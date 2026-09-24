@@ -1,4 +1,4 @@
-# CERIS on CoInfra
+# ECCO
 
 Config-driven experiments for distributed roadside LiDAR perception in real
 sunny, rainy, heavy-snow and freezing-rain recordings. This project works with
