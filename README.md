@@ -182,22 +182,6 @@ Weather is confounded with recording date and traffic, so weather-stratified gai
 are evidence of performance in those conditions, not a controlled causal weather
 effect. Do not infer general deployment success from smoke-test results.
 
-## Recovery, cleanup and validation
-
-Source recovered from neighboring ECCO commit
-`1a748a4d1868231150b7aa4080dc2ead9b1a04bb`. Original ECCO files and uncommitted
-changes were not modified. Its box dataclass was retained; the old placeholder
-detector, fabricated-RSU scaling, Adver-City loader, approximate AP and unused
-wrappers/tests were replaced. Obsolete recovered files are recoverable from that
-commit. Paper drafts, old results, temporary HTML and unrelated scripts were not
-imported. Downloader documentation/dependencies are consolidated here.
-
-Tests use small synthetic CoInfra-shaped fixtures for calibration, timestamp
-checks, zero-yaw/empty annotations, rotated 3D IoU, dataset-level AP, split leakage,
-node selection, byte-to-latency units and a full one-epoch train/evaluate/report run.
-They validate plumbing, not model quality. Real data, long training, CUDA performance
-and publisher-schema compatibility cannot be fully validated until data is present.
-
 Sources: [CoInfra project](https://github.com/NingMingHao/CoInfra),
 [dataset schema](https://github.com/NingMingHao/CoInfra/blob/main/docs/DATASET.md),
 [publisher baseline](https://github.com/NingMingHao/CoInfra/blob/main/baselines/coop_lidar/dataset.py),
