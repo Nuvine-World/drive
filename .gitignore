@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.DS_Store
+/data/
+/coinfra_downloads/
+/coinfra_dataset/
+/outputs/
+*.pt
+.cache/
