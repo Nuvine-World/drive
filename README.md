@@ -6,7 +6,8 @@ roadside units from selected Adver-City clear, rain, fog, and fog-plus-heavy-rai
 scenarios. CoInfra remains available for real multi-RSU adverse-weather tests.
 
 The project compares early, intermediate, and late fusion for 1, 2, 4, and 8
-RSUs. It measures rotated 3D AP, recall, representation size, local inference
+RSUs. It measures rotated 3D AP, precision, recall, F1, TP/FP/FN counts,
+matched-box 3D IoU, center/yaw/size errors, representation size, local inference
 time, and analytical edge/cloud latency. Edge/cloud deployment is not executed;
 latency uses explicit configuration assumptions that must be cited in a paper.
 
@@ -65,8 +66,14 @@ official selection and transfer sizes without downloading archives:
 For an end-to-end one-frame test profile:
 
 ```bash
-./run.sh --config configs/advercity.yaml --smoke
+./run.sh --small --config configs/advercity.yaml
 ```
+
+`--small` is the recommended whole-flow preflight when prepared data already
+exists. It checks that every smoke-profile session is present, skips all download
+and conversion work, replaces any earlier smoke checkpoints, then runs inspection,
+indexing, two training epochs, evaluation, plots, reporting, and final verification.
+Its split-disjoint metrics validate plumbing only and are not research results.
 
 Do not interrupt the process during the final scenario rename. Failed downloads
 remain as `.part` files and resume on the next invocation. An archive is deleted
@@ -95,7 +102,7 @@ validates the pipeline; its metrics are not research results.
 
 ```bash
 .venv/bin/python download_coinfra.py --smoke --download --output coinfra_downloads
-./run.sh --config configs/coinfra.yaml --smoke
+./run.sh --small --config configs/coinfra.yaml
 ```
 
 The three smoke archives are approximately 32 GB compressed. Extract them into
@@ -110,6 +117,9 @@ The three smoke archives are approximately 32 GB compressed. Extract them into
 The runner performs inspection, indexing, training, held-out evaluation, and
 report generation. Timestamped console logs and completion/failure status files
 are written under `logs/`, including Python tracebacks from failed runs.
+Runtime dependencies are imported before acquisition or training begins. Dataset
+inspection parses annotations in every selected frame and verifies that each test
+session has enough common nodes for the largest requested evaluation count.
 
 Training resumes from `seed_N/latest.pt` after the last completed epoch. Recovery
 checkpoints include model, optimizer, metric history, and random states. The best
@@ -177,18 +187,23 @@ The configured output directory contains:
 - `seed_N/best.pt`, `latest.pt`, retained epoch checkpoints, and completion state;
 - `seed_N/training_metrics_seed_N.csv` and training curves;
 - `accuracy.csv` with per-session, subset, seed, class, and IoU metrics;
-- `accuracy_summary.csv` with absolute AP and recall summaries;
+- `accuracy_summary.csv` with per-class accuracy and localization summaries;
+- `metrics_overview.csv` with macro/micro AP, precision, recall, F1, counts, and localization quality;
 - `cooperation_gains.csv` with paired multi-RSU gains over mean/best single RSUs;
 - `weather_cooperation_summary.csv` with weather-stratified paired gains;
 - `node_scaling.csv` with changes between successive configured node counts;
 - `latency_communication.csv` with measured local timing and assumed latency;
 - `accuracy_latency_tradeoffs.csv` joining accuracy and deployment costs;
 - `accuracy_by_nodes.png`, `cooperation_gain_by_weather.png`,
-  `latency_by_bandwidth.png`, and `report.md`.
+  `latency_by_bandwidth.png`, and `report.md`;
+- `verification.json`, written only after required artifacts and metric invariants are checked.
 
-AP is confidence-ranked across a complete session/subset. Undefined classes are
+AP is confidence-ranked across a complete session/subset. Precision, recall, and
+F1 use `evaluation.score_threshold` after class-wise NMS. Localization errors are
+computed only for matched true positives. Undefined classes and match metrics are
 left blank rather than treated as zero. Summary statistics are descriptive, not
-confidence intervals.
+confidence intervals. `run.sh` executes verification after report generation and
+returns a nonzero exit code if required results are missing or inconsistent.
 
 ## Scientific scope
 

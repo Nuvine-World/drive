@@ -82,13 +82,20 @@ def load_config(path):
         raise ValueError('Unknown training mode')
     if t['epochs'] < 1 or not t['seeds'] or t['learning_rate'] <= 0:
         raise ValueError('Invalid training configuration')
-    checkpointing = t.setdefault('checkpointing', {'keep_best': 3,
-        'weights': {'val_loss_quality': .34, 'val_map': .33, 'val_recall': .33}})
-    if checkpointing['keep_best'] < 1:
+    checkpointing = t.setdefault('checkpointing', {})
+    if not isinstance(checkpointing, dict):
+        raise ValueError('training.checkpointing must be a mapping')
+    checkpointing.setdefault('keep_best', 3)
+    checkpointing.setdefault('weights', {'val_loss_quality': .34, 'val_map': .33,
+                                          'val_recall': .33})
+    if (not isinstance(checkpointing['keep_best'], int) or
+            isinstance(checkpointing['keep_best'], bool) or checkpointing['keep_best'] < 1):
         raise ValueError('training.checkpointing.keep_best must be positive')
     weights = checkpointing['weights']
     expected = {'val_loss_quality','val_map','val_recall'}
-    if set(weights) != expected or any(not math.isfinite(v) or v < 0 for v in weights.values()) or sum(weights.values()) <= 0:
+    if (not isinstance(weights, dict) or set(weights) != expected or
+            any(not isinstance(v, (int,float)) or not math.isfinite(v) or v < 0
+                for v in weights.values()) or sum(weights.values()) <= 0):
         raise ValueError(f'Checkpoint weights must be nonnegative and contain {sorted(expected)}')
     recovery = t.setdefault('recovery', {})
     defaults = {'resume': True, 'save_every_epochs': 1, 'wait_for_resources': True,

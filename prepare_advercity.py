@@ -247,14 +247,28 @@ def normalize_boxes(raw, world_to_ego, ego_yaw, aliases, classes, bounds):
 def convert_scenario(extracted, destination, name, cfg):
     source = find_scenario(extracted, name)
     agents = sorted([p for p in source.iterdir() if p.is_dir() and list(p.glob('*_lidar.ply'))], key=agent_key)
-    vehicles = [p for p in agents if int(p.name) >= 0]
-    if not vehicles:
-        raise ValueError(f'No vehicle agents in {name}')
-    ego = vehicles[0]
+    if not agents:
+        raise ValueError(f'No LiDAR agents in {name}')
     frame_sets = [{p.stem.split('_', 1)[0] for p in agent.glob('*_lidar.ply')} for agent in agents]
     frames = sorted(set.intersection(*frame_sets))[::cfg['dataset']['acquisition']['retain_frame_stride']]
     if not frames:
         raise ValueError(f'No common LiDAR frames in {name}')
+    first_frame = frames[0]
+    vehicles = []
+    for agent in agents:
+        raw = frame_yaml(agent, first_frame)
+        if 'RSU' in raw:
+            is_rsu = bool(raw['RSU'])
+        else:
+            try:
+                is_rsu = int(agent.name) < 0
+            except ValueError:
+                is_rsu = False
+        if not is_rsu:
+            vehicles.append(agent)
+    if not vehicles:
+        raise ValueError(f'No vehicle agents in {name}')
+    ego = vehicles[0]
     stage = destination.parent / f'.{name}.converting'
     if stage.exists():
         shutil.rmtree(stage)
