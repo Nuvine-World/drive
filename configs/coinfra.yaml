@@ -21,7 +21,8 @@ dataset:
   yaw_unit: radians
   classes: [car, truck, bus, bicycle, pedestrian]
   class_aliases: {person: pedestrian, cyclist: bicycle, vehicle: car}
-  bounds: [-660.0, 450.0, -5.0, -500.0, 610.0, 10.0]
+  # CoInfra's global metric frame is centered near the roundabout origin.
+  bounds: [-100.0, -100.0, -5.0, 100.0, 100.0, 20.0]
   resolution: 0.8
   splits:
     train: [2025_03_27_sunny]
