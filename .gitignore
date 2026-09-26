@@ -6,6 +6,10 @@ __pycache__/
 /data/
 /coinfra_downloads/
 /coinfra_dataset/
+/advercity_work/
 /outputs/
+/logs/
+/docs/decisions/
+/docs/review/
 *.pt
 .cache/

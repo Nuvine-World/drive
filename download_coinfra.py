@@ -10,8 +10,6 @@ import sys
 
 REPO = "MinghaoNing/CoInfra"
 GB = 1_000_000_000
-# Two recording dates for sunny/snow; both available freezing-rain archives.
-# Different option so that we can download a smaller subset for testing, or a larger subset for more coverage. DOn't have to download all 12 archives for a single test.
 RECOMMENDED = [
     "2025_03_27_sunny_slice0-slice4.tar.zst",
     "2025_11_18_sunny_slice0-slice1.tar.zst",
@@ -131,7 +129,6 @@ def main():
     except ImportError:
         parser.exit(1, "Install dependency: python3 -m pip install huggingface_hub\n")
 
-    # Uses HF_TOKEN or the token stored by `hf auth login`, when available.
     info = HfApi().dataset_info(REPO, revision=args.revision, files_metadata=True)
     print(f"Source: https://huggingface.co/datasets/{REPO}")
     print(f"Pinned commit: {info.sha}")
@@ -164,7 +161,6 @@ def main():
 
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    # Verify existing archives before skipping. Never silently replace a corrupt file.
     pending = []
     for f in selected:
         path = output / f.rfilename
@@ -180,7 +176,6 @@ def main():
                 )
         else:
             pending.append(f)
-    # Conservative: does not subtract partially downloaded cache files.
     needed = sum(f.size for f in pending) + int(args.reserve_gb * GB)
     free = shutil.disk_usage(output).free
     if needed > free:
@@ -212,7 +207,6 @@ if __name__ == "__main__":
         print("\nInterrupted. Rerun the same command to resume.", file=sys.stderr)
         sys.exit(130)
     except Exception as exc:
-        # Avoid echoing signed URLs or tokens contained in remote error messages.
         message = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
         print(
             f"Error: {message}\nFor remote failures, check connectivity and dataset access; "
