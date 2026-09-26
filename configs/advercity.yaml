@@ -1,0 +1,78 @@
+dataset:
+  type: advercity
+  root: data/advercity
+  acquisition:
+    work_dir: advercity_work
+    minimum_free_gb: 35
+    cleanup_archives: true
+    retain_frame_stride: 2
+  smoke:
+    enabled: false
+    splits:
+      train: [ui_cd_d]
+      val: [rsnj_cd_d]
+      test: [rcnj_fhrd_d]
+    sessions_per_split: 1
+    slices_per_session: 1
+    frames_per_slice: 1
+    epochs: 2
+    seeds: 1
+  weather: [clear, soft_rain, heavy_rain, fog, fog_heavy_rain]
+  nodes: []
+  frame_stride: 1
+  max_frames_per_slice: null
+  max_timestamp_delta_s: 0
+  annotation_file: gt.yaml
+  yaw_unit: radians
+  classes: [car, van, truck, motorcycle, bicycle, pedestrian]
+  class_aliases: {vehicle: car, walker: pedestrian}
+  bounds: [-100.0, -100.0, -5.0, 100.0, 100.0, 5.0]
+  resolution: 1.0
+  splits:
+    train: [ui_cd_d, ui_srd_d, ui_hrd_d, ui_fd_d, ui_fhrd_d,
+            unj_cd_d, unj_srd_d, unj_hrd_d, unj_fd_d, unj_fhrd_d,
+            ri_cd_d, ri_srd_d, ri_hrd_d, ri_fd_d, ri_fhrd_d]
+    val: [rsnj_cd_d, rsnj_srd_d, rsnj_hrd_d, rsnj_fd_d, rsnj_fhrd_d]
+    test: [rcnj_cd_d, rcnj_srd_d, rcnj_hrd_d, rcnj_fd_d, rcnj_fhrd_d]
+training:
+  seeds: [42, 43, 44]
+  epochs: 30
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  device: auto
+  hidden_channels: 32
+  modes: [early, intermediate, single]
+  node_counts: [1, 2, 3, 5]
+  checkpointing:
+    keep_best: 3
+    weights: {val_loss_quality: 0.34, val_map: 0.33, val_recall: 0.33}
+  recovery:
+    resume: true
+    save_every_epochs: 1
+    wait_for_resources: true
+    poll_seconds: 60
+    timeout_minutes: 0
+    minimum_free_disk_gb: 20
+    minimum_free_gpu_gb: 2
+    cuda_oom_retries: 3
+evaluation:
+  strategies: [early, intermediate, late]
+  node_counts: [1, 2, 3, 5]
+  subsets_per_count: 5
+  subset_seed: 17
+  score_threshold: 0.15
+  nms_iou: 0.2
+  iou_thresholds: [0.5, 0.7]
+  max_detections: 150
+deployment_assumptions:
+  source: "controlled analytical assumptions; replace with cited or measured server values"
+  bandwidths_mbps: [10, 100, 1000]
+  sensing_ms: 100.0
+  edge_rtt_ms: 5.0
+  cloud_rtt_ms: 40.0
+  processing_ms:
+    edge: {early: 80.0, intermediate: 45.0, late: 25.0}
+    cloud: {early: 40.0, intermediate: 30.0, late: 20.0}
+output:
+  root: outputs/advercity
+  plots: true
