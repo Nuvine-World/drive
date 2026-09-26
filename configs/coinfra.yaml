@@ -1,0 +1,72 @@
+dataset:
+  type: coinfra
+  root: data/coinfra
+  smoke:
+    enabled: false
+    splits:
+      train: [2025_03_27_sunny]
+      val: [2025_11_18_sunny]
+      test: [2025_03_24_rainy]
+    sessions_per_split: 1
+    slices_per_session: 1
+    frames_per_slice: 1
+    epochs: 2
+    seeds: 1
+  weather: [sunny, rainy, heavysnow, freezingrain]
+  nodes: []
+  frame_stride: 5
+  max_frames_per_slice: null
+  max_timestamp_delta_s: 0.15
+  annotation_file: global_roi.yaml
+  yaw_unit: radians
+  classes: [car, truck, bus, bicycle, pedestrian]
+  class_aliases: {person: pedestrian, cyclist: bicycle, vehicle: car}
+  bounds: [-660.0, 450.0, -5.0, -500.0, 610.0, 10.0]
+  resolution: 0.8
+  splits:
+    train: [2025_03_27_sunny]
+    val: [2025_11_18_sunny]
+    test: [2025_11_20_sunny, 2025_02_12_heavysnow, 2025_04_07_heavysnow,
+           2025_11_27_heavysnow, 2025_03_24_rainy, 2025_04_02_freezingrain]
+training:
+  seeds: [42, 43, 44]
+  epochs: 30
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  device: auto
+  hidden_channels: 32
+  modes: [early, intermediate, single]
+  node_counts: [1, 2, 4, 8]
+  checkpointing:
+    keep_best: 3
+    weights: {val_loss_quality: 0.34, val_map: 0.33, val_recall: 0.33}
+  recovery:
+    resume: true
+    save_every_epochs: 1
+    wait_for_resources: true
+    poll_seconds: 60
+    timeout_minutes: 0
+    minimum_free_disk_gb: 5
+    minimum_free_gpu_gb: 2
+    cuda_oom_retries: 3
+evaluation:
+  strategies: [early, intermediate, late]
+  node_counts: [1, 2, 4, 8]
+  subsets_per_count: 5
+  subset_seed: 17
+  score_threshold: 0.15
+  nms_iou: 0.2
+  iou_thresholds: [0.5, 0.7]
+  max_detections: 150
+deployment_assumptions:
+  source: "literature assumption; citation required"
+  bandwidths_mbps: [10, 100, 1000]
+  sensing_ms: 100.0
+  edge_rtt_ms: 5.0
+  cloud_rtt_ms: 40.0
+  processing_ms:
+    edge: {early: 80.0, intermediate: 45.0, late: 25.0}
+    cloud: {early: 40.0, intermediate: 30.0, late: 20.0}
+output:
+  root: outputs/coinfra
+  plots: true
