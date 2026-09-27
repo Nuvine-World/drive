@@ -58,19 +58,39 @@ def load_config(path):
     smoke.setdefault('seeds', 1)
     if smoke['enabled']:
         enable_smoke(cfg)
-    b = d['bounds']
-    if len(b) != 6 or not all(math.isfinite(v) for v in b) or any(b[i] >= b[i+3] for i in range(3)):
-        raise ValueError('Invalid dataset bounds')
-    if not math.isfinite(d['resolution']) or d['resolution'] <= 0:
-        raise ValueError('resolution must be positive')
-    if d['yaw_unit'] not in ('degrees', 'radians'):
-        raise ValueError('yaw_unit must be degrees or radians')
-    if d['frame_stride'] < 1 or d.get('max_timestamp_delta_s', 0) < 0:
-        raise ValueError('Invalid stride or synchronization tolerance')
-    if any(smoke[k] < 1 for k in ('sessions_per_split','slices_per_session','frames_per_slice','epochs','seeds')):
-        raise ValueError('Smoke-mode limits must be positive')
-    if not d['classes'] or len(d['classes']) != len(set(d['classes'])):
-        raise ValueError('Classes must be nonempty and unique')
+    b = d["bounds"]
+    if (
+        len(b) != 6
+        or not all(math.isfinite(v) for v in b)
+        or any(b[i] >= b[i + 3] for i in range(3))
+    ):
+        raise ValueError("Invalid dataset bounds")
+    if not math.isfinite(d["resolution"]) or d["resolution"] <= 0:
+        raise ValueError("resolution must be positive")
+    d.setdefault("objects_per_cell", 1)
+    if (
+        not isinstance(d["objects_per_cell"], int)
+        or isinstance(d["objects_per_cell"], bool)
+        or d["objects_per_cell"] < 1
+    ):
+        raise ValueError("objects_per_cell must be a positive integer")
+    if d["yaw_unit"] not in ("degrees", "radians"):
+        raise ValueError("yaw_unit must be degrees or radians")
+    if d["frame_stride"] < 1 or d.get("max_timestamp_delta_s", 0) < 0:
+        raise ValueError("Invalid stride or synchronization tolerance")
+    if any(
+        smoke[k] < 1
+        for k in (
+            "sessions_per_split",
+            "slices_per_session",
+            "frames_per_slice",
+            "epochs",
+            "seeds",
+        )
+    ):
+        raise ValueError("Smoke-mode limits must be positive")
+    if not d["classes"] or len(d["classes"]) != len(set(d["classes"])):
+        raise ValueError("Classes must be nonempty and unique")
     seen = set()
     for split in ('train', 'val', 'test'):
         sessions = d['splits'][split]

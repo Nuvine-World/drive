@@ -322,6 +322,7 @@ def signature(cfg):
         "class_aliases",
         "bounds",
         "resolution",
+        "objects_per_cell",
         "splits",
     )
     training_keys = (
@@ -470,20 +471,22 @@ def inputs(sample, nodes, cfg):
 def validate_target_centers(boxes, cfg, sample_id):
     """Detect unrepresentable same-class centers without allocating dense targets."""
     classes, bounds, resolution = cfg["classes"], cfg["bounds"], cfg["resolution"]
+    slots = cfg.get("objects_per_cell", 1)
     occupied = {}
     for box in boxes:
         ix = int((box.x - bounds[0]) / resolution)
         iy = int((box.y - bounds[1]) / resolution)
         key = classes.index(box.label), iy, ix
-        if key in occupied:
-            previous = occupied[key]
+        colocated = occupied.setdefault(key, [])
+        if len(colocated) >= slots:
+            previous = colocated[0]
             raise ValueError(
-                "Two same-class centers occupy one grid cell during inspection: "
+                f"More than {slots} same-class centers occupy one grid cell during inspection: "
                 f"sample={sample_id!r}, class={box.label!r}, cell=(x={ix}, y={iy}), "
                 f"resolution={resolution}, first_center=({previous.x:.6f}, {previous.y:.6f}), "
                 f"second_center=({box.x:.6f}, {box.y:.6f})"
             )
-        occupied[key] = box
+        colocated.append(box)
 
 
 def tensor_inputs(clouds, cfg, device, mode):
@@ -668,7 +671,11 @@ def batch_outputs(outputs, index):
 
 
 def make_model(cfg,device):
-    return BEVDetector(cfg['dataset']['classes'],cfg['training']['hidden_channels']).to(device)
+    return BEVDetector(
+        cfg["dataset"]["classes"],
+        cfg["training"]["hidden_channels"],
+        cfg["dataset"].get("objects_per_cell", 1),
+    ).to(device)
 
 
 def mixed_precision(cfg, device):

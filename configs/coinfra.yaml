@@ -24,6 +24,9 @@ dataset:
   # CoInfra's global metric frame is centered near the roundabout origin.
   bounds: [-100.0, -100.0, -5.0, 100.0, 100.0, 20.0]
   resolution: 0.4
+  # Separate prediction slots preserve closely spaced same-class objects whose
+  # centers fall in the same official 0.4 m BEV cell.
+  objects_per_cell: 2
   splits:
     train: [2025_03_27_sunny]
     val: [2025_11_18_sunny]

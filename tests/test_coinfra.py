@@ -255,11 +255,27 @@ def test_checkpoint_pruning_ignores_truncated_metadata(tmp_path):
     assert prune_checkpoints(tmp_path, 2) == []
 
 
-def test_center_collision_explicit(fixture_config):
+def test_center_collision_uses_separate_slots(fixture_config):
+    first = BoundingBox3D(1.0, 0.0, 0, 4, 2, 2, 0, "car")
+    second = BoundingBox3D(1.1, 0.1, 0, 4, 2, 2, 0, "car")
+    heat, regression, mask = targets(
+        [first, second],
+        fixture_config["dataset"],
+        (16, 16),
+        sample_id="session/slice/frame",
+    )
+    assert heat[0, 0, 8, 9] == 1
+    assert heat[0, 1, 8, 9] == 1
+    assert mask[0, :, 8, 9].tolist() == [True, True]
+    assert regression[0, 0, 0, 8, 9] == pytest.approx(0)
+    assert regression[0, 1, 0, 8, 9] == pytest.approx(0.1)
+
+
+def test_center_collision_over_slot_capacity_is_explicit(fixture_config):
     box = BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")
-    with pytest.raises(ValueError, match="grid cell") as failure:
+    with pytest.raises(ValueError, match="More than 2") as failure:
         targets(
-            [box, box],
+            [box, box, box],
             fixture_config["dataset"],
             (16, 16),
             sample_id="session/slice/frame",
@@ -276,7 +292,11 @@ def test_center_collision_explicit(fixture_config):
 
 def test_batched_detector_and_loss_match_individual_samples(fixture_config):
     torch.manual_seed(7)
-    model = BEVDetector(fixture_config["dataset"]["classes"], 4)
+    model = BEVDetector(
+        fixture_config["dataset"]["classes"],
+        4,
+        fixture_config["dataset"]["objects_per_cell"],
+    )
     bev = torch.randn(2, 3, 16, 16)
     boxes = [
         [BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")],
@@ -308,13 +328,21 @@ def test_batched_detector_and_loss_match_individual_samples(fixture_config):
 
 
 def test_validation_rejects_empty_split(fixture_config):
-    model = BEVDetector(fixture_config["dataset"]["classes"], 4)
+    model = BEVDetector(
+        fixture_config["dataset"]["classes"],
+        4,
+        fixture_config["dataset"]["objects_per_cell"],
+    )
     with pytest.raises(ValueError, match="Validation split contains no samples"):
         validation_metrics(model, [], fixture_config, torch.device("cpu"))
 
 
 def test_validation_oom_splits_only_current_batch(monkeypatch, fixture_config):
-    model = BEVDetector(fixture_config["dataset"]["classes"], 4)
+    model = BEVDetector(
+        fixture_config["dataset"]["classes"],
+        4,
+        fixture_config["dataset"]["objects_per_cell"],
+    )
     gt = [BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")]
     examples = []
     for _ in range(2):
@@ -341,12 +369,30 @@ def test_validation_oom_splits_only_current_batch(monkeypatch, fixture_config):
 
 def test_decode_accepts_mixed_precision_outputs(fixture_config):
     classes = len(fixture_config["dataset"]["classes"])
-    logits = torch.full((1, classes, 16, 16), -20, dtype=torch.float16)
+    slots = fixture_config["dataset"]["objects_per_cell"]
+    logits = torch.full((1, classes * slots, 16, 16), -20, dtype=torch.float16)
     logits[0, 0, 8, 8] = 0
-    regression = torch.zeros((1, 8 * classes, 16, 16), dtype=torch.float16)
+    regression = torch.zeros((1, 8 * classes * slots, 16, 16), dtype=torch.float16)
     boxes = decode((logits, regression), fixture_config)
     assert boxes
     assert boxes[0].score == pytest.approx(0.5)
+
+
+def test_decode_preserves_two_objects_from_one_class_cell(fixture_config):
+    classes = len(fixture_config["dataset"]["classes"])
+    slots = fixture_config["dataset"]["objects_per_cell"]
+    logits = torch.full((1, classes * slots, 16, 16), -20.0)
+    logits[0, 0, 8, 8] = 5
+    logits[0, 1, 8, 8] = 4
+    regression = torch.zeros((1, 8 * classes * slots, 16, 16))
+    values = regression.reshape(1, classes, slots, 8, 16, 16)
+    values[0, 0, 0, 0, 8, 8] = 0.1
+    values[0, 0, 1, 0, 8, 8] = 0.8
+    values[0, 0, :, 3:6, 8, 8] = -4
+    boxes = decode((logits, regression), fixture_config)
+    cars = [box for box in boxes if box.label == "car"]
+    assert len(cars) == 2
+    assert sorted(box.x for box in cars) == pytest.approx([0.1, 0.8])
 
 
 def test_end_to_end_train_all_fusions_report(fixture_config):

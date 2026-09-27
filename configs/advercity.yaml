@@ -28,6 +28,7 @@ dataset:
   class_aliases: {vehicle: car, walker: pedestrian}
   bounds: [-100.0, -100.0, -5.0, 100.0, 100.0, 5.0]
   resolution: 1.0
+  objects_per_cell: 2
   splits:
     train: [ui_cd_d, ui_srd_d, ui_hrd_d, ui_fd_d, ui_fhrd_d,
             unj_cd_d, unj_srd_d, unj_hrd_d, unj_fd_d, unj_fhrd_d,

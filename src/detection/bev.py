@@ -10,13 +10,15 @@ from src.metrics.evaluation import nms
 
 
 class BEVDetector(nn.Module):
-    def __init__(self, classes, hidden):
+    def __init__(self, classes, hidden, objects_per_cell=1):
         super().__init__()
         self.classes = classes
+        self.objects_per_cell = objects_per_cell
         self.encoder = nn.Sequential(nn.Conv2d(3,hidden,3,padding=1), nn.ReLU(),
                                      nn.Conv2d(hidden,hidden,3,padding=1), nn.ReLU())
-        self.heatmap = nn.Conv2d(hidden,len(classes),1)
-        self.regression = nn.Conv2d(hidden,8*len(classes),1)
+        slots = len(classes) * objects_per_cell
+        self.heatmap = nn.Conv2d(hidden, slots, 1)
+        self.regression = nn.Conv2d(hidden, 8 * slots, 1)
         nn.init.constant_(self.heatmap.bias, -2.19)
 
     def heads(self, features):
@@ -36,10 +38,11 @@ class BEVDetector(nn.Module):
 
 def targets(boxes, cfg, shape, sample_id=None):
     h, w = shape
-    classes, b, r = cfg['classes'], cfg['bounds'], cfg['resolution']
-    heat = np.zeros((len(classes),h,w),np.float32)
-    reg = np.zeros((len(classes),8,h,w),np.float32)
-    mask = np.zeros((len(classes),h,w),bool)
+    classes, b, r = cfg["classes"], cfg["bounds"], cfg["resolution"]
+    slots = cfg.get("objects_per_cell", 1)
+    heat = np.zeros((len(classes), slots, h, w), np.float32)
+    reg = np.zeros((len(classes), slots, 8, h, w), np.float32)
+    mask = np.zeros((len(classes), slots, h, w), bool)
     occupied = {}
     for box in boxes:
         x, y = (box.x-b[0])/r, (box.y-b[1])/r
@@ -47,40 +50,50 @@ def targets(boxes, cfg, shape, sample_id=None):
         if not (0 <= ix < w and 0 <= iy < h):
             continue
         key = c, iy, ix
-        if key in occupied:
-            previous = occupied[key]
+        colocated = occupied.setdefault(key, [])
+        if len(colocated) >= slots:
+            previous = colocated[0]
             raise ValueError(
-                "Two same-class centers occupy one grid cell: "
+                f"More than {slots} same-class centers occupy one grid cell: "
                 f"sample={sample_id!r}, class={box.label!r}, cell=(x={ix}, y={iy}), "
                 f"resolution={r}, first_center=({previous.x:.6f}, {previous.y:.6f}), "
                 f"second_center=({box.x:.6f}, {box.y:.6f}), "
                 f"delta=({abs(previous.x-box.x):.6f}, {abs(previous.y-box.y):.6f})"
             )
-        occupied[key] = box
-        heat[c,iy,ix] = 1
-        mask[c,iy,ix] = True
-        reg[c,:,iy,ix] = [x-ix,y-iy,box.z,math.log(box.length),math.log(box.width),
-                          math.log(box.height),math.sin(box.yaw),math.cos(box.yaw)]
+        slot = len(colocated)
+        colocated.append(box)
+        heat[c, slot, iy, ix] = 1
+        mask[c, slot, iy, ix] = True
+        reg[c, slot, :, iy, ix] = [
+            x - ix,
+            y - iy,
+            box.z,
+            math.log(box.length),
+            math.log(box.width),
+            math.log(box.height),
+            math.sin(box.yaw),
+            math.cos(box.yaw),
+        ]
     return heat, reg, mask
 
 
 def loss(outputs, target):
     logits, regression = outputs
     heat, reg, mask = [torch.as_tensor(v,device=logits.device) for v in target]
-    if heat.ndim == 3:
+    if heat.ndim == 4:
         heat, reg, mask = heat[None], reg[None], mask[None]
-    p = logits.sigmoid().float().clamp(1e-5, 1 - 1e-5)
+    batch, classes, slots, height, width = heat.shape
+    p = logits.reshape(batch, classes, slots, height, width)
+    p = p.sigmoid().float().clamp(1e-5, 1 - 1e-5)
     positive = heat == 1
     axes = tuple(range(1, heat.ndim))
     focal = -torch.where(positive, (1 - p) ** 2 * p.log(), p**2 * (1 - p).log()).sum(
         dim=axes
     )
     focal = focal / positive.sum(dim=axes).clamp(min=1)
-    prediction = regression.float().reshape(
-        reg.shape[0], reg.shape[1], 8, *reg.shape[-2:]
-    )
-    prediction = prediction.permute(0, 1, 3, 4, 2)
-    expected = reg.permute(0, 1, 3, 4, 2)
+    prediction = regression.float().reshape(batch, classes, slots, 8, height, width)
+    prediction = prediction.permute(0, 1, 2, 4, 5, 3)
+    expected = reg.permute(0, 1, 2, 4, 5, 3)
     regression_losses = []
     for index in range(len(reg)):
         selected = mask[index]
@@ -94,23 +107,27 @@ def loss(outputs, target):
 
 def decode(outputs, cfg):
     logits, regression = outputs
-    settings, d = cfg['evaluation'], cfg['dataset']
+    settings, d = cfg["evaluation"], cfg["dataset"]
+    classes = len(d["classes"])
+    slots = d.get("objects_per_cell", 1)
     # Keep thresholding, local-max selection, and box decoding stable under AMP.
-    p = logits[0].float().sigmoid()
-    maxima = F.max_pool2d(p[None],3,stride=1,padding=1)[0]
-    scores = torch.where(p == maxima,p,torch.zeros_like(p)).flatten()
-    values, indices = scores.topk(min(settings['max_detections'], scores.numel()))
-    _, h, w = p.shape
-    reg = (
-        regression[0].float().reshape(len(d["classes"]), 8, h, w).detach().cpu().numpy()
-    )
+    _, _, h, w = logits.shape
+    p = logits[0].float().reshape(classes, slots, h, w).sigmoid()
+    flat_heatmaps = p.reshape(classes * slots, h, w)
+    maxima = F.max_pool2d(flat_heatmaps[None], 3, stride=1, padding=1)[0]
+    scores = torch.where(
+        flat_heatmaps == maxima, flat_heatmaps, torch.zeros_like(flat_heatmaps)
+    ).flatten()
+    values, indices = scores.topk(min(settings["max_detections"], scores.numel()))
+    reg = regression[0].float().reshape(classes, slots, 8, h, w).detach().cpu().numpy()
     boxes = []
     for score, index in zip(values.detach().cpu().tolist(),indices.detach().cpu().tolist()):
         if score < settings['score_threshold']:
             continue
-        c, cell = divmod(index,h*w)
-        iy, ix = divmod(cell,w)
-        v = reg[c,:,iy,ix]
+        channel, cell = divmod(index, h * w)
+        c, slot = divmod(channel, slots)
+        iy, ix = divmod(cell, w)
+        v = reg[c, slot, :, iy, ix]
         if not np.isfinite(v).all():
             raise ValueError('Nonfinite model output')
         x = d['bounds'][0]+(ix+float(v[0]))*d['resolution']
