@@ -95,12 +95,15 @@ def loss(outputs, target):
 def decode(outputs, cfg):
     logits, regression = outputs
     settings, d = cfg['evaluation'], cfg['dataset']
-    p = logits[0].sigmoid()
+    # Keep thresholding, local-max selection, and box decoding stable under AMP.
+    p = logits[0].float().sigmoid()
     maxima = F.max_pool2d(p[None],3,stride=1,padding=1)[0]
     scores = torch.where(p == maxima,p,torch.zeros_like(p)).flatten()
     values, indices = scores.topk(min(settings['max_detections'], scores.numel()))
     _, h, w = p.shape
-    reg = regression[0].reshape(len(d['classes']),8,h,w).detach().cpu().numpy()
+    reg = (
+        regression[0].float().reshape(len(d["classes"]), 8, h, w).detach().cpu().numpy()
+    )
     boxes = []
     for score, index in zip(values.detach().cpu().tolist(),indices.detach().cpu().tolist()):
         if score < settings['score_threshold']:

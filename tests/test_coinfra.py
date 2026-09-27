@@ -11,14 +11,25 @@ import numpy as np
 import pytest
 import torch
 import yaml
+import src.pipeline as pipeline_module
 from src.config import PROJECT, enable_smoke, load_config
 from main import run_pipeline
 from src.data.coinfra import annotations, calibration, discover, load_cloud, rasterize
 from src.data.loader import BoundingBox3D
-from src.detection.bev import BEVDetector, loss, targets
+from src.detection.bev import BEVDetector, decode, loss, targets
 from src.metrics.evaluation import evaluate, iou3d
-from src.pipeline import (choose_groups, indexed, inspect, network_rows,
-                          prune_checkpoints, report, run_evaluation, train, verify_results)
+from src.pipeline import (
+    choose_groups,
+    indexed,
+    inspect,
+    network_rows,
+    prune_checkpoints,
+    report,
+    run_evaluation,
+    train,
+    validation_metrics,
+    verify_results,
+)
 
 
 @pytest.fixture
@@ -273,6 +284,41 @@ def test_batched_detector_and_loss_match_individual_samples(fixture_config):
     separate = [model(per_node[i], "intermediate") for i in range(2)]
     torch.testing.assert_close(batched[0], torch.cat([value[0] for value in separate]))
     torch.testing.assert_close(batched[1], torch.cat([value[1] for value in separate]))
+
+
+def test_validation_rejects_empty_split(fixture_config):
+    model = BEVDetector(fixture_config["dataset"]["classes"], 4)
+    with pytest.raises(ValueError, match="Validation split contains no samples"):
+        validation_metrics(model, [], fixture_config, torch.device("cpu"))
+
+
+def test_validation_oom_backoff_persists(monkeypatch, fixture_config):
+    attempted = []
+
+    def fake_validation(model, samples, cfg, device, batch_size):
+        attempted.append(batch_size)
+        if batch_size == 4:
+            raise torch.OutOfMemoryError("out of memory")
+        return "ok"
+
+    monkeypatch.setattr(pipeline_module, "_validation_metrics", fake_validation)
+    monkeypatch.setattr(pipeline_module, "release_cuda_memory", lambda device: None)
+    runtime_batches = {"evaluation": 4}
+    device = SimpleNamespace(type="cuda")
+    assert validation_metrics(None, [], fixture_config, device, runtime_batches) == "ok"
+    assert runtime_batches["evaluation"] == 2
+    assert validation_metrics(None, [], fixture_config, device, runtime_batches) == "ok"
+    assert attempted == [4, 2, 2]
+
+
+def test_decode_accepts_mixed_precision_outputs(fixture_config):
+    classes = len(fixture_config["dataset"]["classes"])
+    logits = torch.full((1, classes, 16, 16), -20, dtype=torch.float16)
+    logits[0, 0, 8, 8] = 0
+    regression = torch.zeros((1, 8 * classes, 16, 16), dtype=torch.float16)
+    boxes = decode((logits, regression), fixture_config)
+    assert boxes
+    assert boxes[0].score == pytest.approx(0.5)
 
 
 def test_end_to_end_train_all_fusions_report(fixture_config):
