@@ -1,6 +1,10 @@
 from pathlib import Path
+import math
+import warnings
 import numpy as np
-from src.data.coinfra import annotations as normalized_annotations, in_bounds
+import yaml
+from src.data.coinfra import first, in_bounds, vector
+from src.data.loader import BoundingBox3D
 
 
 WEATHER = {
@@ -20,7 +24,50 @@ def scenario_weather(name):
 
 
 def annotations(path, cfg):
-    return normalized_annotations(path, cfg)
+    """Read Adver-City labels while isolating corrupt publisher objects.
+
+    A small number of source frames contain NaN/Inf poses or incomplete objects.
+    Dropping only those objects keeps the frame usable and is preferable to aborting
+    a multi-day run.  The strict CoInfra reader remains unchanged.
+    """
+    with open(path) as stream:
+        raw = yaml.safe_load(stream)
+    if isinstance(raw, dict):
+        raw = first(raw, "objects", "annotations", "data")
+    if not isinstance(raw, list):
+        raise ValueError(f"Expected annotation list in {path}")
+    boxes = []
+    rejected = []
+    for index, obj in enumerate(raw):
+        try:
+            label = str(first(obj, "label", "class", "type")).lower()
+            label = cfg["class_aliases"].get(label, label)
+            if label not in cfg["classes"]:
+                raise ValueError(f"unknown label {label!r}")
+            center = vector(first(obj, "center", "position", "translation"))
+            dimensions = vector(first(obj, "size", "dimensions"), size=True)
+            yaw = first(obj, "yaw", "heading", "rotation")
+            if isinstance(yaw, dict):
+                yaw = first(yaw, "z", "yaw", "heading", "0")
+            yaw = float(yaw)
+            if not math.isfinite(yaw) or (dimensions <= 0).any():
+                raise ValueError("non-finite yaw or non-positive dimensions")
+            if cfg["yaw_unit"] == "degrees":
+                yaw = math.radians(yaw)
+            box = BoundingBox3D(*center, *dimensions, yaw, label)
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            rejected.append((index, str(error)))
+            continue
+        if in_bounds(box.x, box.y, box.z, cfg["bounds"]):
+            boxes.append(box)
+    if rejected:
+        preview = "; ".join(f"#{index}: {error}" for index, error in rejected[:3])
+        warnings.warn(
+            f"Skipped {len(rejected)} invalid Adver-City annotations in {path} "
+            f"({preview})",
+            RuntimeWarning,
+        )
+    return boxes
 
 
 def discover(cfg):

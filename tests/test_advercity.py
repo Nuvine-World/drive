@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
+import pytest
 import yaml
 from prepare_advercity import convert_scenario, download, extract_archive, matrix, read_ply
 from src.config import PROJECT, load_config
@@ -76,6 +77,41 @@ def test_advercity_weather_filter_is_applied(tmp_path):
                           splits={'train':['ui_cd_d','ri_fd_d'],'val':[],'test':[]})
     samples = discover(cfg)
     assert [sample['session'] for sample in samples]==['ri_fd_d']
+
+
+def test_advercity_skips_only_invalid_annotations(tmp_path):
+    cfg = load_config(PROJECT / "configs/advercity.yaml")["dataset"]
+    path = tmp_path / "gt.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "objects": [
+                    {
+                        "class": "car",
+                        "position": [1, 2, 0],
+                        "dimensions": [4, 2, 2],
+                        "heading": 0,
+                    },
+                    {
+                        "class": "car",
+                        "position": [float("nan"), 2, 0],
+                        "dimensions": [4, 2, 2],
+                        "heading": 0,
+                    },
+                    {
+                        "class": "car",
+                        "position": [1, 2, 0],
+                        "dimensions": [0, 2, 2],
+                        "heading": 0,
+                    },
+                ]
+            }
+        )
+    )
+    with pytest.warns(RuntimeWarning, match="Skipped 2 invalid"):
+        boxes = annotations(path, cfg)
+    assert len(boxes) == 1
+    assert boxes[0].label == "car"
 
 
 def test_convert_accepts_nonnumeric_vehicle_agent(tmp_path):

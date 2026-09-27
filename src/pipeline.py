@@ -66,7 +66,7 @@ def plot_training(path, rows):
     plt.close(figure)
 
 
-def validation_metrics(model, samples, cfg, device):
+def _validation_metrics(model, samples, cfg, device):
     losses = []
     frames = {strategy: [] for strategy in cfg['evaluation']['strategies']}
     grouped = defaultdict(list)
@@ -171,6 +171,30 @@ def validation_metrics(model, samples, cfg, device):
             float(np.mean(all_recalls)) if all_recalls else 0.0, details)
 
 
+def validation_metrics(model, samples, cfg, device):
+    """Validate at the configured batch size, backing off after a CUDA OOM."""
+    try:
+        return _validation_metrics(model, samples, cfg, device)
+    except (torch.OutOfMemoryError, RuntimeError) as error:
+        if not cuda_oom(error, device):
+            raise
+        release_cuda_memory(device)
+        size = cfg["evaluation"]["batch_size"]
+        if size == 1:
+            raise RuntimeError(
+                "CUDA cannot fit one validation example; reduce resolution, "
+                "hidden_channels, or node_counts, or set training.device=cpu."
+            ) from error
+        reduced_size = max(1, size // 2)
+        print(
+            f"[{utc_now()}] CUDA OOM during validation; reducing batch "
+            f"{size} -> {reduced_size} and restarting validation",
+            flush=True,
+        )
+        reduced = cfg | {"evaluation": cfg["evaluation"] | {"batch_size": reduced_size}}
+        return validation_metrics(model, samples, reduced, device)
+
+
 def selection_score(cfg, val_loss, val_map, val_recall):
     weights = cfg['training']['checkpointing']['weights']
     values = {'val_loss_quality': 1.0 / (1.0 + val_loss),
@@ -241,7 +265,25 @@ def signature(cfg):
 
 def device_for(cfg):
     name = cfg['training']['device']
-    return torch.device(('cuda' if torch.cuda.is_available() else 'cpu') if name == 'auto' else name)
+    device = torch.device(
+        ("cuda" if torch.cuda.is_available() else "cpu") if name == "auto" else name
+    )
+    if device.type == "cuda":
+        # BEV tensor shapes repeat heavily, so benchmarked kernels and TF32 improve
+        # throughput without changing storage or checkpoint compatibility.
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+        properties = torch.cuda.get_device_properties(device)
+        print(
+            f"Using GPU {properties.name} ({properties.total_memory / 1e9:.1f} GB); "
+            f'train_batch={cfg["training"]["batch_size"]}, '
+            f'eval_batch={cfg["evaluation"]["batch_size"]}, '
+            f'amp={cfg["training"]["mixed_precision"]}',
+            flush=True,
+        )
+    else:
+        print(f"Using {device.type.upper()} (CUDA unavailable or disabled)", flush=True)
+    return device
 
 
 def sync(device):
@@ -387,6 +429,64 @@ def collect_training_batch(futures, device):
     return bev, target
 
 
+def cuda_oom(error, device):
+    return device.type == "cuda" and (
+        isinstance(error, torch.OutOfMemoryError)
+        or "out of memory" in str(error).lower()
+    )
+
+
+def release_cuda_memory(device):
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def train_examples(model, optimizer, scaler, examples, mode, cfg, device, context):
+    """Train the largest batch that fits, recursively splitting on CUDA OOM."""
+    try:
+        bev = device_tensor(np.stack([example[0] for example in examples]), device)
+        target = tuple(
+            device_tensor(np.stack([example[1][index] for example in examples]), device)
+            for index in range(3)
+        )
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=mixed_precision(cfg, device),
+        ):
+            value = loss(model(bev, mode), target)
+        if not torch.isfinite(value):
+            raise ValueError("Nonfinite training loss")
+        scaler.scale(value).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
+        scaler.step(optimizer)
+        scaler.update()
+        return [float(value.detach())] * len(examples)
+    except (torch.OutOfMemoryError, RuntimeError) as error:
+        if not cuda_oom(error, device):
+            raise
+        optimizer.zero_grad(set_to_none=True)
+        release_cuda_memory(device)
+        if len(examples) == 1:
+            raise RuntimeError(
+                f"CUDA cannot fit one {mode} example ({context}). Reduce resolution, "
+                "hidden_channels, or node_counts, or set training.device=cpu."
+            ) from error
+        midpoint = len(examples) // 2
+        print(
+            f"[{utc_now()}] CUDA OOM ({context}); reducing batch "
+            f"{len(examples)} -> {midpoint}+{len(examples)-midpoint}",
+            flush=True,
+        )
+        return train_examples(
+            model, optimizer, scaler, examples[:midpoint], mode, cfg, device, context
+        ) + train_examples(
+            model, optimizer, scaler, examples[midpoint:], mode, cfg, device, context
+        )
+
+
 def prepare_validation_example(sample, cfg):
     clouds = inputs(sample, sorted(sample["nodes"]), cfg)
     early = array_inputs(clouds, cfg, "early")[0]
@@ -485,49 +585,25 @@ def train(cfg, overwrite=False):
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 pending = submit_training_batch(executor, batches[0], cfg)
                 for batch_index, plans in enumerate(batches):
-                    bev, target = collect_training_batch(pending, device)
+                    examples = [future.result() for future in pending]
                     pending = (
                         submit_training_batch(executor, batches[batch_index + 1], cfg)
                         if batch_index + 1 < len(batches)
                         else None
                     )
                     mode = plans[0][1]
-                    attempts = 0
-                    while True:
-                        try:
-                            with torch.autocast(
-                                device_type=device.type,
-                                dtype=torch.float16,
-                                enabled=mixed_precision(cfg, device),
-                            ):
-                                outputs = model(bev, mode)
-                                value = loss(outputs, target)
-                            if not torch.isfinite(value):
-                                raise ValueError("Nonfinite training loss")
-                            optimizer.zero_grad(set_to_none=True)
-                            scaler.scale(value).backward()
-                            scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
-                            scaler.step(optimizer)
-                            scaler.update()
-                            break
-                        except torch.OutOfMemoryError:
-                            optimizer.zero_grad(set_to_none=True)
-                            if device.type == "cuda":
-                                torch.cuda.empty_cache()
-                            attempts += 1
-                            if (
-                                attempts
-                                > cfg["training"]["recovery"]["cuda_oom_retries"]
-                            ):
-                                raise
-                            print(
-                                f"[{utc_now()}] CUDA OOM seed={seed} epoch={epoch+1}; retry "
-                                f'{attempts}/{cfg["training"]["recovery"]["cuda_oom_retries"]}',
-                                flush=True,
-                            )
-                            wait_for_resources(cfg, device, "CUDA out of memory")
-                    train_losses.extend([float(value.detach())] * len(plans))
+                    train_losses.extend(
+                        train_examples(
+                            model,
+                            optimizer,
+                            scaler,
+                            examples,
+                            mode,
+                            cfg,
+                            device,
+                            f"seed={seed} epoch={epoch+1}",
+                        )
+                    )
             model.eval()
             val, val_map, val_recall, validation_details = validation_metrics(
                 model, validation, cfg, device)
@@ -640,6 +716,104 @@ def infer(model, clouds, cfg, device, strategy):
     return boxes,elapsed_ms,representation
 
 
+def infer_batch(model, cloud_batches, cfg, device, strategy):
+    """Batched inference with transparent CUDA OOM batch reduction."""
+    try:
+        arrays = [array_inputs(clouds, cfg, strategy) for clouds in cloud_batches]
+        if strategy == "early":
+            arrays = [value[0] for value in arrays]
+        bev = device_tensor(np.stack(arrays), device)
+        sync(device)
+        start = time.perf_counter()
+        with torch.no_grad(), torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=mixed_precision(cfg, device),
+        ):
+            if strategy == "early":
+                outputs = model.heads(model.encoder(bev))
+                predictions = [
+                    decode(batch_outputs(outputs, i), cfg)
+                    for i in range(len(cloud_batches))
+                ]
+                representations = [
+                    sum(payload(p) for p in clouds) for clouds in cloud_batches
+                ]
+            else:
+                batch, nodes, channels, height, width = bev.shape
+                features = model.encoder(
+                    bev.reshape(batch * nodes, channels, height, width)
+                ).reshape(batch, nodes, -1, height, width)
+                if strategy == "intermediate":
+                    outputs = model.heads(features.amax(dim=1))
+                    predictions = [
+                        decode(batch_outputs(outputs, i), cfg) for i in range(batch)
+                    ]
+                    representations = [
+                        sum(payload(feature) for feature in item.detach().cpu().numpy())
+                        for item in features
+                    ]
+                else:
+                    outputs = model.heads(
+                        features.reshape(batch * nodes, *features.shape[2:])
+                    )
+                    predictions, representations = [], []
+                    for item in range(batch):
+                        local = [
+                            decode(batch_outputs(outputs, item * nodes + node), cfg)
+                            for node in range(nodes)
+                        ]
+                        predictions.append(
+                            nms(
+                                [box for group in local for box in group],
+                                cfg["evaluation"]["nms_iou"],
+                                cfg["evaluation"]["max_detections"],
+                            )
+                        )
+                        representations.append(
+                            sum(
+                                payload(
+                                    np.array(
+                                        [
+                                            list(box.to_array())
+                                            + [
+                                                cfg["dataset"]["classes"].index(
+                                                    box.label
+                                                ),
+                                                box.score,
+                                            ]
+                                            for box in group
+                                        ],
+                                        dtype=np.float32,
+                                    ).reshape(-1, 9)
+                                )
+                                for group in local
+                            )
+                        )
+        sync(device)
+        per_frame_ms = (time.perf_counter() - start) * 1000 / len(cloud_batches)
+        return list(
+            zip(predictions, [per_frame_ms] * len(predictions), representations)
+        )
+    except (torch.OutOfMemoryError, RuntimeError) as error:
+        if not cuda_oom(error, device):
+            raise
+        release_cuda_memory(device)
+        if len(cloud_batches) == 1:
+            # The legacy path has the smallest possible live tensor set and gives a
+            # clear terminal error if even one frame cannot fit.
+            return [infer(model, cloud_batches[0], cfg, device, strategy)]
+        midpoint = len(cloud_batches) // 2
+        print(
+            f"[{utc_now()}] CUDA OOM during {strategy} evaluation; reducing batch "
+            f"{len(cloud_batches)} -> {midpoint}+{len(cloud_batches)-midpoint}",
+            flush=True,
+        )
+        return infer_batch(
+            model, cloud_batches[:midpoint], cfg, device, strategy
+        ) + infer_batch(model, cloud_batches[midpoint:], cfg, device, strategy)
+
+
 def network_rows(cfg,base,raw_bytes,representation_bytes):
     net = cfg['deployment_assumptions']
     rows = []
@@ -678,31 +852,80 @@ def run_evaluation(cfg):
             groups = choose_groups(common,cfg['evaluation'])
             buckets = defaultdict(list)
             costs = defaultdict(list)
-            for sample in frames:
-                gt = annotations(sample['gt'],cfg['dataset'])
-                cloud_by_node = {n:load_cloud(sample['nodes'][n],cfg['dataset']['bounds']) for n in common}
-                for nodes in groups:
-                    clouds = [cloud_by_node[n] for n in nodes]
-                    raw_bytes = sum(payload(p) for p in clouds)
-                    for strategy in cfg['evaluation']['strategies']:
+            prepared = [
+                (
+                    annotations(sample["gt"], cfg["dataset"]),
+                    {
+                        n: load_cloud(sample["nodes"][n], cfg["dataset"]["bounds"])
+                        for n in common
+                    },
+                )
+                for sample in frames
+            ]
+            batch_size = cfg["evaluation"]["batch_size"]
+            for nodes in groups:
+                for strategy in cfg["evaluation"]["strategies"]:
+                    key = (nodes, strategy)
+                    for start in range(0, len(prepared), batch_size):
+                        chunk = prepared[start : start + batch_size]
+                        cloud_batches = [
+                            [cloud_by_node[n] for n in nodes]
+                            for _, cloud_by_node in chunk
+                        ]
                         if strategy not in warmed:
-                            infer(model,clouds,cfg,device,strategy)
+                            infer(model, cloud_batches[0], cfg, device, strategy)
                             warmed.add(strategy)
-                        preds,elapsed,representation = infer(model,clouds,cfg,device,strategy)
-                        key = (nodes,strategy)
-                        buckets[key].append((preds,gt))
-                        costs[key].append((elapsed,raw_bytes,representation))
-            for (nodes,strategy),values in buckets.items():
-                base = {'seed':seed,'session':session,'weather':frames[0]['weather'],
-                        'nodes':','.join(nodes),'node_count':len(nodes),'strategy':strategy}
-                all_metrics.extend(base | row for row in evaluate(values,cfg['dataset']['classes'],cfg['evaluation']['iou_thresholds']))
-                measured = np.array(costs[(nodes,strategy)])
-                cost_base = base | {'frames':len(values),'inference_decode_ms_mean':float(measured[:,0].mean()),
-                                    'inference_decode_ms_p95':float(np.quantile(measured[:,0],.95))}
-                all_costs.extend(network_rows(cfg,cost_base,float(measured[:,1].mean()),float(measured[:,2].mean())))
-            print(f'Evaluated seed={seed} session={session}, frames={len(frames)}, subsets={len(groups)}',flush=True)
-            write_csv(output/'accuracy.csv',all_metrics)
-            write_csv(output/'latency_communication.csv',all_costs)
+                        results = infer_batch(
+                            model, cloud_batches, cfg, device, strategy
+                        )
+                        for (gt, _), clouds, (preds, elapsed, representation) in zip(
+                            chunk, cloud_batches, results
+                        ):
+                            buckets[key].append((preds, gt))
+                            costs[key].append(
+                                (
+                                    elapsed,
+                                    sum(payload(p) for p in clouds),
+                                    representation,
+                                )
+                            )
+            for (nodes, strategy), values in buckets.items():
+                base = {
+                    "seed": seed,
+                    "session": session,
+                    "weather": frames[0]["weather"],
+                    "nodes": ",".join(nodes),
+                    "node_count": len(nodes),
+                    "strategy": strategy,
+                }
+                all_metrics.extend(
+                    base | row
+                    for row in evaluate(
+                        values,
+                        cfg["dataset"]["classes"],
+                        cfg["evaluation"]["iou_thresholds"],
+                    )
+                )
+                measured = np.array(costs[(nodes, strategy)])
+                cost_base = base | {
+                    "frames": len(values),
+                    "inference_decode_ms_mean": float(measured[:, 0].mean()),
+                    "inference_decode_ms_p95": float(np.quantile(measured[:, 0], 0.95)),
+                }
+                all_costs.extend(
+                    network_rows(
+                        cfg,
+                        cost_base,
+                        float(measured[:, 1].mean()),
+                        float(measured[:, 2].mean()),
+                    )
+                )
+            print(
+                f"Evaluated seed={seed} session={session}, frames={len(frames)}, subsets={len(groups)}",
+                flush=True,
+            )
+            write_csv(output / "accuracy.csv", all_metrics)
+            write_csv(output / "latency_communication.csv", all_costs)
     return all_metrics
 
 

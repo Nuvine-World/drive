@@ -41,6 +41,9 @@ training:
   weight_decay: 0.0001
   device: auto
   hidden_channels: 32
+  batch_size: 8
+  preprocessing_workers: 8
+  mixed_precision: true
   modes: [early, intermediate, single]
   node_counts: [1, 2, 3, 5]
   checkpointing:
@@ -56,6 +59,7 @@ training:
     minimum_free_gpu_gb: 2
     cuda_oom_retries: 3
 evaluation:
+  batch_size: 8
   strategies: [early, intermediate, late]
   node_counts: [1, 2, 3, 5]
   subsets_per_count: 5

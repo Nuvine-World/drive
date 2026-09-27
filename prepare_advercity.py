@@ -224,19 +224,40 @@ def normalize_boxes(raw, world_to_ego, ego_yaw, aliases, classes, bounds):
     boxes = []
     groups = list((raw.get('vehicles') or {}).values()) + list((raw.get('walkers') or {}).values())
     for obj in groups:
-        label = aliases.get(str(obj.get('class', '')).lower(), str(obj.get('class', '')).lower())
-        if label not in classes:
+        try:
+            label = aliases.get(
+                str(obj.get("class", "")).lower(), str(obj.get("class", "")).lower()
+            )
+            if label not in classes:
+                continue
+            location = np.asarray(obj["location"], dtype=float)
+            angle = np.asarray(obj.get("angle", [0, 0, 0]), dtype=float)
+            center = np.asarray(obj.get("center", [0, 0, 0]), dtype=float)
+            extent = np.asarray(obj["extent"], dtype=float)
+            if (
+                location.shape != (3,)
+                or angle.shape != (3,)
+                or center.shape != (3,)
+                or extent.shape != (3,)
+                or not np.isfinite(
+                    np.concatenate((location, angle, center, extent))
+                ).all()
+                or (extent <= 0).any()
+            ):
+                continue
+            yaw = float(angle[1])
+            radians = math.radians(yaw)
+            rotation = np.array(
+                [
+                    [math.cos(radians), -math.sin(radians), 0],
+                    [math.sin(radians), math.cos(radians), 0],
+                    [0, 0, 1],
+                ]
+            )
+            location = location + rotation @ center
+            local = world_to_ego[:3, :3] @ location + world_to_ego[:3, 3]
+        except (KeyError, TypeError, ValueError, OverflowError):
             continue
-        location = np.asarray(obj['location'], dtype=float)
-        angle = obj.get('angle', [0, 0, 0])
-        yaw = float(angle[1])
-        center = np.asarray(obj.get('center', [0, 0, 0]), dtype=float)
-        radians = math.radians(yaw)
-        rotation = np.array([[math.cos(radians), -math.sin(radians), 0],
-                             [math.sin(radians), math.cos(radians), 0], [0, 0, 1]])
-        location = location + rotation @ center
-        local = world_to_ego[:3, :3] @ location + world_to_ego[:3, 3]
-        extent = np.asarray(obj['extent'], dtype=float)
         if ((local >= bounds[:3]) & (local < bounds[3:])).all():
             boxes.append({'class': label, 'position': local.tolist(),
                           'dimensions': (extent * 2).tolist(),
