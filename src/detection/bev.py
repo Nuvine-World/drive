@@ -29,19 +29,29 @@ class BEVDetector(nn.Module):
         return self.heads(features)
 
 
-def targets(boxes, cfg, shape):
+def targets(boxes, cfg, shape, sample_id=None):
     h, w = shape
     classes, b, r = cfg['classes'], cfg['bounds'], cfg['resolution']
     heat = np.zeros((len(classes),h,w),np.float32)
     reg = np.zeros((len(classes),8,h,w),np.float32)
     mask = np.zeros((len(classes),h,w),bool)
+    occupied = {}
     for box in boxes:
         x, y = (box.x-b[0])/r, (box.y-b[1])/r
         ix, iy, c = int(x), int(y), classes.index(box.label)
         if not (0 <= ix < w and 0 <= iy < h):
             continue
-        if mask[c,iy,ix]:
-            raise ValueError('Two same-class centers occupy one grid cell; reduce dataset.resolution')
+        key = c, iy, ix
+        if key in occupied:
+            previous = occupied[key]
+            raise ValueError(
+                "Two same-class centers occupy one grid cell: "
+                f"sample={sample_id!r}, class={box.label!r}, cell=(x={ix}, y={iy}), "
+                f"resolution={r}, first_center=({previous.x:.6f}, {previous.y:.6f}), "
+                f"second_center=({box.x:.6f}, {box.y:.6f}), "
+                f"delta=({abs(previous.x-box.x):.6f}, {abs(previous.y-box.y):.6f})"
+            )
+        occupied[key] = box
         heat[c,iy,ix] = 1
         mask[c,iy,ix] = True
         reg[c,:,iy,ix] = [x-ix,y-iy,box.z,math.log(box.length),math.log(box.width),

@@ -72,6 +72,16 @@ def test_calibration_composition_and_nan_filter(fixture_config):
     assert calibration(node['calibration'])[0,3]==1
 
 
+def test_default_coinfra_bounds_use_global_metric_frame(monkeypatch):
+    monkeypatch.delenv("COINFRA_ROOT", raising=False)
+    cfg = load_config(PROJECT / "configs/coinfra.yaml")
+    bounds = cfg["dataset"]["bounds"]
+    assert bounds[:2] == [-100.0, -100.0]
+    assert bounds[3:5] == [100.0, 100.0]
+    assert bounds[0] < 0 < bounds[3]
+    assert bounds[1] < 0 < bounds[4]
+
+
 def test_zero_yaw_and_empty_gt(fixture_config):
     sample = discover(fixture_config)[0]
     assert annotations(sample['gt'],fixture_config['dataset'])[0].yaw==0
@@ -192,13 +202,14 @@ def test_network_units(fixture_config):
 def test_smoke_profile_is_small_and_split_disjoint():
     cfg = load_config(PROJECT/'configs/coinfra.yaml')
     enable_smoke(cfg)
-    splits = cfg['dataset']['splits']
-    assert all(len(sessions)==1 for sessions in splits.values())
-    assert len({sessions[0] for sessions in splits.values()})==3
-    assert cfg['training']['epochs']==2
-    assert cfg['training']['seeds']==[42]
-    assert cfg['evaluation']['node_counts']==[1]
-    assert Path(cfg['output']['root']).name=='smoke'
+    splits = cfg["dataset"]["splits"]
+    assert all(len(sessions) == 1 for sessions in splits.values())
+    assert len({sessions[0] for sessions in splits.values()}) == 3
+    assert cfg["training"]["epochs"] == 2
+    assert cfg["training"]["seeds"] == [42]
+    assert cfg["training"]["node_counts"] == [1, 2]
+    assert cfg["evaluation"]["node_counts"] == [1, 2]
+    assert Path(cfg["output"]["root"]).name == "smoke"
 
 
 def test_checkpoint_pruning_keeps_highest_scores(tmp_path):
@@ -213,9 +224,22 @@ def test_checkpoint_pruning_keeps_highest_scores(tmp_path):
 
 
 def test_center_collision_explicit(fixture_config):
-    box = BoundingBox3D(1,0,0,4,2,2,0,'car')
-    with pytest.raises(ValueError,match='grid cell'):
-        targets([box,box],fixture_config['dataset'],(16,16))
+    box = BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")
+    with pytest.raises(ValueError, match="grid cell") as failure:
+        targets(
+            [box, box],
+            fixture_config["dataset"],
+            (16, 16),
+            sample_id="session/slice/frame",
+        )
+    message = str(failure.value)
+    assert "sample='session/slice/frame'" in message
+    assert "class='car'" in message
+    assert "cell=(x=9, y=8)" in message
+    assert "resolution=1" in message
+    assert "first_center=(1.000000, 0.000000)" in message
+    assert "second_center=(1.000000, 0.000000)" in message
+    assert "delta=(0.000000, 0.000000)" in message
 
 
 def test_end_to_end_train_all_fusions_report(fixture_config):

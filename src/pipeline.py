@@ -70,10 +70,10 @@ def validation_metrics(model, samples, cfg, device):
     frames = {strategy: [] for strategy in cfg['evaluation']['strategies']}
     with torch.no_grad():
         for sample in samples:
-            clouds = inputs(sample, sorted(sample['nodes']), cfg)
-            bev = tensor_inputs(clouds, cfg, device, 'early')
-            gt = annotations(sample['gt'], cfg['dataset'])
-            target = targets(gt, cfg['dataset'], bev.shape[-2:])
+            clouds = inputs(sample, sorted(sample["nodes"]), cfg)
+            bev = tensor_inputs(clouds, cfg, device, "early")
+            gt = annotations(sample["gt"], cfg["dataset"])
+            target = targets(gt, cfg["dataset"], bev.shape[-2:], sample_id=sample["id"])
             outputs = model(bev)
             losses.append(float(loss(outputs, target)))
             for strategy in frames:
@@ -331,9 +331,14 @@ def train(cfg, overwrite=False):
                 attempts = 0
                 while True:
                     try:
-                        outputs = model(bev,'early' if mode=='single' else mode)
-                        target = targets(annotations(sample['gt'],cfg['dataset']),cfg['dataset'],bev.shape[-2:])
-                        value = loss(outputs,target)
+                        outputs = model(bev, "early" if mode == "single" else mode)
+                        target = targets(
+                            annotations(sample["gt"], cfg["dataset"]),
+                            cfg["dataset"],
+                            bev.shape[-2:],
+                            sample_id=sample["id"],
+                        )
+                        value = loss(outputs, target)
                         if not torch.isfinite(value):
                             raise ValueError('Nonfinite training loss')
                         optimizer.zero_grad(set_to_none=True)
@@ -722,33 +727,55 @@ def report(cfg):
             figure.tight_layout()
             figure.savefig(output/'latency_by_bandwidth.png', dpi=160)
             plt.close(figure)
-    advercity = cfg['dataset'].get('type') == 'advercity'
-    primary = ('Primary question: how much do additional simulated vehicle and roadside LiDAR agents improve detection?'
-               if advercity else
-               'Primary question: how much do additional real roadside LiDAR nodes improve detection?')
-    secondary = ('Secondary question: how does that cooperation gain vary across controlled simulated weather categories?'
-                 if advercity else
-                 'Secondary question: does that cooperation gain persist across recorded weather conditions?')
-    weather_limit = ('Adver-City weather is simulated and categorical; no numerical meteorological visibility is inferred.'
-                     if advercity else
-                     'Weather sessions differ in traffic/date; weather comparisons alone do not establish a causal weather effect.')
-    lines = ['# ECCO cooperation-first experiment report','', primary, secondary,
-             '',
-             'Accuracy: rotated 3D, globally confidence-ranked AP within each session/subset/seed.',
-             'Precision, recall, and F1 use the configured score threshold after class-wise NMS.',
-             'Matched-object diagnostics include 3D IoU, center error, yaw error, and dimension IoU.',
-             'All aggregates are descriptive means, not confidence intervals or causal weather estimates.',
-             'Single-node rows cover every common real node. The fixed global ROI/GT is unchanged across counts.',
-             'Measured inference+decode includes serial node execution and NMS; excludes loading/rasterization/serialization.',
-             'End-to-end latency is an analytical estimate using configured literature-derived assumptions.',
-             'Logical payloads use float32 and zlib level 1; protocol headers and packet loss are not modeled.',
-             'Cloud sends raw cropped points; edge sends raw points/features/local predictions according to strategy.',
-             f'Assumption source: {cfg["deployment_assumptions"]["source"]}.',
-             weather_limit,
-             'cooperation_gains.csv uses paired comparisons within session/seed/class/strategy/IoU.',
-             '', '## Cooperation gain by weather', '',
-             '| Weather | Nodes | Fusion | Class | IoU | AP gain | Recall gain | AP positive rate |',
-             '|---|---:|---|---|---:|---:|---:|---:|']
+    advercity = cfg["dataset"].get("type") == "advercity"
+    primary = (
+        "Primary question: how much do additional simulated vehicle and roadside LiDAR agents improve detection?"
+        if advercity
+        else "Primary question: how much do additional real roadside LiDAR nodes improve detection?"
+    )
+    secondary = (
+        "Secondary question: how does that cooperation gain vary across controlled simulated weather categories?"
+        if advercity
+        else "Secondary question: does that cooperation gain persist across recorded weather conditions?"
+    )
+    weather_limit = (
+        "Adver-City weather is simulated and categorical; no numerical meteorological visibility is inferred."
+        if advercity
+        else "Weather sessions differ in traffic/date; weather comparisons alone do not establish a causal weather effect."
+    )
+    lines = [
+        "# ECCO cooperation-first experiment report",
+        "",
+        primary,
+        secondary,
+        "",
+        *(
+            [
+                "**Smoke-run notice:** this report validates the end-to-end pipeline on a tiny "
+                "sample. Its accuracy and cooperation metrics are not experimental results.",
+                "",
+            ]
+            if cfg["dataset"].get("smoke", {}).get("enabled")
+            else []
+        ),
+        "Accuracy: rotated 3D, globally confidence-ranked AP within each session/subset/seed.",
+        "Precision, recall, and F1 use the configured score threshold after class-wise NMS.",
+        "Matched-object diagnostics include 3D IoU, center error, yaw error, and dimension IoU.",
+        "All aggregates are descriptive means, not confidence intervals or causal weather estimates.",
+        "Single-node rows cover every common real node. The fixed global ROI/GT is unchanged across counts.",
+        "Measured inference+decode includes serial node execution and NMS; excludes loading/rasterization/serialization.",
+        "End-to-end latency is an analytical estimate using configured literature-derived assumptions.",
+        "Logical payloads use float32 and zlib level 1; protocol headers and packet loss are not modeled.",
+        "Cloud sends raw cropped points; edge sends raw points/features/local predictions according to strategy.",
+        f'Assumption source: {cfg["deployment_assumptions"]["source"]}.',
+        weather_limit,
+        "cooperation_gains.csv uses paired comparisons within session/seed/class/strategy/IoU.",
+        "",
+        "## Cooperation gain by weather",
+        "",
+        "| Weather | Nodes | Fusion | Class | IoU | AP gain | Recall gain | AP positive rate |",
+        "|---|---:|---|---|---:|---:|---:|---:|",
+    ]
     for row in weather_summary:
         lines.append(f'| {row["weather"]} | {row["node_count"]} | {row["strategy"]} | '
                      f'{row["class"]} | {row["iou"]} | {row["mean_ap_gain"]:.4f} | '

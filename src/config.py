@@ -19,11 +19,12 @@ def enable_smoke(cfg):
     cfg['dataset']['splits'] = smoke['splits']
     cfg['training']['epochs'] = smoke['epochs']
     cfg['training']['seeds'] = cfg['training']['seeds'][:smoke['seeds']]
-    cfg['training']['node_counts'] = [1]
-    cfg['evaluation']['node_counts'] = [1]
-    output = Path(cfg['output']['root'])
-    if output.name != 'smoke':
-        cfg['output']['root'] = str(output/'smoke')
+    # Keep the profile tiny while still exercising the cooperative code path.
+    cfg["training"]["node_counts"] = [1, 2]
+    cfg["evaluation"]["node_counts"] = [1, 2]
+    output = Path(cfg["output"]["root"])
+    if output.name != "smoke":
+        cfg["output"]["root"] = str(output / "smoke")
     return cfg
 
 
