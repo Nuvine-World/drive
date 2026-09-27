@@ -9,6 +9,8 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
+import warnings
+from collections.abc import Mapping
 from pathlib import Path
 import numpy as np
 import yaml
@@ -222,9 +224,17 @@ def agent_key(path):
 
 def normalize_boxes(raw, world_to_ego, ego_yaw, aliases, classes, bounds):
     boxes = []
-    groups = list((raw.get('vehicles') or {}).values()) + list((raw.get('walkers') or {}).values())
-    for obj in groups:
+    groups, rejected = [], []
+    for group_name in ("vehicles", "walkers"):
+        group = raw.get(group_name) or {}
+        if not isinstance(group, Mapping):
+            rejected.append(f"{group_name}: expected mapping")
+            continue
+        groups.extend(group.values())
+    for index, obj in enumerate(groups):
         try:
+            if not isinstance(obj, Mapping):
+                raise TypeError(f"expected mapping, got {type(obj).__name__}")
             label = aliases.get(
                 str(obj.get("class", "")).lower(), str(obj.get("class", "")).lower()
             )
@@ -244,7 +254,7 @@ def normalize_boxes(raw, world_to_ego, ego_yaw, aliases, classes, bounds):
                 ).all()
                 or (extent <= 0).any()
             ):
-                continue
+                raise ValueError("invalid vector shape, non-finite value, or extent")
             yaw = float(angle[1])
             radians = math.radians(yaw)
             rotation = np.array(
@@ -256,12 +266,25 @@ def normalize_boxes(raw, world_to_ego, ego_yaw, aliases, classes, bounds):
             )
             location = location + rotation @ center
             local = world_to_ego[:3, :3] @ location + world_to_ego[:3, 3]
-        except (KeyError, TypeError, ValueError, OverflowError):
+        except (
+            AttributeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ) as error:
+            rejected.append(f"#{index}: {error}")
             continue
         if ((local >= bounds[:3]) & (local < bounds[3:])).all():
             boxes.append({'class': label, 'position': local.tolist(),
                           'dimensions': (extent * 2).tolist(),
                           'heading': math.radians(yaw - ego_yaw)})
+    if rejected:
+        warnings.warn(
+            f"Skipped {len(rejected)} invalid Adver-City source annotations "
+            f'({"; ".join(rejected[:3])})',
+            RuntimeWarning,
+        )
     return {'objects': boxes}
 
 

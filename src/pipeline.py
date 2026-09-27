@@ -66,6 +66,92 @@ def plot_training(path, rows):
     plt.close(figure)
 
 
+def validate_examples(model, examples, cfg, device, retries):
+    """Validate one prepared batch, splitting only that batch after CUDA OOM."""
+    try:
+        early = device_tensor(np.stack([item[0] for item in examples]), device)
+        per_node = device_tensor(np.stack([item[1] for item in examples]), device)
+        target = tuple(
+            device_tensor(np.stack([item[3][i] for item in examples]), device)
+            for i in range(3)
+        )
+        with torch.no_grad(), torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=mixed_precision(cfg, device),
+        ):
+            early_outputs = model(early)
+            batch_loss = float(loss(early_outputs, target))
+            batch_size, nodes, channels, height, width = per_node.shape
+            features = model.encoder(
+                per_node.reshape(batch_size * nodes, channels, height, width)
+            ).reshape(batch_size, nodes, -1, height, width)
+            intermediate = (
+                model.heads(features.amax(dim=1))
+                if "intermediate" in cfg["evaluation"]["strategies"]
+                else None
+            )
+            late = (
+                model.heads(features.reshape(batch_size * nodes, *features.shape[2:]))
+                if "late" in cfg["evaluation"]["strategies"]
+                else None
+            )
+        frames = {strategy: [] for strategy in cfg["evaluation"]["strategies"]}
+        for index, item in enumerate(examples):
+            if "early" in frames:
+                frames["early"].append(
+                    (decode(batch_outputs(early_outputs, index), cfg), item[2])
+                )
+            if intermediate is not None:
+                frames["intermediate"].append(
+                    (decode(batch_outputs(intermediate, index), cfg), item[2])
+                )
+            if late is not None:
+                offset = index * nodes
+                local = [
+                    decode(batch_outputs(late, offset + node), cfg)
+                    for node in range(nodes)
+                ]
+                frames["late"].append(
+                    (
+                        nms(
+                            [box for group in local for box in group],
+                            cfg["evaluation"]["nms_iou"],
+                            cfg["evaluation"]["max_detections"],
+                        ),
+                        item[2],
+                    )
+                )
+        return [batch_loss] * len(examples), frames
+    except (torch.OutOfMemoryError, RuntimeError) as error:
+        if not cuda_oom(error, device):
+            raise
+        early = per_node = target = early_outputs = features = intermediate = late = (
+            None
+        )
+        release_cuda_memory(device)
+        if len(examples) > 1:
+            midpoint = len(examples) // 2
+            print(
+                f"[{utc_now()}] CUDA OOM during validation; reducing current batch "
+                f"{len(examples)} -> {midpoint}+{len(examples)-midpoint}",
+                flush=True,
+            )
+            left = validate_examples(model, examples[:midpoint], cfg, device, retries)
+            right = validate_examples(model, examples[midpoint:], cfg, device, retries)
+            return left[0] + right[0], {
+                strategy: left[1][strategy] + right[1][strategy]
+                for strategy in cfg["evaluation"]["strategies"]
+            }
+        if retries > 0:
+            wait_for_resources(cfg, device, "single-example validation CUDA OOM")
+            return validate_examples(model, examples, cfg, device, retries - 1)
+        raise RuntimeError(
+            "CUDA cannot fit one validation example after resource retries; reduce "
+            "resolution, hidden_channels, or node_counts, or use training.device=cpu."
+        ) from error
+
+
 def _validation_metrics(model, samples, cfg, device, batch_size):
     losses = []
     frames = {strategy: [] for strategy in cfg['evaluation']['strategies']}
@@ -81,7 +167,8 @@ def _validation_metrics(model, samples, cfg, device, batch_size):
     if not batches:
         raise ValueError("Validation split contains no samples")
     workers = cfg["training"]["preprocessing_workers"]
-    with torch.no_grad(), ThreadPoolExecutor(max_workers=workers) as executor:
+    retries = cfg["training"]["recovery"]["cuda_oom_retries"]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
         pending = submit_validation_batch(executor, batches[0], cfg)
         for batch_index, batch in enumerate(batches):
             examples = [future.result() for future in pending]
@@ -90,67 +177,12 @@ def _validation_metrics(model, samples, cfg, device, batch_size):
                 if batch_index + 1 < len(batches)
                 else None
             )
-            early = device_tensor(np.stack([item[0] for item in examples]), device)
-            per_node = device_tensor(np.stack([item[1] for item in examples]), device)
-            target = tuple(
-                device_tensor(np.stack([item[3][i] for item in examples]), device)
-                for i in range(3)
+            batch_losses, batch_frames = validate_examples(
+                model, examples, cfg, device, retries
             )
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch.float16,
-                enabled=mixed_precision(cfg, device),
-            ):
-                early_outputs = model(early)
-                batch_loss = float(loss(early_outputs, target))
-            losses.extend([batch_loss] * len(examples))
-            if "early" in frames:
-                for index, item in enumerate(examples):
-                    frames["early"].append(
-                        (decode(batch_outputs(early_outputs, index), cfg), item[2])
-                    )
-            batch_size, nodes, channels, height, width = per_node.shape
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch.float16,
-                enabled=mixed_precision(cfg, device),
-            ):
-                features = model.encoder(
-                    per_node.reshape(batch_size * nodes, channels, height, width)
-                )
-                features = features.reshape(batch_size, nodes, *features.shape[1:])
-            if "intermediate" in frames:
-                with torch.autocast(
-                    device_type=device.type,
-                    dtype=torch.float16,
-                    enabled=mixed_precision(cfg, device),
-                ):
-                    intermediate = model.heads(features.amax(dim=1))
-                for index, item in enumerate(examples):
-                    frames["intermediate"].append(
-                        (decode(batch_outputs(intermediate, index), cfg), item[2])
-                    )
-            if "late" in frames:
-                with torch.autocast(
-                    device_type=device.type,
-                    dtype=torch.float16,
-                    enabled=mixed_precision(cfg, device),
-                ):
-                    late = model.heads(
-                        features.reshape(batch_size * nodes, *features.shape[2:])
-                    )
-                for index, item in enumerate(examples):
-                    offset = index * nodes
-                    local = [
-                        decode(batch_outputs(late, offset + node), cfg)
-                        for node in range(nodes)
-                    ]
-                    predictions = nms(
-                        [box for group in local for box in group],
-                        cfg["evaluation"]["nms_iou"],
-                        cfg["evaluation"]["max_detections"],
-                    )
-                    frames["late"].append((predictions, item[2]))
+            losses.extend(batch_losses)
+            for strategy in frames:
+                frames[strategy].extend(batch_frames[strategy])
     details, all_aps, all_precisions, all_recalls, all_f1s = {}, [], [], [], []
     for strategy, strategy_frames in frames.items():
         rows = evaluate(strategy_frames, cfg['dataset']['classes'], cfg['evaluation']['iou_thresholds'])
@@ -174,35 +206,12 @@ def _validation_metrics(model, samples, cfg, device, batch_size):
 
 
 def validation_metrics(model, samples, cfg, device, runtime_batches=None, retries=None):
-    """Validate at the configured batch size, backing off after a CUDA OOM."""
+    """Validate in batches; OOM recovery is local to each failing batch."""
     if runtime_batches is None:
         runtime_batches = {"evaluation": cfg["evaluation"]["batch_size"]}
-    if retries is None:
-        retries = cfg["training"]["recovery"]["cuda_oom_retries"]
-    try:
-        return _validation_metrics(
-            model, samples, cfg, device, runtime_batches["evaluation"]
-        )
-    except (torch.OutOfMemoryError, RuntimeError) as error:
-        if not cuda_oom(error, device):
-            raise
-        release_cuda_memory(device)
-        size = runtime_batches["evaluation"]
-        if size == 1 or retries == 0:
-            raise RuntimeError(
-                "CUDA validation OOM backoff exhausted; reduce batch_size, resolution, "
-                "hidden_channels, or node_counts, or set training.device=cpu."
-            ) from error
-        reduced_size = max(1, size // 2)
-        runtime_batches["evaluation"] = reduced_size
-        print(
-            f"[{utc_now()}] CUDA OOM during validation; reducing batch "
-            f"{size} -> {reduced_size} and restarting validation",
-            flush=True,
-        )
-        return validation_metrics(
-            model, samples, cfg, device, runtime_batches, retries - 1
-        )
+    return _validation_metrics(
+        model, samples, cfg, device, runtime_batches["evaluation"]
+    )
 
 
 def selection_score(cfg, val_loss, val_map, val_recall):
@@ -429,16 +438,6 @@ def submit_training_batch(executor, plans, cfg):
     return [executor.submit(prepare_training_example, plan, cfg) for plan in plans]
 
 
-def collect_training_batch(futures, device):
-    examples = [future.result() for future in futures]
-    bev = device_tensor(np.stack([example[0] for example in examples]), device)
-    target = tuple(
-        device_tensor(np.stack([example[1][index] for example in examples]), device)
-        for index in range(3)
-    )
-    return bev, target
-
-
 def cuda_oom(error, device):
     return device.type == "cuda" and (
         isinstance(error, torch.OutOfMemoryError)
@@ -489,10 +488,25 @@ def train_examples(
         if not cuda_oom(error, device):
             raise
         optimizer.zero_grad(set_to_none=True)
+        bev = target = value = None
         release_cuda_memory(device)
-        if len(examples) == 1 or retries == 0:
+        if len(examples) == 1:
+            if retries > 0:
+                wait_for_resources(cfg, device, f"{context} single-example CUDA OOM")
+                return train_examples(
+                    model,
+                    optimizer,
+                    scaler,
+                    examples,
+                    mode,
+                    cfg,
+                    device,
+                    context,
+                    runtime_batches,
+                    retries - 1,
+                )
             raise RuntimeError(
-                f"CUDA {mode} OOM backoff exhausted ({context}). Reduce batch_size, "
+                f"CUDA {mode} OOM retries exhausted ({context}). Reduce batch_size, "
                 "resolution, hidden_channels, or node_counts, or set training.device=cpu."
             ) from error
         midpoint = len(examples) // 2
@@ -512,7 +526,7 @@ def train_examples(
             device,
             context,
             runtime_batches,
-            retries - 1,
+            retries,
         ) + train_examples(
             model,
             optimizer,
@@ -523,7 +537,7 @@ def train_examples(
             device,
             context,
             runtime_batches,
-            retries - 1,
+            retries,
         )
 
 
@@ -765,8 +779,12 @@ def infer(model, clouds, cfg, device, strategy):
     return boxes,elapsed_ms,representation
 
 
-def infer_batch(model, cloud_batches, cfg, device, strategy, raw_payloads=None):
+def infer_batch(
+    model, cloud_batches, cfg, device, strategy, raw_payloads=None, retries=None
+):
     """Batched inference with transparent CUDA OOM batch reduction."""
+    if retries is None:
+        retries = cfg["training"]["recovery"]["cuda_oom_retries"]
     try:
         arrays = [array_inputs(clouds, cfg, strategy) for clouds in cloud_batches]
         if strategy == "early":
@@ -849,11 +867,27 @@ def infer_batch(model, cloud_batches, cfg, device, strategy, raw_payloads=None):
     except (torch.OutOfMemoryError, RuntimeError) as error:
         if not cuda_oom(error, device):
             raise
+        arrays = bev = outputs = features = predictions = representations = None
         release_cuda_memory(device)
         if len(cloud_batches) == 1:
-            # The legacy path has the smallest possible live tensor set and gives a
-            # clear terminal error if even one frame cannot fit.
-            return [infer(model, cloud_batches[0], cfg, device, strategy)]
+            if retries > 0:
+                wait_for_resources(
+                    cfg, device, f"single-frame {strategy} evaluation CUDA OOM"
+                )
+                return infer_batch(
+                    model,
+                    cloud_batches,
+                    cfg,
+                    device,
+                    strategy,
+                    raw_payloads,
+                    retries - 1,
+                )
+            raise RuntimeError(
+                f"CUDA cannot fit one {strategy} evaluation frame after resource "
+                "retries; reduce resolution, hidden_channels, or node_counts, or "
+                "use training.device=cpu."
+            ) from error
         midpoint = len(cloud_batches) // 2
         print(
             f"[{utc_now()}] CUDA OOM during {strategy} evaluation; reducing batch "
@@ -863,9 +897,21 @@ def infer_batch(model, cloud_batches, cfg, device, strategy, raw_payloads=None):
         left_payloads = raw_payloads[:midpoint] if raw_payloads is not None else None
         right_payloads = raw_payloads[midpoint:] if raw_payloads is not None else None
         return infer_batch(
-            model, cloud_batches[:midpoint], cfg, device, strategy, left_payloads
+            model,
+            cloud_batches[:midpoint],
+            cfg,
+            device,
+            strategy,
+            left_payloads,
+            retries,
         ) + infer_batch(
-            model, cloud_batches[midpoint:], cfg, device, strategy, right_payloads
+            model,
+            cloud_batches[midpoint:],
+            cfg,
+            device,
+            strategy,
+            right_payloads,
+            retries,
         )
 
 
@@ -907,48 +953,48 @@ def run_evaluation(cfg):
             groups = choose_groups(common,cfg['evaluation'])
             buckets = defaultdict(list)
             costs = defaultdict(list)
-            prepared = [
-                (
-                    annotations(sample["gt"], cfg["dataset"]),
-                    {
-                        n: load_cloud(sample["nodes"][n], cfg["dataset"]["bounds"])
-                        for n in common
-                    },
-                )
-                for sample in frames
-            ]
             batch_size = cfg["evaluation"]["batch_size"]
-            for nodes in groups:
-                cloud_frames = [
-                    [cloud_by_node[n] for n in nodes] for _, cloud_by_node in prepared
+            for start in range(0, len(frames), batch_size):
+                frame_chunk = frames[start : start + batch_size]
+                prepared = [
+                    (
+                        annotations(sample["gt"], cfg["dataset"]),
+                        {
+                            n: load_cloud(sample["nodes"][n], cfg["dataset"]["bounds"])
+                            for n in common
+                        },
+                    )
+                    for sample in frame_chunk
                 ]
-                raw_payloads = [
-                    sum(payload(point_cloud) for point_cloud in clouds)
-                    for clouds in cloud_frames
-                ]
-                for strategy in cfg["evaluation"]["strategies"]:
-                    key = (nodes, strategy)
-                    for start in range(0, len(prepared), batch_size):
-                        chunk = prepared[start : start + batch_size]
-                        cloud_batches = cloud_frames[start : start + batch_size]
-                        raw_batch = raw_payloads[start : start + batch_size]
+                for nodes in groups:
+                    cloud_batches = [
+                        [cloud_by_node[n] for n in nodes]
+                        for _, cloud_by_node in prepared
+                    ]
+                    raw_batch = [
+                        sum(payload(point_cloud) for point_cloud in clouds)
+                        for clouds in cloud_batches
+                    ]
+                    for strategy in cfg["evaluation"]["strategies"]:
+                        key = (nodes, strategy)
                         if strategy not in warmed:
-                            infer(model, cloud_batches[0], cfg, device, strategy)
+                            infer_batch(
+                                model,
+                                cloud_batches[:1],
+                                cfg,
+                                device,
+                                strategy,
+                                raw_batch[:1],
+                            )
                             warmed.add(strategy)
                         results = infer_batch(
                             model, cloud_batches, cfg, device, strategy, raw_batch
                         )
                         for (gt, _), raw_bytes, (preds, elapsed, representation) in zip(
-                            chunk, raw_batch, results
+                            prepared, raw_batch, results
                         ):
                             buckets[key].append((preds, gt))
-                            costs[key].append(
-                                (
-                                    elapsed,
-                                    raw_bytes,
-                                    representation,
-                                )
-                            )
+                            costs[key].append((elapsed, raw_bytes, representation))
             for (nodes, strategy), values in buckets.items():
                 base = {
                     "seed": seed,

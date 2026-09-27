@@ -4,7 +4,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import yaml
-from prepare_advercity import convert_scenario, download, extract_archive, matrix, read_ply
+from prepare_advercity import (
+    convert_scenario,
+    download,
+    extract_archive,
+    matrix,
+    normalize_boxes,
+    read_ply,
+)
 from src.config import PROJECT, load_config
 from src.data.advercity import annotations, discover, load_cloud, scenario_weather
 
@@ -112,6 +119,35 @@ def test_advercity_skips_only_invalid_annotations(tmp_path):
         boxes = annotations(path, cfg)
     assert len(boxes) == 1
     assert boxes[0].label == "car"
+
+
+def test_normalize_boxes_skips_and_reports_malformed_source_objects():
+    raw = {
+        "vehicles": {
+            1: {
+                "class": "car",
+                "location": [5, 0, 0],
+                "center": [0, 0, 0],
+                "extent": [2, 1, 1],
+                "angle": [0, 0, 0],
+            },
+            2: None,
+            3: {"class": "car", "location": [float("nan"), 0, 0], "extent": [2, 1, 1]},
+            4: {"class": "car", "location": [1, 0, 0], "extent": [0, 1, 1]},
+        },
+        "walkers": ["not", "a", "mapping"],
+    }
+    with pytest.warns(RuntimeWarning, match="Skipped 4 invalid"):
+        result = normalize_boxes(
+            raw,
+            np.eye(4),
+            0,
+            {"vehicle": "car"},
+            ["car"],
+            np.array([-20, -20, -5, 20, 20, 5]),
+        )
+    assert len(result["objects"]) == 1
+    assert result["objects"][0]["dimensions"] == [4.0, 2.0, 2.0]
 
 
 def test_convert_accepts_nonnumeric_vehicle_agent(tmp_path):

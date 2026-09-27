@@ -292,23 +292,30 @@ def test_validation_rejects_empty_split(fixture_config):
         validation_metrics(model, [], fixture_config, torch.device("cpu"))
 
 
-def test_validation_oom_backoff_persists(monkeypatch, fixture_config):
-    attempted = []
+def test_validation_oom_splits_only_current_batch(monkeypatch, fixture_config):
+    model = BEVDetector(fixture_config["dataset"]["classes"], 4)
+    gt = [BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")]
+    examples = []
+    for _ in range(2):
+        early = np.zeros((3, 16, 16), np.float32)
+        per_node = np.zeros((2, 3, 16, 16), np.float32)
+        target = targets(gt, fixture_config["dataset"], (16, 16))
+        examples.append((early, per_node, gt, target))
+    original = pipeline_module.device_tensor
 
-    def fake_validation(model, samples, cfg, device, batch_size):
-        attempted.append(batch_size)
-        if batch_size == 4:
+    def oom_for_multi_item(array, device):
+        if len(array) > 1:
             raise torch.OutOfMemoryError("out of memory")
-        return "ok"
+        return original(array, torch.device("cpu"))
 
-    monkeypatch.setattr(pipeline_module, "_validation_metrics", fake_validation)
+    monkeypatch.setattr(pipeline_module, "device_tensor", oom_for_multi_item)
     monkeypatch.setattr(pipeline_module, "release_cuda_memory", lambda device: None)
-    runtime_batches = {"evaluation": 4}
-    device = SimpleNamespace(type="cuda")
-    assert validation_metrics(None, [], fixture_config, device, runtime_batches) == "ok"
-    assert runtime_batches["evaluation"] == 2
-    assert validation_metrics(None, [], fixture_config, device, runtime_batches) == "ok"
-    assert attempted == [4, 2, 2]
+    fixture_config["training"]["mixed_precision"] = False
+    losses, frames = pipeline_module.validate_examples(
+        model, examples, fixture_config, SimpleNamespace(type="cuda"), retries=0
+    )
+    assert len(losses) == 2
+    assert all(len(values) == 2 for values in frames.values())
 
 
 def test_decode_accepts_mixed_precision_outputs(fixture_config):
