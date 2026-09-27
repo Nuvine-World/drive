@@ -12,6 +12,7 @@ import zlib
 import platform
 import shutil
 import os
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -185,14 +186,9 @@ def _validation_metrics(model, samples, cfg, device, batch_size):
     workers = cfg["training"]["preprocessing_workers"]
     retries = cfg["training"]["recovery"]["cuda_oom_retries"]
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        pending = submit_validation_batch(executor, batches[0], cfg)
-        for batch_index, batch in enumerate(batches):
-            examples = [future.result() for future in pending]
-            pending = (
-                submit_validation_batch(executor, batches[batch_index + 1], cfg)
-                if batch_index + 1 < len(batches)
-                else None
-            )
+        for batch, examples in prefetched_batches(
+            executor, batches, submit_validation_batch, cfg
+        ):
             batch_losses, batch_frames = validate_examples(
                 model, examples, cfg, device, retries
             )
@@ -666,6 +662,27 @@ def submit_validation_batch(executor, samples, cfg):
     ]
 
 
+def prefetched_batches(executor, batches, submit, cfg, depth=3):
+    """Prepare a bounded number of batches while the current batch runs on GPU."""
+    batches = iter(batches)
+    pending = deque()
+    for _ in range(depth):
+        try:
+            batch = next(batches)
+        except StopIteration:
+            break
+        pending.append((batch, submit(executor, batch, cfg)))
+    while pending:
+        batch, futures = pending.popleft()
+        try:
+            following = next(batches)
+        except StopIteration:
+            following = None
+        if following is not None:
+            pending.append((following, submit(executor, following, cfg)))
+        yield batch, [future.result() for future in futures]
+
+
 def batch_outputs(outputs, index):
     return outputs[0][index : index + 1], outputs[1][index : index + 1]
 
@@ -774,14 +791,9 @@ def train(cfg, overwrite=False):
                 raise ValueError("Training split contains no samples")
             workers = cfg["training"]["preprocessing_workers"]
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                pending = submit_training_batch(executor, batches[0], cfg)
-                for batch_index, plans in enumerate(batches):
-                    examples = [future.result() for future in pending]
-                    pending = (
-                        submit_training_batch(executor, batches[batch_index + 1], cfg)
-                        if batch_index + 1 < len(batches)
-                        else None
-                    )
+                for plans, examples in prefetched_batches(
+                    executor, batches, submit_training_batch, cfg
+                ):
                     mode = plans[0][1]
                     train_losses.extend(
                         train_examples(
