@@ -10,6 +10,7 @@ import time
 import zlib
 import platform
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from collections import defaultdict
 import numpy as np
@@ -68,17 +69,86 @@ def plot_training(path, rows):
 def validation_metrics(model, samples, cfg, device):
     losses = []
     frames = {strategy: [] for strategy in cfg['evaluation']['strategies']}
-    with torch.no_grad():
-        for sample in samples:
-            clouds = inputs(sample, sorted(sample["nodes"]), cfg)
-            bev = tensor_inputs(clouds, cfg, device, "early")
-            gt = annotations(sample["gt"], cfg["dataset"])
-            target = targets(gt, cfg["dataset"], bev.shape[-2:], sample_id=sample["id"])
-            outputs = model(bev)
-            losses.append(float(loss(outputs, target)))
-            for strategy in frames:
-                predictions, _, _ = infer(model, clouds, cfg, device, strategy)
-                frames[strategy].append((predictions, gt))
+    grouped = defaultdict(list)
+    for sample in samples:
+        grouped[len(sample["nodes"])].append(sample)
+    size = cfg["evaluation"]["batch_size"]
+    batches = [
+        group[start : start + size]
+        for group in grouped.values()
+        for start in range(0, len(group), size)
+    ]
+    workers = cfg["training"]["preprocessing_workers"]
+    with torch.no_grad(), ThreadPoolExecutor(max_workers=workers) as executor:
+        pending = submit_validation_batch(executor, batches[0], cfg)
+        for batch_index, batch in enumerate(batches):
+            examples = [future.result() for future in pending]
+            pending = (
+                submit_validation_batch(executor, batches[batch_index + 1], cfg)
+                if batch_index + 1 < len(batches)
+                else None
+            )
+            early = device_tensor(np.stack([item[0] for item in examples]), device)
+            per_node = device_tensor(np.stack([item[1] for item in examples]), device)
+            target = tuple(
+                device_tensor(np.stack([item[3][i] for item in examples]), device)
+                for i in range(3)
+            )
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=mixed_precision(cfg, device),
+            ):
+                early_outputs = model(early)
+                batch_loss = float(loss(early_outputs, target))
+            losses.extend([batch_loss] * len(examples))
+            if "early" in frames:
+                for index, item in enumerate(examples):
+                    frames["early"].append(
+                        (decode(batch_outputs(early_outputs, index), cfg), item[2])
+                    )
+            batch_size, nodes, channels, height, width = per_node.shape
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=mixed_precision(cfg, device),
+            ):
+                features = model.encoder(
+                    per_node.reshape(batch_size * nodes, channels, height, width)
+                )
+                features = features.reshape(batch_size, nodes, *features.shape[1:])
+            if "intermediate" in frames:
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.float16,
+                    enabled=mixed_precision(cfg, device),
+                ):
+                    intermediate = model.heads(features.amax(dim=1))
+                for index, item in enumerate(examples):
+                    frames["intermediate"].append(
+                        (decode(batch_outputs(intermediate, index), cfg), item[2])
+                    )
+            if "late" in frames:
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.float16,
+                    enabled=mixed_precision(cfg, device),
+                ):
+                    late = model.heads(
+                        features.reshape(batch_size * nodes, *features.shape[2:])
+                    )
+                for index, item in enumerate(examples):
+                    offset = index * nodes
+                    local = [
+                        decode(batch_outputs(late, offset + node), cfg)
+                        for node in range(nodes)
+                    ]
+                    predictions = nms(
+                        [box for group in local for box in group],
+                        cfg["evaluation"]["nms_iou"],
+                        cfg["evaluation"]["max_detections"],
+                    )
+                    frames["late"].append((predictions, item[2]))
     details, all_aps, all_precisions, all_recalls, all_f1s = {}, [], [], [], []
     for strategy, strategy_frames in frames.items():
         rows = evaluate(strategy_frames, cfg['dataset']['classes'], cfg['evaluation']['iou_thresholds'])
@@ -251,15 +321,97 @@ def inputs(sample, nodes, cfg):
 
 
 def tensor_inputs(clouds, cfg, device, mode):
-    if mode == 'early':
-        bevs = rasterize(np.concatenate(clouds),cfg['dataset'])[None]
-    else:
-        bevs = np.stack([rasterize(p,cfg['dataset']) for p in clouds])
-    return torch.from_numpy(bevs).to(device)
+    bevs = array_inputs(clouds, cfg, mode)
+    return device_tensor(bevs, device)
+
+
+def array_inputs(clouds, cfg, mode):
+    if mode == "early":
+        return rasterize(np.concatenate(clouds), cfg["dataset"])[None]
+    return np.stack([rasterize(p, cfg["dataset"]) for p in clouds])
+
+
+def device_tensor(array, device):
+    value = torch.from_numpy(array)
+    if device.type == "cuda":
+        value = value.pin_memory()
+    return value.to(device, non_blocking=device.type == "cuda")
+
+
+def training_plan(order, cfg, rng):
+    buckets = defaultdict(list)
+    for sample in order:
+        available = sorted(sample["nodes"])
+        counts = [n for n in cfg["training"]["node_counts"] if n <= len(available)]
+        if not counts:
+            raise ValueError("No training node count fits available data")
+        mode = rng.choice(cfg["training"]["modes"])
+        nodes = rng.sample(available, 1 if mode == "single" else rng.choice(counts))
+        model_mode = "early" if mode == "single" else mode
+        buckets[(model_mode, len(nodes))].append((sample, model_mode, nodes))
+    batches = []
+    size = cfg["training"]["batch_size"]
+    for plans in buckets.values():
+        batches.extend(
+            plans[start : start + size] for start in range(0, len(plans), size)
+        )
+    rng.shuffle(batches)
+    return batches
+
+
+def prepare_training_example(plan, cfg):
+    sample, mode, nodes = plan
+    bev = array_inputs(inputs(sample, nodes, cfg), cfg, mode)
+    if mode == "early":
+        bev = bev[0]
+    target = targets(
+        annotations(sample["gt"], cfg["dataset"]),
+        cfg["dataset"],
+        bev.shape[-2:],
+        sample_id=sample["id"],
+    )
+    return bev, target
+
+
+def submit_training_batch(executor, plans, cfg):
+    return [executor.submit(prepare_training_example, plan, cfg) for plan in plans]
+
+
+def collect_training_batch(futures, device):
+    examples = [future.result() for future in futures]
+    bev = device_tensor(np.stack([example[0] for example in examples]), device)
+    target = tuple(
+        device_tensor(np.stack([example[1][index] for example in examples]), device)
+        for index in range(3)
+    )
+    return bev, target
+
+
+def prepare_validation_example(sample, cfg):
+    clouds = inputs(sample, sorted(sample["nodes"]), cfg)
+    early = array_inputs(clouds, cfg, "early")[0]
+    per_node = array_inputs(clouds, cfg, "intermediate")
+    gt = annotations(sample["gt"], cfg["dataset"])
+    target = targets(gt, cfg["dataset"], early.shape[-2:], sample_id=sample["id"])
+    return early, per_node, gt, target
+
+
+def submit_validation_batch(executor, samples, cfg):
+    return [
+        executor.submit(prepare_validation_example, sample, cfg) for sample in samples
+    ]
+
+
+def batch_outputs(outputs, index):
+    return outputs[0][index : index + 1], outputs[1][index : index + 1]
 
 
 def make_model(cfg,device):
     return BEVDetector(cfg['dataset']['classes'],cfg['training']['hidden_channels']).to(device)
+
+
+def mixed_precision(cfg, device):
+    return device.type == "cuda" and cfg["training"]["mixed_precision"]
 
 
 def train(cfg, overwrite=False):
@@ -290,26 +442,35 @@ def train(cfg, overwrite=False):
         np.random.seed(seed)
         torch.manual_seed(seed)
         rng = random.Random(seed)
-        model = make_model(cfg,device)
-        optimizer = torch.optim.AdamW(model.parameters(),lr=cfg['training']['learning_rate'],
-                                      weight_decay=cfg['training']['weight_decay'])
-        best_score, history, start_epoch = -float('inf'), [], 0
+        model = make_model(cfg, device)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=cfg["training"]["learning_rate"],
+            weight_decay=cfg["training"]["weight_decay"],
+        )
+        scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision(cfg, device))
+        best_score, history, start_epoch = -float("inf"), [], 0
         if not overwrite and not completion.exists() and latest.exists():
             if not cfg['training']['recovery']['resume']:
                 raise ValueError(f'Incomplete training for seed {seed}; enable training.recovery.resume or use --overwrite')
             state = torch.load(latest, map_location=device, weights_only=True)
-            if state['signature'] != signature(cfg) or state['config'] != cfg:
-                raise ValueError(f'{latest} belongs to a different configuration')
-            model.load_state_dict(state['model'])
-            optimizer.load_state_dict(state['optimizer'])
-            start_epoch = int(state['epoch'])
-            best_score = float(state['best_score'])
-            history = state['history']
-            rng.setstate(state['python_rng_state'])
-            torch.set_rng_state(state['torch_rng_state'].cpu())
-            if device.type == 'cuda' and state.get('cuda_rng_state') is not None:
-                torch.cuda.set_rng_state(state['cuda_rng_state'].cpu(), device)
-            print(f'[{utc_now()}] RESUMING seed={seed} after epoch={start_epoch} from {latest}', flush=True)
+            if state["signature"] != signature(cfg) or state["config"] != cfg:
+                raise ValueError(f"{latest} belongs to a different configuration")
+            model.load_state_dict(state["model"])
+            optimizer.load_state_dict(state["optimizer"])
+            if state.get("scaler") is not None:
+                scaler.load_state_dict(state["scaler"])
+            start_epoch = int(state["epoch"])
+            best_score = float(state["best_score"])
+            history = state["history"]
+            rng.setstate(state["python_rng_state"])
+            torch.set_rng_state(state["torch_rng_state"].cpu())
+            if device.type == "cuda" and state.get("cuda_rng_state") is not None:
+                torch.cuda.set_rng_state(state["cuda_rng_state"].cpu(), device)
+            print(
+                f"[{utc_now()}] RESUMING seed={seed} after epoch={start_epoch} from {latest}",
+                flush=True,
+            )
         elif not overwrite and path.exists() and not completion.exists():
             raise ValueError(f'Incomplete training for seed {seed} has no recovery checkpoint; use --overwrite')
         started = time.perf_counter()
@@ -319,44 +480,54 @@ def train(cfg, overwrite=False):
             order = training.copy()
             rng.shuffle(order)
             train_losses = []
-            for sample in order:
-                available = sorted(sample['nodes'])
-                counts = [n for n in cfg['training']['node_counts'] if n<=len(available)]
-                if not counts:
-                    raise ValueError('No training node count fits available data')
-                mode = rng.choice(cfg['training']['modes'])
-                nodes = rng.sample(available,1 if mode=='single' else rng.choice(counts))
-                cloud = inputs(sample,nodes,cfg)
-                bev = tensor_inputs(cloud,cfg,device,'early' if mode=='single' else mode)
-                attempts = 0
-                while True:
-                    try:
-                        outputs = model(bev, "early" if mode == "single" else mode)
-                        target = targets(
-                            annotations(sample["gt"], cfg["dataset"]),
-                            cfg["dataset"],
-                            bev.shape[-2:],
-                            sample_id=sample["id"],
-                        )
-                        value = loss(outputs, target)
-                        if not torch.isfinite(value):
-                            raise ValueError('Nonfinite training loss')
-                        optimizer.zero_grad(set_to_none=True)
-                        value.backward()
-                        torch.nn.utils.clip_grad_norm_(model.parameters(),10)
-                        optimizer.step()
-                        break
-                    except torch.OutOfMemoryError:
-                        optimizer.zero_grad(set_to_none=True)
-                        if device.type == 'cuda':
-                            torch.cuda.empty_cache()
-                        attempts += 1
-                        if attempts > cfg['training']['recovery']['cuda_oom_retries']:
-                            raise
-                        print(f'[{utc_now()}] CUDA OOM seed={seed} epoch={epoch+1}; retry '
-                              f'{attempts}/{cfg["training"]["recovery"]["cuda_oom_retries"]}', flush=True)
-                        wait_for_resources(cfg, device, 'CUDA out of memory')
-                train_losses.append(float(value.detach()))
+            batches = training_plan(order, cfg, rng)
+            workers = cfg["training"]["preprocessing_workers"]
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                pending = submit_training_batch(executor, batches[0], cfg)
+                for batch_index, plans in enumerate(batches):
+                    bev, target = collect_training_batch(pending, device)
+                    pending = (
+                        submit_training_batch(executor, batches[batch_index + 1], cfg)
+                        if batch_index + 1 < len(batches)
+                        else None
+                    )
+                    mode = plans[0][1]
+                    attempts = 0
+                    while True:
+                        try:
+                            with torch.autocast(
+                                device_type=device.type,
+                                dtype=torch.float16,
+                                enabled=mixed_precision(cfg, device),
+                            ):
+                                outputs = model(bev, mode)
+                                value = loss(outputs, target)
+                            if not torch.isfinite(value):
+                                raise ValueError("Nonfinite training loss")
+                            optimizer.zero_grad(set_to_none=True)
+                            scaler.scale(value).backward()
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
+                            scaler.step(optimizer)
+                            scaler.update()
+                            break
+                        except torch.OutOfMemoryError:
+                            optimizer.zero_grad(set_to_none=True)
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
+                            attempts += 1
+                            if (
+                                attempts
+                                > cfg["training"]["recovery"]["cuda_oom_retries"]
+                            ):
+                                raise
+                            print(
+                                f"[{utc_now()}] CUDA OOM seed={seed} epoch={epoch+1}; retry "
+                                f'{attempts}/{cfg["training"]["recovery"]["cuda_oom_retries"]}',
+                                flush=True,
+                            )
+                            wait_for_resources(cfg, device, "CUDA out of memory")
+                    train_losses.extend([float(value.detach())] * len(plans))
             model.eval()
             val, val_map, val_recall, validation_details = validation_metrics(
                 model, validation, cfg, device)
@@ -389,19 +560,33 @@ def train(cfg, overwrite=False):
                 best_tmp.replace(path)
             metrics_path = path.parent/f'training_metrics_seed_{seed}.csv'
             write_csv(metrics_path, history)
-            if cfg['output']['plots']:
-                plot_training(path.parent/f'training_curves_seed_{seed}.png', history)
-            kept_epochs = ','.join(str(item[1]) for item in retained)
-            print(f'seed={seed} epoch={epoch+1} train={row["train_loss"]:.4f} '
-                  f'val={val:.4f} mAP={val_map:.4f} precision={row["val_precision"]:.4f} '
-                  f'recall={val_recall:.4f} F1={row["val_f1"]:.4f} '
-                  f'score={score:.4f} kept=[{kept_epochs}]', flush=True)
-            if (epoch+1) % cfg['training']['recovery']['save_every_epochs'] == 0:
-                wait_for_resources(cfg, device, 'before recovery checkpoint')
-                recovery_state = state | {'optimizer':optimizer.state_dict(),
-                    'best_score':best_score,'history':history,
-                    'python_rng_state':rng.getstate(),'torch_rng_state':torch.get_rng_state(),
-                    'cuda_rng_state':torch.cuda.get_rng_state(device) if device.type=='cuda' else None}
+            if cfg["output"]["plots"]:
+                plot_training(path.parent / f"training_curves_seed_{seed}.png", history)
+            kept_epochs = ",".join(str(item[1]) for item in retained)
+            print(
+                f'seed={seed} epoch={epoch+1} train={row["train_loss"]:.4f} '
+                f'val={val:.4f} mAP={val_map:.4f} precision={row["val_precision"]:.4f} '
+                f'recall={val_recall:.4f} F1={row["val_f1"]:.4f} '
+                f"score={score:.4f} kept=[{kept_epochs}]",
+                flush=True,
+            )
+            if (epoch + 1) % cfg["training"]["recovery"]["save_every_epochs"] == 0:
+                wait_for_resources(cfg, device, "before recovery checkpoint")
+                recovery_state = state | {
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": (
+                        scaler.state_dict() if mixed_precision(cfg, device) else None
+                    ),
+                    "best_score": best_score,
+                    "history": history,
+                    "python_rng_state": rng.getstate(),
+                    "torch_rng_state": torch.get_rng_state(),
+                    "cuda_rng_state": (
+                        torch.cuda.get_rng_state(device)
+                        if device.type == "cuda"
+                        else None
+                    ),
+                }
                 atomic_torch_save(recovery_state, latest)
         best_state = torch.load(path, map_location='cpu', weights_only=True)
         write_json(completion,{'timestamp_utc':utc_now(),'epochs':cfg['training']['epochs'],

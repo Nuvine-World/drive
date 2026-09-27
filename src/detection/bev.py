@@ -22,10 +22,15 @@ class BEVDetector(nn.Module):
     def heads(self, features):
         return self.heatmap(features), self.regression(features)
 
-    def forward(self, bev, mode='early'):
-        features = self.encoder(bev)
-        if mode == 'intermediate':
-            features = features.amax(dim=0, keepdim=True)
+    def forward(self, bev, mode="early"):
+        if mode == "intermediate" and bev.ndim == 5:
+            batch, nodes, channels, height, width = bev.shape
+            features = self.encoder(bev.reshape(batch * nodes, channels, height, width))
+            features = features.reshape(batch, nodes, *features.shape[1:]).amax(dim=1)
+        else:
+            features = self.encoder(bev)
+            if mode == "intermediate":
+                features = features.amax(dim=0, keepdim=True)
         return self.heads(features)
 
 
@@ -62,13 +67,29 @@ def targets(boxes, cfg, shape, sample_id=None):
 def loss(outputs, target):
     logits, regression = outputs
     heat, reg, mask = [torch.as_tensor(v,device=logits.device) for v in target]
-    p = logits[0].sigmoid().clamp(1e-5,1-1e-5)
+    if heat.ndim == 3:
+        heat, reg, mask = heat[None], reg[None], mask[None]
+    p = logits.sigmoid().float().clamp(1e-5, 1 - 1e-5)
     positive = heat == 1
-    focal = -(torch.where(positive,(1-p)**2*p.log(),p**2*(1-p).log())).sum()/positive.sum().clamp(min=1)
-    prediction = regression[0].reshape_as(reg).permute(0,2,3,1)
-    expected = reg.permute(0,2,3,1)
-    regression_loss = F.smooth_l1_loss(prediction[mask],expected[mask]) if mask.any() else regression.sum()*0
-    return focal + regression_loss
+    axes = tuple(range(1, heat.ndim))
+    focal = -torch.where(positive, (1 - p) ** 2 * p.log(), p**2 * (1 - p).log()).sum(
+        dim=axes
+    )
+    focal = focal / positive.sum(dim=axes).clamp(min=1)
+    prediction = regression.float().reshape(
+        reg.shape[0], reg.shape[1], 8, *reg.shape[-2:]
+    )
+    prediction = prediction.permute(0, 1, 3, 4, 2)
+    expected = reg.permute(0, 1, 3, 4, 2)
+    regression_losses = []
+    for index in range(len(reg)):
+        selected = mask[index]
+        regression_losses.append(
+            F.smooth_l1_loss(prediction[index][selected], expected[index][selected])
+            if selected.any()
+            else prediction[index].sum() * 0
+        )
+    return (focal + torch.stack(regression_losses)).mean()
 
 
 def decode(outputs, cfg):

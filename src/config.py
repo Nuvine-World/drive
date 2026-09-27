@@ -77,13 +77,34 @@ def load_config(path):
         if not sessions or seen.intersection(sessions):
             raise ValueError('Splits must be nonempty and recording sessions must not overlap')
         seen.update(sessions)
-    if not e['strategies'] or not set(e['strategies']) <= {'early', 'intermediate', 'late'}:
-        raise ValueError('Unknown fusion strategy')
-    if not t['modes'] or not set(t['modes']) <= {'early', 'intermediate', 'single'}:
-        raise ValueError('Unknown training mode')
-    if t['epochs'] < 1 or not t['seeds'] or t['learning_rate'] <= 0:
-        raise ValueError('Invalid training configuration')
-    checkpointing = t.setdefault('checkpointing', {})
+    if not e["strategies"] or not set(e["strategies"]) <= {
+        "early",
+        "intermediate",
+        "late",
+    }:
+        raise ValueError("Unknown fusion strategy")
+    if not t["modes"] or not set(t["modes"]) <= {"early", "intermediate", "single"}:
+        raise ValueError("Unknown training mode")
+    if t["epochs"] < 1 or not t["seeds"] or t["learning_rate"] <= 0:
+        raise ValueError("Invalid training configuration")
+    t.setdefault("batch_size", 1)
+    t.setdefault("preprocessing_workers", 1)
+    t.setdefault("mixed_precision", False)
+    if (
+        not isinstance(t["batch_size"], int)
+        or isinstance(t["batch_size"], bool)
+        or t["batch_size"] < 1
+    ):
+        raise ValueError("training.batch_size must be positive")
+    if (
+        not isinstance(t["preprocessing_workers"], int)
+        or isinstance(t["preprocessing_workers"], bool)
+        or t["preprocessing_workers"] < 1
+    ):
+        raise ValueError("training.preprocessing_workers must be positive")
+    if not isinstance(t["mixed_precision"], bool):
+        raise ValueError("training.mixed_precision must be boolean")
+    checkpointing = t.setdefault("checkpointing", {})
     if not isinstance(checkpointing, dict):
         raise ValueError('training.checkpointing must be a mapping')
     checkpointing.setdefault('keep_best', 3)
@@ -105,24 +126,43 @@ def load_config(path):
                 'cuda_oom_retries': 3}
     for key, value in defaults.items():
         recovery.setdefault(key, value)
-    if recovery['save_every_epochs'] < 1 or recovery['poll_seconds'] < 1 or recovery['timeout_minutes'] < 0:
-        raise ValueError('Invalid training recovery interval')
-    if recovery['minimum_free_disk_gb'] < 0 or recovery['minimum_free_gpu_gb'] < 0 or recovery['cuda_oom_retries'] < 0:
-        raise ValueError('Recovery space and retry values must be nonnegative')
-    if any(n < 1 for n in e['node_counts'] + t['node_counts']):
-        raise ValueError('Node counts must be positive')
-    if e['subsets_per_count'] < 1 or e['max_detections'] < 1:
-        raise ValueError('Invalid evaluation limits')
-    if any(not 0 < x <= 1 for x in e['iou_thresholds']):
-        raise ValueError('Invalid IoU threshold')
-    if not 0 <= e['score_threshold'] <= 1 or not 0 < e['nms_iou'] <= 1:
-        raise ValueError('Invalid detection thresholds')
-    n = cfg['deployment_assumptions']
-    if not isinstance(n.get('source'), str) or not n['source'].strip():
-        raise ValueError('deployment_assumptions.source must identify the assumption source')
-    if any(not math.isfinite(x) or x <= 0 for x in n['bandwidths_mbps']):
-        raise ValueError('Bandwidth must be positive')
-    for p in ('edge', 'cloud'):
-        if n[p+'_rtt_ms'] < 0 or any(n['processing_ms'][p][s] < 0 for s in e['strategies']):
-            raise ValueError('Latency cannot be negative')
+    if (
+        recovery["save_every_epochs"] < 1
+        or recovery["poll_seconds"] < 1
+        or recovery["timeout_minutes"] < 0
+    ):
+        raise ValueError("Invalid training recovery interval")
+    if (
+        recovery["minimum_free_disk_gb"] < 0
+        or recovery["minimum_free_gpu_gb"] < 0
+        or recovery["cuda_oom_retries"] < 0
+    ):
+        raise ValueError("Recovery space and retry values must be nonnegative")
+    if any(n < 1 for n in e["node_counts"] + t["node_counts"]):
+        raise ValueError("Node counts must be positive")
+    if e["subsets_per_count"] < 1 or e["max_detections"] < 1:
+        raise ValueError("Invalid evaluation limits")
+    e.setdefault("batch_size", t["batch_size"])
+    if (
+        not isinstance(e["batch_size"], int)
+        or isinstance(e["batch_size"], bool)
+        or e["batch_size"] < 1
+    ):
+        raise ValueError("evaluation.batch_size must be positive")
+    if any(not 0 < x <= 1 for x in e["iou_thresholds"]):
+        raise ValueError("Invalid IoU threshold")
+    if not 0 <= e["score_threshold"] <= 1 or not 0 < e["nms_iou"] <= 1:
+        raise ValueError("Invalid detection thresholds")
+    n = cfg["deployment_assumptions"]
+    if not isinstance(n.get("source"), str) or not n["source"].strip():
+        raise ValueError(
+            "deployment_assumptions.source must identify the assumption source"
+        )
+    if any(not math.isfinite(x) or x <= 0 for x in n["bandwidths_mbps"]):
+        raise ValueError("Bandwidth must be positive")
+    for p in ("edge", "cloud"):
+        if n[p + "_rtt_ms"] < 0 or any(
+            n["processing_ms"][p][s] < 0 for s in e["strategies"]
+        ):
+            raise ValueError("Latency cannot be negative")
     return cfg

@@ -15,7 +15,7 @@ from src.config import PROJECT, enable_smoke, load_config
 from main import run_pipeline
 from src.data.coinfra import annotations, calibration, discover, load_cloud, rasterize
 from src.data.loader import BoundingBox3D
-from src.detection.bev import targets
+from src.detection.bev import BEVDetector, loss, targets
 from src.metrics.evaluation import evaluate, iou3d
 from src.pipeline import (choose_groups, indexed, inspect, network_rows,
                           prune_checkpoints, report, run_evaluation, train, verify_results)
@@ -240,6 +240,39 @@ def test_center_collision_explicit(fixture_config):
     assert "first_center=(1.000000, 0.000000)" in message
     assert "second_center=(1.000000, 0.000000)" in message
     assert "delta=(0.000000, 0.000000)" in message
+
+
+def test_batched_detector_and_loss_match_individual_samples(fixture_config):
+    torch.manual_seed(7)
+    model = BEVDetector(fixture_config["dataset"]["classes"], 4)
+    bev = torch.randn(2, 3, 16, 16)
+    boxes = [
+        [BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")],
+        [BoundingBox3D(-1, 1, 0, 1, 1, 2, 0, "pedestrian")],
+    ]
+    target = tuple(
+        np.stack(values)
+        for values in zip(
+            *[targets(value, fixture_config["dataset"], (16, 16)) for value in boxes]
+        )
+    )
+    batched_outputs = model(bev)
+    batched_loss = loss(batched_outputs, target)
+    individual = [
+        loss(
+            (batched_outputs[0][i : i + 1], batched_outputs[1][i : i + 1]),
+            tuple(value[i] for value in target),
+        )
+        for i in range(2)
+    ]
+    expected = float(torch.stack(individual).mean().detach())
+    assert float(batched_loss.detach()) == pytest.approx(expected, rel=1e-6)
+
+    per_node = torch.randn(2, 2, 3, 16, 16)
+    batched = model(per_node, "intermediate")
+    separate = [model(per_node[i], "intermediate") for i in range(2)]
+    torch.testing.assert_close(batched[0], torch.cat([value[0] for value in separate]))
+    torch.testing.assert_close(batched[1], torch.cat([value[1] for value in separate]))
 
 
 def test_end_to_end_train_all_fusions_report(fixture_config):
