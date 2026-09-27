@@ -34,15 +34,30 @@ from src.pipeline import (
 
 @pytest.fixture
 def fixture_config(tmp_path):
-    cfg = load_config(PROJECT/'configs/coinfra.yaml')
-    d = cfg['dataset']
-    d.update(root=str(tmp_path/'data'),bounds=[-8,-8,-2,8,8,4],resolution=1,
-             frame_stride=1,classes=['car','pedestrian'],splits={
-                 'train':['2025_01_01_sunny'],'val':['2025_01_02_sunny'],
-                 'test':['2025_01_03_rainy']})
-    cfg['output']['root'] = str(tmp_path/'output')
-    cfg['training'].update(seeds=[1],epochs=1,device='cpu',hidden_channels=4,node_counts=[1,2])
-    cfg['evaluation'].update(node_counts=[1,2],max_detections=5,score_threshold=0.01)
+    cfg = load_config(PROJECT / "configs/coinfra.yaml")
+    d = cfg["dataset"]
+    d.update(
+        root=str(tmp_path / "data"),
+        bounds=[-8, -8, -2, 8, 8, 4],
+        resolution=1,
+        frame_stride=1,
+        classes=["car", "pedestrian"],
+        splits={
+            "train": ["2025_01_01_sunny"],
+            "val": ["2025_01_02_sunny"],
+            "test": ["2025_01_03_rainy"],
+        },
+    )
+    cfg["output"]["root"] = str(tmp_path / "output")
+    cfg["training"].update(
+        seeds=[1],
+        epochs=1,
+        device="cpu",
+        require_cuda=False,
+        hidden_channels=4,
+        node_counts=[1, 2],
+    )
+    cfg["evaluation"].update(node_counts=[1, 2], max_detections=5, score_threshold=0.01)
     rng = np.random.default_rng(3)
     for sessions in d['splits'].values():
         for session in sessions:
@@ -234,6 +249,12 @@ def test_checkpoint_pruning_keeps_highest_scores(tmp_path):
     assert not (tmp_path/'epoch_0001.json').exists()
 
 
+def test_checkpoint_pruning_ignores_truncated_metadata(tmp_path):
+    (tmp_path / "epoch_0001.pt").write_bytes(b"checkpoint")
+    (tmp_path / "epoch_0001.json").write_text("{")
+    assert prune_checkpoints(tmp_path, 2) == []
+
+
 def test_center_collision_explicit(fixture_config):
     box = BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")
     with pytest.raises(ValueError, match="grid cell") as failure:
@@ -365,12 +386,18 @@ def test_cli_from_another_directory(fixture_config,tmp_path):
     config = tmp_path/'run.yaml'
     config.write_text(yaml.safe_dump(fixture_config))
     env = os.environ.copy()
-    env.pop('COINFRA_ROOT',None)
-    env['COINFRA_PYTHON']=sys.executable
-    result = subprocess.run(['bash',str(PROJECT/'run.sh'),'--config',str(config),'--stage','check'],
-                            cwd=tmp_path,env=env,text=True,capture_output=True)
-    assert result.returncode==0, result.stderr
-    assert 'Configuration valid' in result.stdout
+    env.pop("COINFRA_ROOT", None)
+    env["COINFRA_PYTHON"] = sys.executable
+    env["ECCO_LOG_DIR"] = str(tmp_path / "logs")
+    result = subprocess.run(
+        ["bash", str(PROJECT / "run.sh"), "--config", str(config), "--stage", "check"],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Configuration valid" in result.stdout
 
 
 def test_training_incomplete_checkpoint_resumes_from_latest(fixture_config):
@@ -378,6 +405,31 @@ def test_training_incomplete_checkpoint_resumes_from_latest(fixture_config):
     train(fixture_config)
     path = Path(fixture_config['output']['root'])/'seed_1/complete.json'
     path.unlink()
+    fixture_config["training"]["preprocessing_workers"] = 2
+    fixture_config["output"]["plots"] = False
     train(fixture_config)
     assert path.exists()
     assert (path.parent/'latest.pt').exists()
+
+
+def test_completed_training_can_extend_epochs(fixture_config):
+    torch.set_num_threads(1)
+    train(fixture_config)
+    fixture_config["training"]["epochs"] = 2
+    fixture_config["training"]["batch_size"] = 1
+    train(fixture_config)
+    completion = Path(fixture_config["output"]["root"]) / "seed_1/complete.json"
+    assert json.loads(completion.read_text())["epochs"] == 2
+
+
+def test_evaluation_reuses_completed_session_parts(monkeypatch, fixture_config):
+    torch.set_num_threads(1)
+    train(fixture_config)
+    first = run_evaluation(fixture_config)
+    monkeypatch.setattr(
+        pipeline_module,
+        "infer_batch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("recomputed")),
+    )
+    second = run_evaluation(fixture_config)
+    assert second == first

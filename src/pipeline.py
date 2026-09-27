@@ -1,5 +1,6 @@
 """Reproducible CoInfra preprocessing, training, inference and network sweeps."""
 import csv
+import gc
 import hashlib
 import itertools
 import json
@@ -10,6 +11,7 @@ import time
 import zlib
 import platform
 import shutil
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -21,17 +23,30 @@ from src.metrics.evaluation import evaluate, nms
 
 
 def write_json(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, allow_nan=False))
+    atomic_write_text(path, json.dumps(value, indent=2, allow_nan=False))
 
 
 def write_csv(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('w', newline='') as stream:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", newline="") as stream:
         if rows:
             writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
             writer.writeheader()
             writer.writerows(rows)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+
+
+def atomic_write_text(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w") as stream:
+        stream.write(value)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
 
 
 def utc_now():
@@ -126,30 +141,31 @@ def validate_examples(model, examples, cfg, device, retries):
     except (torch.OutOfMemoryError, RuntimeError) as error:
         if not cuda_oom(error, device):
             raise
-        early = per_node = target = early_outputs = features = intermediate = late = (
-            None
+        oom_message = str(error)
+    # Retry only after the exception and its traceback have left scope.
+    gc.collect()
+    release_cuda_memory(device)
+    if len(examples) > 1:
+        midpoint = len(examples) // 2
+        print(
+            f"[{utc_now()}] CUDA OOM during validation; reducing current batch "
+            f"{len(examples)} -> {midpoint}+{len(examples)-midpoint}",
+            flush=True,
         )
-        release_cuda_memory(device)
-        if len(examples) > 1:
-            midpoint = len(examples) // 2
-            print(
-                f"[{utc_now()}] CUDA OOM during validation; reducing current batch "
-                f"{len(examples)} -> {midpoint}+{len(examples)-midpoint}",
-                flush=True,
-            )
-            left = validate_examples(model, examples[:midpoint], cfg, device, retries)
-            right = validate_examples(model, examples[midpoint:], cfg, device, retries)
-            return left[0] + right[0], {
-                strategy: left[1][strategy] + right[1][strategy]
-                for strategy in cfg["evaluation"]["strategies"]
-            }
-        if retries > 0:
-            wait_for_resources(cfg, device, "single-example validation CUDA OOM")
-            return validate_examples(model, examples, cfg, device, retries - 1)
-        raise RuntimeError(
-            "CUDA cannot fit one validation example after resource retries; reduce "
-            "resolution, hidden_channels, or node_counts, or use training.device=cpu."
-        ) from error
+        left = validate_examples(model, examples[:midpoint], cfg, device, retries)
+        right = validate_examples(model, examples[midpoint:], cfg, device, retries)
+        return left[0] + right[0], {
+            strategy: left[1][strategy] + right[1][strategy]
+            for strategy in cfg["evaluation"]["strategies"]
+        }
+    if retries > 0:
+        wait_for_resources(cfg, device, "single-example validation CUDA OOM")
+        return validate_examples(model, examples, cfg, device, retries - 1)
+    raise RuntimeError(
+        "CUDA cannot fit one validation example after resource retries; reduce "
+        "resolution, hidden_channels, or node_counts, or use training.device=cpu. "
+        f"Original error: {oom_message}"
+    )
 
 
 def _validation_metrics(model, samples, cfg, device, batch_size):
@@ -225,7 +241,14 @@ def selection_score(cfg, val_loss, val_map, val_recall):
 def prune_checkpoints(directory, keep):
     candidates = []
     for metadata in directory.glob('epoch_*.json'):
-        value = json.loads(metadata.read_text())
+        try:
+            value = json.loads(metadata.read_text())
+        except (OSError, ValueError) as error:
+            print(
+                f"Ignoring unreadable checkpoint metadata {metadata}: {error}",
+                flush=True,
+            )
+            continue
         checkpoint = metadata.with_suffix('.pt')
         if checkpoint.exists():
             candidates.append((float(value['selection_score']), int(value['epoch']), checkpoint, metadata))
@@ -249,7 +272,13 @@ def wait_for_resources(cfg, device, reason='resource check'):
         disk_free = shutil.disk_usage(output).free
         gpu_free = None
         if device.type == 'cuda':
-            gpu_free, _ = torch.cuda.mem_get_info(device)
+            physical_free, _ = torch.cuda.mem_get_info(device)
+            reclaimable = max(
+                0,
+                torch.cuda.memory_reserved(device)
+                - torch.cuda.memory_allocated(device),
+            )
+            gpu_free = physical_free + reclaimable
         disk_ok = disk_free >= disk_required
         gpu_ok = gpu_free is None or gpu_free >= gpu_required
         if disk_ok and gpu_ok:
@@ -278,8 +307,51 @@ def fingerprint(cfg):
 
 
 def signature(cfg):
-    d = cfg['dataset']
-    return {k:d[k] for k in ('classes','bounds','resolution')} | {'hidden':cfg['training']['hidden_channels']}
+    """Fields that determine trained weights; operational settings are excluded."""
+    d, t = cfg["dataset"], cfg["training"]
+    dataset_keys = (
+        "type",
+        "weather",
+        "nodes",
+        "frame_stride",
+        "max_frames_per_slice",
+        "max_timestamp_delta_s",
+        "annotation_file",
+        "yaw_unit",
+        "classes",
+        "class_aliases",
+        "bounds",
+        "resolution",
+        "splits",
+    )
+    training_keys = (
+        "hidden_channels",
+        "learning_rate",
+        "weight_decay",
+        "modes",
+        "node_counts",
+    )
+    return {
+        "dataset": {key: d.get(key) for key in dataset_keys},
+        "training": {key: t.get(key) for key in training_keys},
+    }
+
+
+def checkpoint_compatible(state, cfg):
+    saved = state.get("signature")
+    current = signature(cfg)
+    if saved == current:
+        return True
+    saved_cfg = state.get("config")
+    return isinstance(saved_cfg, dict) and signature(saved_cfg) == current
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def device_for(cfg):
@@ -318,16 +390,27 @@ def preprocess(cfg):
     counts = defaultdict(int)
     for sample in samples:
         counts[f'{sample["split"]}/{sample["weather"]}'] += 1
-    for split in ('train','val','test'):
-        if not any(s['split']==split for s in samples):
-            raise ValueError(f'No {split} samples after weather filters')
-    output = Path(cfg['output']['root'])
-    write_json(output/'index.json', {'dataset_fingerprint':fingerprint(cfg),'samples':samples})
-    write_json(output/'resolved_config.json',cfg)
-    write_json(output/'environment.json',{'python':platform.python_version(),
-               'platform':platform.platform(),'torch':torch.__version__,'numpy':np.__version__})
-    write_json(output/'inventory.json',dict(counts))
-    print(json.dumps(dict(counts),indent=2))
+    for split in ("train", "val", "test"):
+        if not any(s["split"] == split for s in samples):
+            raise ValueError(f"No {split} samples after weather filters")
+    output = Path(cfg["output"]["root"])
+    write_json(
+        output / "index.json",
+        {"dataset_fingerprint": fingerprint(cfg), "samples": samples},
+    )
+    write_json(output / "resolved_config.json", cfg)
+    write_json(
+        output / "environment.json",
+        {
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "torch": torch.__version__,
+            "torch_cuda": torch.version.cuda,
+            "numpy": np.__version__,
+        },
+    )
+    write_json(output / "inventory.json", dict(counts))
+    print(json.dumps(dict(counts), indent=2))
     return samples
 
 
@@ -358,8 +441,11 @@ def validate_node_capacity(samples, cfg):
 
 def inspect(cfg):
     samples = preprocess(cfg)
-    annotation_counts = {sample['id']:len(annotations(sample['gt'],cfg['dataset']))
-                         for sample in samples}
+    annotation_counts = {}
+    for sample in samples:
+        boxes = annotations(sample["gt"], cfg["dataset"])
+        validate_target_centers(boxes, cfg["dataset"], sample["id"])
+        annotation_counts[sample["id"]] = len(boxes)
     report = []
     seen = set()
     for sample in samples:
@@ -379,6 +465,25 @@ def inspect(cfg):
 
 def inputs(sample, nodes, cfg):
     return [load_cloud(sample['nodes'][n],cfg['dataset']['bounds']) for n in nodes]
+
+
+def validate_target_centers(boxes, cfg, sample_id):
+    """Detect unrepresentable same-class centers without allocating dense targets."""
+    classes, bounds, resolution = cfg["classes"], cfg["bounds"], cfg["resolution"]
+    occupied = {}
+    for box in boxes:
+        ix = int((box.x - bounds[0]) / resolution)
+        iy = int((box.y - bounds[1]) / resolution)
+        key = classes.index(box.label), iy, ix
+        if key in occupied:
+            previous = occupied[key]
+            raise ValueError(
+                "Two same-class centers occupy one grid cell during inspection: "
+                f"sample={sample_id!r}, class={box.label!r}, cell=(x={ix}, y={iy}), "
+                f"resolution={resolution}, first_center=({previous.x:.6f}, {previous.y:.6f}), "
+                f"second_center=({box.x:.6f}, {box.y:.6f})"
+            )
+        occupied[key] = box
 
 
 def tensor_inputs(clouds, cfg, device, mode):
@@ -487,36 +592,38 @@ def train_examples(
     except (torch.OutOfMemoryError, RuntimeError) as error:
         if not cuda_oom(error, device):
             raise
-        optimizer.zero_grad(set_to_none=True)
-        bev = target = value = None
-        release_cuda_memory(device)
-        if len(examples) == 1:
-            if retries > 0:
-                wait_for_resources(cfg, device, f"{context} single-example CUDA OOM")
-                return train_examples(
-                    model,
-                    optimizer,
-                    scaler,
-                    examples,
-                    mode,
-                    cfg,
-                    device,
-                    context,
-                    runtime_batches,
-                    retries - 1,
-                )
-            raise RuntimeError(
-                f"CUDA {mode} OOM retries exhausted ({context}). Reduce batch_size, "
-                "resolution, hidden_channels, or node_counts, or set training.device=cpu."
-            ) from error
-        midpoint = len(examples) // 2
-        runtime_batches["training"] = min(runtime_batches["training"], midpoint)
-        print(
-            f"[{utc_now()}] CUDA OOM ({context}); reducing batch "
-            f"{len(examples)} -> {midpoint}+{len(examples)-midpoint}",
-            flush=True,
+        oom_message = str(error)
+    optimizer.zero_grad(set_to_none=True)
+    gc.collect()
+    release_cuda_memory(device)
+    if len(examples) == 1:
+        if retries > 0:
+            wait_for_resources(cfg, device, f"{context} single-example CUDA OOM")
+            return train_examples(
+                model,
+                optimizer,
+                scaler,
+                examples,
+                mode,
+                cfg,
+                device,
+                context,
+                runtime_batches,
+                retries - 1,
+            )
+        raise RuntimeError(
+            f"CUDA {mode} OOM retries exhausted ({context}). Reduce batch_size, "
+            "resolution, hidden_channels, or node_counts, or set training.device=cpu. "
+            f"Original error: {oom_message}"
         )
-        return train_examples(
+    midpoint = len(examples) // 2
+    runtime_batches["training"] = min(runtime_batches["training"], midpoint)
+    print(
+        f"[{utc_now()}] CUDA OOM ({context}); reducing batch "
+        f"{len(examples)} -> {midpoint}+{len(examples)-midpoint}",
+        flush=True,
+    )
+    return train_examples(
             model,
             optimizer,
             scaler,
@@ -584,12 +691,21 @@ def train(cfg, overwrite=False):
         completion = path.parent/'complete.json'
         if path.exists() and completion.exists() and not overwrite:
             state = torch.load(path,map_location='cpu',weights_only=True)
-            if state['signature'] != signature(cfg) or state['config'] != cfg:
-                raise ValueError(f'{path} belongs to a different config; use another output directory')
-            if json.loads(completion.read_text()).get('epochs') != cfg['training']['epochs']:
-                raise ValueError(f'Incomplete training for seed {seed}; use --overwrite to restart that run')
-            print(f'Skipping existing checkpoint {path}; --overwrite retrains it')
-            continue
+            if not checkpoint_compatible(state, cfg):
+                raise ValueError(
+                    f"{path} belongs to a different config; use another output directory"
+                )
+            completed_epochs = int(json.loads(completion.read_text()).get("epochs", 0))
+            if completed_epochs >= cfg["training"]["epochs"]:
+                print(f"Skipping existing checkpoint {path}; --overwrite retrains it")
+                continue
+            if not latest.exists():
+                raise ValueError(
+                    f"Cannot extend seed {seed}: missing recovery checkpoint {latest}"
+                )
+            print(
+                f'Extending seed={seed} from {completed_epochs} to {cfg["training"]["epochs"]} epochs'
+            )
         if overwrite:
             for stale in list(path.parent.glob('epoch_*.pt')) + list(path.parent.glob('epoch_*.json')):
                 stale.unlink()
@@ -608,11 +724,19 @@ def train(cfg, overwrite=False):
         )
         scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision(cfg, device))
         best_score, history, start_epoch = -float("inf"), [], 0
-        if not overwrite and not completion.exists() and latest.exists():
+        if (
+            not overwrite
+            and latest.exists()
+            and (
+                not completion.exists()
+                or int(json.loads(completion.read_text()).get("epochs", 0))
+                < cfg["training"]["epochs"]
+            )
+        ):
             if not cfg['training']['recovery']['resume']:
                 raise ValueError(f'Incomplete training for seed {seed}; enable training.recovery.resume or use --overwrite')
             state = torch.load(latest, map_location=device, weights_only=True)
-            if state["signature"] != signature(cfg) or state["config"] != cfg:
+            if not checkpoint_compatible(state, cfg):
                 raise ValueError(f"{latest} belongs to a different configuration")
             model.load_state_dict(state["model"])
             optimizer.load_state_dict(state["optimizer"])
@@ -710,7 +834,6 @@ def train(cfg, overwrite=False):
                 flush=True,
             )
             if (epoch + 1) % cfg["training"]["recovery"]["save_every_epochs"] == 0:
-                wait_for_resources(cfg, device, "before recovery checkpoint")
                 recovery_state = state | {
                     "optimizer": optimizer.state_dict(),
                     "scaler": (
@@ -867,36 +990,37 @@ def infer_batch(
     except (torch.OutOfMemoryError, RuntimeError) as error:
         if not cuda_oom(error, device):
             raise
-        arrays = bev = outputs = features = predictions = representations = None
-        release_cuda_memory(device)
-        if len(cloud_batches) == 1:
-            if retries > 0:
-                wait_for_resources(
-                    cfg, device, f"single-frame {strategy} evaluation CUDA OOM"
-                )
-                return infer_batch(
-                    model,
-                    cloud_batches,
-                    cfg,
-                    device,
-                    strategy,
-                    raw_payloads,
-                    retries - 1,
-                )
-            raise RuntimeError(
-                f"CUDA cannot fit one {strategy} evaluation frame after resource "
-                "retries; reduce resolution, hidden_channels, or node_counts, or "
-                "use training.device=cpu."
-            ) from error
-        midpoint = len(cloud_batches) // 2
-        print(
-            f"[{utc_now()}] CUDA OOM during {strategy} evaluation; reducing batch "
-            f"{len(cloud_batches)} -> {midpoint}+{len(cloud_batches)-midpoint}",
-            flush=True,
+        oom_message = str(error)
+    gc.collect()
+    release_cuda_memory(device)
+    if len(cloud_batches) == 1:
+        if retries > 0:
+            wait_for_resources(
+                cfg, device, f"single-frame {strategy} evaluation CUDA OOM"
+            )
+            return infer_batch(
+                model,
+                cloud_batches,
+                cfg,
+                device,
+                strategy,
+                raw_payloads,
+                retries - 1,
+            )
+        raise RuntimeError(
+            f"CUDA cannot fit one {strategy} evaluation frame after resource "
+            "retries; reduce resolution, hidden_channels, or node_counts, or "
+            f"use training.device=cpu. Original error: {oom_message}"
         )
-        left_payloads = raw_payloads[:midpoint] if raw_payloads is not None else None
-        right_payloads = raw_payloads[midpoint:] if raw_payloads is not None else None
-        return infer_batch(
+    midpoint = len(cloud_batches) // 2
+    print(
+        f"[{utc_now()}] CUDA OOM during {strategy} evaluation; reducing batch "
+        f"{len(cloud_batches)} -> {midpoint}+{len(cloud_batches)-midpoint}",
+        flush=True,
+    )
+    left_payloads = raw_payloads[:midpoint] if raw_payloads is not None else None
+    right_payloads = raw_payloads[midpoint:] if raw_payloads is not None else None
+    return infer_batch(
             model,
             cloud_batches[:midpoint],
             cfg,
@@ -942,13 +1066,44 @@ def run_evaluation(cfg):
         if not checkpoint.exists():
             raise FileNotFoundError(f'Train first; missing {checkpoint}')
         state = torch.load(checkpoint,map_location=device,weights_only=True)
-        if state['signature'] != signature(cfg) or state['config']['dataset'] != cfg['dataset']:
-            raise ValueError('Checkpoint data/model configuration mismatch')
-        model = make_model(cfg,device)
-        model.load_state_dict(state['model'])
+        if not checkpoint_compatible(state, cfg):
+            raise ValueError("Checkpoint data/model configuration mismatch")
+        evaluation_signature = hashlib.sha256(
+            json.dumps(
+                {
+                    "checkpoint_sha256": file_sha256(checkpoint),
+                    "dataset": signature(cfg)["dataset"],
+                    "evaluation": cfg["evaluation"],
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        model = make_model(cfg, device)
+        model.load_state_dict(state["model"])
         model.eval()
         warmed = set()
-        for session,frames in sessions.items():
+        for session, frames in sessions.items():
+            part_path = output / "eval_parts" / f"seed_{seed}" / f"{session}.json"
+            if part_path.exists():
+                try:
+                    part = json.loads(part_path.read_text())
+                except (OSError, ValueError) as error:
+                    print(
+                        f"Ignoring unreadable evaluation part {part_path}: {error}",
+                        flush=True,
+                    )
+                else:
+                    if part.get("signature") == evaluation_signature:
+                        all_metrics.extend(part["metrics"])
+                        all_costs.extend(part["costs"])
+                        print(
+                            f"Resumed evaluation seed={seed} session={session}",
+                            flush=True,
+                        )
+                        write_csv(output / "accuracy.csv", all_metrics)
+                        write_csv(output / "latency_communication.csv", all_costs)
+                        continue
+            metrics_start, costs_start = len(all_metrics), len(all_costs)
             common = set.intersection(*(set(f['nodes']) for f in frames))
             groups = choose_groups(common,cfg['evaluation'])
             buckets = defaultdict(list)
@@ -1029,6 +1184,16 @@ def run_evaluation(cfg):
             print(
                 f"Evaluated seed={seed} session={session}, frames={len(frames)}, subsets={len(groups)}",
                 flush=True,
+            )
+            write_json(
+                part_path,
+                {
+                    "signature": evaluation_signature,
+                    "seed": seed,
+                    "session": session,
+                    "metrics": all_metrics[metrics_start:],
+                    "costs": all_costs[costs_start:],
+                },
             )
             write_csv(output / "accuracy.csv", all_metrics)
             write_csv(output / "latency_communication.csv", all_costs)

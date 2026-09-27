@@ -1,6 +1,10 @@
 """Command-line entry point for the ECCO experiment pipeline."""
+
 import argparse
+import fcntl
 from pathlib import Path
+import sys
+import traceback
 
 from src.config import PROJECT, enable_smoke, load_config
 
@@ -13,7 +17,22 @@ def check_runtime(cfg):
     import numpy  # noqa: F401
     import shapely  # noqa: F401
     import torch  # noqa: F401
-    if cfg['output']['plots']:
+
+    for name in ("GradScaler",):
+        if not hasattr(torch.amp, name):
+            raise RuntimeError(
+                f"Installed torch {torch.__version__} lacks torch.amp.{name}"
+            )
+    if not hasattr(torch, "OutOfMemoryError"):
+        raise RuntimeError(
+            f"Installed torch {torch.__version__} lacks torch.OutOfMemoryError"
+        )
+    if cfg["training"].get("require_cuda", False) and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is required by training.require_cuda, but torch.cuda.is_available() is false. "
+            f"torch={torch.__version__}, torch.version.cuda={torch.version.cuda!r}"
+        )
+    if cfg["output"]["plots"]:
         import matplotlib  # noqa: F401
     if cfg['dataset'].get('type') == 'advercity':
         import py7zr  # noqa: F401
@@ -79,6 +98,26 @@ def run_pipeline(args, cfg):
         verify_results(cfg)
 
 
+def acquire_run_lock(cfg, stage):
+    if stage == "check":
+        return None
+    output = Path(cfg["output"]["root"])
+    output.mkdir(parents=True, exist_ok=True)
+    stream = (output / ".lock").open("a+")
+    try:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        stream.close()
+        raise ValueError(
+            f"Another ECCO process is already using output directory {output}"
+        )
+    stream.seek(0)
+    stream.truncate()
+    stream.write(f'pid={__import__("os").getpid()}\n')
+    stream.flush()
+    return stream
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default=str(PROJECT/'configs/advercity.yaml'))
@@ -99,8 +138,28 @@ def main():
     check_runtime(cfg)
     if args.require_data:
         require_existing_data(cfg)
-    run_pipeline(args, cfg)
+    lock = acquire_run_lock(cfg, args.stage)
+    try:
+        run_pipeline(args, cfg)
+    finally:
+        if lock is not None:
+            lock.close()
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ValueError, FileNotFoundError) as error:
+        print(
+            f"Fatal configuration or data error: {error}", file=sys.stderr, flush=True
+        )
+        raise SystemExit(2)
+    except (TimeoutError, OSError, RuntimeError):
+        traceback.print_exc()
+        print(
+            "Transient runtime failure; safe to retry without --overwrite.",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(75)

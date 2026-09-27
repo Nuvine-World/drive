@@ -6,7 +6,9 @@ cd "$PROJECT_DIR"
 
 PYTHON_BIN="${ECCO_PYTHON:-${ADVERCITY_PYTHON:-${COINFRA_PYTHON:-$PROJECT_DIR/.venv/bin/python}}}"
 RUN_LOG_DIR="$PROJECT_DIR/logs"
+RUN_LOG_DIR="${ECCO_LOG_DIR:-$RUN_LOG_DIR}"
 mkdir -p "$RUN_LOG_DIR"
+export PYTHONUNBUFFERED=1
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$RUN_LOG_DIR/matplotlib_cache}"
 mkdir -p "$MPLCONFIGDIR"
 RUN_TIMESTAMP="$(date -u '+%Y%m%dT%H%M%SZ')_$$"
@@ -26,6 +28,12 @@ if [[ "$SMALL_RUN" == true ]]; then
   PIPELINE_ARGS+=(--smoke --overwrite --skip-prepare --require-data)
 fi
 
+MAX_ATTEMPTS="${ECCO_MAX_ATTEMPTS:-3}"
+if [[ ! "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+  printf '%s\n' 'ECCO_MAX_ATTEMPTS must be a positive integer' >&2
+  exit 2
+fi
+
 set +e
 {
   printf '%s status=started command=' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -38,9 +46,24 @@ set +e
   if [[ "$SMALL_RUN" == true ]]; then
     printf '%s\n' 'Small mode: existing-data check + fresh smoke end-to-end run (no download).'
   fi
-  "$PYTHON_BIN" main.py --stage all "${PIPELINE_ARGS[@]}"
 } 2>&1 | tee -a "$RUN_LOG"
 status=${PIPESTATUS[0]}
+
+if [[ $status -eq 0 ]]; then
+  attempt=1
+  while true; do
+    printf '%s attempt=%s/%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$attempt" "$MAX_ATTEMPTS" | tee -a "$RUN_LOG"
+    "$PYTHON_BIN" main.py --stage all "${PIPELINE_ARGS[@]}" 2>&1 | tee -a "$RUN_LOG"
+    status=${PIPESTATUS[0]}
+    if [[ $status -ne 75 || $attempt -ge $MAX_ATTEMPTS ]]; then
+      break
+    fi
+    delay=$((attempt * 60))
+    printf '%s transient_failure=1 retry_in_seconds=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$delay" | tee -a "$RUN_LOG"
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+fi
 set -e
 
 ended="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"

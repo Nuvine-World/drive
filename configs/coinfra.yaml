@@ -35,6 +35,7 @@ training:
   learning_rate: 0.001
   weight_decay: 0.0001
   device: auto
+  require_cuda: true
   hidden_channels: 32
   batch_size: 4
   preprocessing_workers: 4
@@ -49,7 +50,7 @@ training:
     save_every_epochs: 1
     wait_for_resources: true
     poll_seconds: 60
-    timeout_minutes: 0
+    timeout_minutes: 60
     minimum_free_disk_gb: 5
     minimum_free_gpu_gb: 2
     cuda_oom_retries: 3

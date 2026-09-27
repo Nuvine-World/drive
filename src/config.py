@@ -90,6 +90,7 @@ def load_config(path):
     t.setdefault("batch_size", 1)
     t.setdefault("preprocessing_workers", 1)
     t.setdefault("mixed_precision", False)
+    t.setdefault("require_cuda", False)
     if (
         not isinstance(t["batch_size"], int)
         or isinstance(t["batch_size"], bool)
@@ -104,6 +105,8 @@ def load_config(path):
         raise ValueError("training.preprocessing_workers must be positive")
     if not isinstance(t["mixed_precision"], bool):
         raise ValueError("training.mixed_precision must be boolean")
+    if not isinstance(t["require_cuda"], bool):
+        raise ValueError("training.require_cuda must be boolean")
     checkpointing = t.setdefault("checkpointing", {})
     if not isinstance(checkpointing, dict):
         raise ValueError('training.checkpointing must be a mapping')

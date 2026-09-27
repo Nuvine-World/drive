@@ -1,5 +1,6 @@
 """CoInfra I2I reader. Fail on missing calibration/labels instead of guessing."""
 from pathlib import Path
+from functools import lru_cache
 import math
 import numpy as np
 import yaml
@@ -63,6 +64,13 @@ def annotations(path, cfg):
 
 
 def calibration(path):
+    path = Path(path)
+    stat = path.stat()
+    return _calibration_cached(str(path), stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=None)
+def _calibration_cached(path, _mtime_ns, _size):
     raw = read_yaml(path)
     matrices = []
     for key in ('lidar_to_ground', 'ground_to_global'):
