@@ -111,7 +111,22 @@ The three smoke archives are approximately 32 GB compressed. Extract them into
 ## Full experiment
 
 ```bash
+./preflight.sh
+nohup ./run.sh >> output.txt 2>&1 < /dev/null &
+```
+
+With no `--config`, `run.sh` runs CoInfra first and starts Adver-City only after
+CoInfra exits successfully. If CoInfra fails, the sequence exits with the same
+nonzero status and Adver-City is not started. `preflight.sh` runs the unit tests,
+checks both configurations and runtime dependencies, verifies CUDA availability,
+and requires the externally downloaded CoInfra data. Adver-City data is not
+required by the preflight because its full run prepares and validates that data.
+
+To run only one dataset, continue to pass its configuration explicitly:
+
+```bash
 ./run.sh --config configs/coinfra.yaml
+./run.sh --config configs/advercity.yaml
 ```
 
 The runner performs inspection, indexing, training, held-out evaluation, and

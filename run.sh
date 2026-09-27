@@ -4,6 +4,49 @@ set -Eeuo pipefail
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
+# With no explicit config, run both experiments in order. Each child invocation
+# uses the normal single-config path below, so Adver-City is never started when
+# CoInfra exits unsuccessfully.
+CONFIG_SUPPLIED=false
+for argument in "$@"; do
+  if [[ "$argument" == "--config" || "$argument" == --config=* ]]; then
+    CONFIG_SUPPLIED=true
+    break
+  fi
+done
+
+if [[ "$CONFIG_SUPPLIED" == false ]]; then
+  SEQUENCE_LOG_DIR="${ECCO_LOG_DIR:-$PROJECT_DIR/logs}"
+  mkdir -p "$SEQUENCE_LOG_DIR"
+  SEQUENCE_TIMESTAMP="$(date -u '+%Y%m%dT%H%M%SZ')_$$"
+  SEQUENCE_STATUS="$SEQUENCE_LOG_DIR/sequence_${SEQUENCE_TIMESTAMP}_status.txt"
+
+  sequence_status=0
+  printf '%s sequence=coinfra,advercity status=started\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  printf '%s dataset=coinfra status=started\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  "$0" --config configs/coinfra.yaml "$@" || sequence_status=$?
+
+  if [[ $sequence_status -eq 0 ]]; then
+    printf '%s dataset=coinfra status=completed\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '%s dataset=advercity status=started\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    "$0" --config configs/advercity.yaml "$@" || sequence_status=$?
+  else
+    printf '%s dataset=coinfra status=failed exit_code=%s; advercity=not_started\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$sequence_status" >&2
+  fi
+
+  if [[ $sequence_status -eq 0 ]]; then
+    printf '%s dataset=advercity status=completed\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '%s sequence=coinfra,advercity status=completed exit_code=0\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" | tee "$SEQUENCE_STATUS"
+  else
+    printf '%s sequence=coinfra,advercity status=failed exit_code=%s\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$sequence_status" | tee "$SEQUENCE_STATUS" >&2
+  fi
+  exit "$sequence_status"
+fi
+
 PYTHON_BIN="${ECCO_PYTHON:-${ADVERCITY_PYTHON:-${COINFRA_PYTHON:-$PROJECT_DIR/.venv/bin/python}}}"
 RUN_LOG_DIR="$PROJECT_DIR/logs"
 RUN_LOG_DIR="${ECCO_LOG_DIR:-$RUN_LOG_DIR}"
