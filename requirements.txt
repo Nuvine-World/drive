@@ -6,3 +6,5 @@ huggingface_hub>=0.34,<2
 pytest>=8,<10
 matplotlib>=3.8,<4
 py7zr>=0.22,<2
+black>=25,<26
+darker>=3,<4
