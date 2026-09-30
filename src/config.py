@@ -101,9 +101,15 @@ def load_config(path):
         "early",
         "intermediate",
         "late",
+        "adaptive",
     }:
         raise ValueError("Unknown fusion strategy")
-    if not t["modes"] or not set(t["modes"]) <= {"early", "intermediate", "single"}:
+    if not t["modes"] or not set(t["modes"]) <= {
+        "early",
+        "intermediate",
+        "adaptive",
+        "single",
+    }:
         raise ValueError("Unknown training mode")
     if t["epochs"] < 1 or not t["seeds"] or t["learning_rate"] <= 0:
         raise ValueError("Invalid training configuration")
@@ -165,6 +171,9 @@ def load_config(path):
         raise ValueError("Node counts must be positive")
     if e["subsets_per_count"] < 1 or e["max_detections"] < 1:
         raise ValueError("Invalid evaluation limits")
+    e.setdefault("receiver_policy", "all")
+    if e["receiver_policy"] not in {"all", "first"}:
+        raise ValueError("evaluation.receiver_policy must be all or first")
     e.setdefault("batch_size", t["batch_size"])
     if (
         not isinstance(e["batch_size"], int)
@@ -176,6 +185,51 @@ def load_config(path):
         raise ValueError("Invalid IoU threshold")
     if not 0 <= e["score_threshold"] <= 1 or not 0 < e["nms_iou"] <= 1:
         raise ValueError("Invalid detection thresholds")
+    adaptive = cfg.setdefault("adaptive_fusion", {})
+    adaptive.setdefault("training_budgets", [0.01, 0.05, 0.1])
+    adaptive.setdefault("evaluation_budgets", [0.01, 0.05, 0.1, 0.25])
+    adaptive.setdefault("ablations", ["random", "energy"])
+    adaptive.setdefault("index_bytes", 4)
+    adaptive.setdefault("value_bytes", 2)
+    for key in ("training_budgets", "evaluation_budgets"):
+        values = adaptive[key]
+        if not values or any(
+            not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0 < value <= 1
+            for value in values
+        ):
+            raise ValueError(f"adaptive_fusion.{key} must contain fractions in (0, 1]")
+        if len(values) != len(set(values)):
+            raise ValueError(f"adaptive_fusion.{key} contains duplicates")
+    if adaptive["index_bytes"] not in (2, 4) or adaptive["value_bytes"] not in (2, 4):
+        raise ValueError("adaptive fusion byte widths must be 2 or 4")
+    if not isinstance(adaptive["ablations"], list) or not set(
+        adaptive["ablations"]
+    ) <= {"random", "energy"}:
+        raise ValueError("adaptive_fusion.ablations supports random and energy")
+    latency = cfg.setdefault("latency_experiment", {})
+    latency.setdefault("frame_period_ms", 100.0)
+    latency.setdefault("profile_batch_size", 1)
+    latency.setdefault("deadlines_ms", [150.0, 250.0])
+    latency.setdefault("burst_multipliers", [1, 2, 4])
+    if latency["frame_period_ms"] <= 0:
+        raise ValueError("latency_experiment.frame_period_ms must be positive")
+    if (
+        not isinstance(latency["profile_batch_size"], int)
+        or isinstance(latency["profile_batch_size"], bool)
+        or latency["profile_batch_size"] < 1
+    ):
+        raise ValueError("latency_experiment.profile_batch_size must be positive")
+    if not latency["deadlines_ms"] or any(
+        value <= 0 for value in latency["deadlines_ms"]
+    ):
+        raise ValueError("latency deadlines must be positive")
+    if not latency["burst_multipliers"] or any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 1
+        for value in latency["burst_multipliers"]
+    ):
+        raise ValueError("latency burst multipliers must be positive integers")
     n = cfg["deployment_assumptions"]
     if not isinstance(n.get("source"), str) or not n["source"].strip():
         raise ValueError(
@@ -183,6 +237,12 @@ def load_config(path):
         )
     if any(not math.isfinite(x) or x <= 0 for x in n["bandwidths_mbps"]):
         raise ValueError("Bandwidth must be positive")
+    minimum_deadline = n["sensing_ms"] + max(n["edge_rtt_ms"], n["cloud_rtt_ms"])
+    if any(value <= minimum_deadline for value in latency["deadlines_ms"]):
+        raise ValueError(
+            "latency deadlines must exceed sensing_ms plus every configured RTT "
+            f"({minimum_deadline:g} ms)"
+        )
     for p in ("edge", "cloud"):
         if n[p + "_rtt_ms"] < 0 or any(
             n["processing_ms"][p][s] < 0 for s in e["strategies"]

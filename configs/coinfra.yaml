@@ -45,7 +45,7 @@ training:
   batch_size: 16
   preprocessing_workers: 8
   mixed_precision: true
-  modes: [early, intermediate, single]
+  modes: [early, intermediate, adaptive, single]
   node_counts: [1, 2, 4, 8]
   checkpointing:
     keep_best: 3
@@ -60,10 +60,11 @@ training:
     minimum_free_gpu_gb: 2
     cuda_oom_retries: 3
 evaluation:
+  receiver_policy: all
   # Validation materializes both early- and per-node BEVs, so keep this below
   # the training batch even on a 24 GB card.
   batch_size: 8
-  strategies: [early, intermediate, late]
+  strategies: [early, intermediate, late, adaptive]
   node_counts: [1, 2, 4, 8]
   subsets_per_count: 5
   subset_seed: 17
@@ -71,6 +72,18 @@ evaluation:
   nms_iou: 0.2
   iou_thresholds: [0.5, 0.7]
   max_detections: 150
+adaptive_fusion:
+  training_budgets: [0.01, 0.05, 0.10, 0.25]
+  evaluation_budgets: [0.01, 0.05, 0.10, 0.25]
+  ablations: [random, energy]
+  index_bytes: 4
+  value_bytes: 2
+latency_experiment:
+  frame_period_ms: 100.0
+  profile_batch_size: 1
+  # Must exceed sensing plus the smallest configured RTT (105 ms).
+  deadlines_ms: [150.0, 250.0]
+  burst_multipliers: [1, 2, 4]
 deployment_assumptions:
   source: "literature assumption; citation required"
   bandwidths_mbps: [10, 100, 1000]
@@ -78,8 +91,8 @@ deployment_assumptions:
   edge_rtt_ms: 5.0
   cloud_rtt_ms: 40.0
   processing_ms:
-    edge: {early: 80.0, intermediate: 45.0, late: 25.0}
-    cloud: {early: 40.0, intermediate: 30.0, late: 20.0}
+    edge: {early: 80.0, intermediate: 45.0, late: 25.0, adaptive: 50.0}
+    cloud: {early: 40.0, intermediate: 30.0, late: 20.0, adaptive: 35.0}
 output:
   root: outputs/coinfra
   plots: true

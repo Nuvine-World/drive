@@ -107,6 +107,11 @@ def validate_examples(model, examples, cfg, device, retries):
                 if "intermediate" in cfg["evaluation"]["strategies"]
                 else None
             )
+            adaptive = None
+            if "adaptive" in cfg["evaluation"]["strategies"]:
+                validation_budget = cfg["adaptive_fusion"]["evaluation_budgets"][0]
+                fused, _ = model.adaptive_features(features, validation_budget)
+                adaptive = model.heads(fused)
             late = (
                 model.heads(features.reshape(batch_size * nodes, *features.shape[2:]))
                 if "late" in cfg["evaluation"]["strategies"]
@@ -121,6 +126,10 @@ def validate_examples(model, examples, cfg, device, retries):
             if intermediate is not None:
                 frames["intermediate"].append(
                     (decode(batch_outputs(intermediate, index), cfg), item[2])
+                )
+            if adaptive is not None:
+                frames["adaptive"].append(
+                    (decode(batch_outputs(adaptive, index), cfg), item[2])
                 )
             if late is not None:
                 offset = index * nodes
@@ -329,8 +338,47 @@ def signature(cfg):
         "node_counts",
     )
     return {
+        "model_version": 2,
         "dataset": {key: d.get(key) for key in dataset_keys},
         "training": {key: t.get(key) for key in training_keys},
+        # Evaluation budgets, selectors, and serialization widths do not change
+        # learned weights. Keeping them out permits post-training sweeps without
+        # invalidating an otherwise compatible checkpoint.
+        "adaptive_fusion": {
+            "training_budgets": cfg.get("adaptive_fusion", {}).get("training_budgets")
+        },
+    }
+
+
+def audit_split_isolation(samples):
+    """Fail closed when any recording or source artifact crosses a split."""
+    owners = {}
+    sessions = {}
+    for sample in samples:
+        split = sample["split"]
+        session = sample["session"]
+        previous = sessions.setdefault(session, split)
+        if previous != split:
+            raise ValueError(
+                f"Data leakage: session {session!r} occurs in {previous} and {split}"
+            )
+        sources = [("sample_id", sample["id"]), ("ground_truth", sample["gt"])]
+        sources.extend(
+            (f"cloud:{node}", value["cloud"]) for node, value in sample["nodes"].items()
+        )
+        for kind, value in sources:
+            identity = value if kind == "sample_id" else str(Path(value).resolve())
+            key = (kind, identity)
+            earlier = owners.setdefault(key, split)
+            if earlier != split:
+                raise ValueError(
+                    f"Data leakage: {kind} {identity!r} occurs in {earlier} and {split}"
+                )
+    return {
+        "samples": len(samples),
+        "sessions": len(sessions),
+        "sources": len(owners),
+        "status": "passed",
     }
 
 
@@ -383,6 +431,7 @@ def sync(device):
 
 def preprocess(cfg):
     samples = discover(cfg)
+    isolation = audit_split_isolation(samples)
     validate_node_capacity(samples, cfg)
     counts = defaultdict(int)
     for sample in samples:
@@ -407,6 +456,7 @@ def preprocess(cfg):
         },
     )
     write_json(output / "inventory.json", dict(counts))
+    write_json(output / "split_isolation.json", isolation)
     print(json.dumps(dict(counts), indent=2))
     return samples
 
@@ -513,6 +563,9 @@ def training_plan(order, cfg, rng, batch_size=None):
         mode = rng.choice(cfg["training"]["modes"])
         nodes = rng.sample(available, 1 if mode == "single" else rng.choice(counts))
         model_mode = "early" if mode == "single" else mode
+        if model_mode == "adaptive":
+            budget = rng.choice(cfg["adaptive_fusion"]["training_budgets"])
+            model_mode = f"adaptive@{budget:g}"
         buckets[(model_mode, len(nodes))].append((sample, model_mode, nodes))
     batches = []
     size = batch_size or cfg["training"]["batch_size"]
@@ -567,6 +620,7 @@ def train_examples(
     retries,
 ):
     """Train the largest batch that fits, recursively splitting on CUDA OOM."""
+    optimizer_step_started = False
     try:
         bev = device_tensor(np.stack([example[0] for example in examples]), device)
         target = tuple(
@@ -585,6 +639,7 @@ def train_examples(
         scaler.scale(value).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
+        optimizer_step_started = True
         scaler.step(optimizer)
         scaler.update()
         return [float(value.detach())] * len(examples)
@@ -593,6 +648,11 @@ def train_examples(
             raise
         oom_message = str(error)
     optimizer.zero_grad(set_to_none=True)
+    if optimizer_step_started:
+        # GradScaler records a per-optimizer STEPPED state before invoking the
+        # optimizer. Clear that state so an OOM inside optimizer.step does not
+        # make the smaller retry fail with "step() has already been called".
+        scaler.update()
     gc.collect()
     release_cuda_memory(device)
     if len(examples) == 1:
@@ -887,6 +947,12 @@ def choose_groups(nodes, settings):
         choices = list(itertools.combinations(nodes,count))
         if count != 1 and len(choices)>settings['subsets_per_count']:
             choices = sorted(rng.sample(choices,settings['subsets_per_count']))
+        if settings.get("receiver_policy", "all") == "all" and count > 1:
+            choices = [
+                (receiver,) + tuple(node for node in choice if node != receiver)
+                for choice in choices
+                for receiver in choice
+            ]
         groups.extend(choices)
     return groups
 
@@ -895,29 +961,84 @@ def payload(array):
     return len(zlib.compress(np.asarray(array,dtype='<f4').tobytes(),level=1))
 
 
+def feature_payload(array, cfg):
+    """Compressed dense feature bytes at the adaptive value precision."""
+    dtype = "<f2" if cfg["adaptive_fusion"]["value_bytes"] == 2 else "<f4"
+    return len(zlib.compress(np.asarray(array, dtype=dtype).tobytes(), level=1))
+
+
+def adaptive_payload(feature_nodes, selected, cfg):
+    """Serialize selected collaborator cells as int32 indices and fp16 values."""
+    total = 0
+    feature_nodes = feature_nodes.detach().float().cpu().numpy()
+    selected = selected.detach().cpu().numpy()
+    index_dtype = "<u2" if cfg["adaptive_fusion"]["index_bytes"] == 2 else "<u4"
+    value_dtype = "<f2" if cfg["adaptive_fusion"]["value_bytes"] == 2 else "<f4"
+    for node, mask in zip(feature_nodes[1:], selected):
+        indices = np.flatnonzero(mask).astype(index_dtype, copy=False)
+        values = node.reshape(node.shape[0], -1)[:, indices].T.astype(
+            value_dtype, copy=False
+        )
+        total += len(zlib.compress(indices.tobytes() + values.tobytes(), level=1))
+    return total
+
+
+def adaptive_selector(strategy):
+    base = strategy.split("@", 1)[0]
+    return base.split("_", 1)[1] if "_" in base else "learned"
+
+
 def infer(model, clouds, cfg, device, strategy):
+    base_strategy, _, budget_text = strategy.partition("@")
     bev = tensor_inputs(clouds,cfg,device,strategy)
     sync(device)
     start = time.perf_counter()
     with torch.no_grad():
         features = model.encoder(bev)
-        if strategy=='intermediate':
-            output = model.heads(features.amax(dim=0,keepdim=True))
-            boxes = decode(output,cfg)
-        elif strategy=='late':
-            local = [decode(model.heads(f[None]),cfg) for f in features]
-            boxes = nms([b for group in local for b in group],cfg['evaluation']['nms_iou'],cfg['evaluation']['max_detections'])
+        if base_strategy == "intermediate":
+            output = model.heads(features.amax(dim=0, keepdim=True))
+            boxes = decode(output, cfg)
+        elif base_strategy.startswith("adaptive"):
+            budget = float(
+                budget_text or cfg["adaptive_fusion"]["evaluation_budgets"][0]
+            )
+            fused, selected = model.adaptive_features(
+                features[None], budget, adaptive_selector(strategy)
+            )
+            boxes = decode(model.heads(fused), cfg)
+        elif base_strategy == "late":
+            local = [decode(model.heads(f[None]), cfg) for f in features]
+            boxes = nms(
+                [b for group in local for b in group],
+                cfg["evaluation"]["nms_iou"],
+                cfg["evaluation"]["max_detections"],
+            )
         else:
             boxes = decode(model.heads(features),cfg)
     sync(device)
-    elapsed_ms = (time.perf_counter()-start)*1000
-    if strategy=='intermediate':
-        representation = sum(payload(f) for f in features.detach().cpu().numpy())
-    elif strategy=='late':
-        representation = sum(payload(np.array([list(b.to_array())+[cfg['dataset']['classes'].index(b.label),b.score]
-                                             for b in group],dtype=np.float32).reshape(-1,9)) for group in local)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    if base_strategy == "intermediate":
+        representation = sum(
+            feature_payload(f, cfg) for f in features[1:].detach().cpu().numpy()
+        )
+    elif base_strategy.startswith("adaptive"):
+        representation = adaptive_payload(features, selected[0], cfg)
+    elif base_strategy == "late":
+        representation = sum(
+            payload(
+                np.array(
+                    [
+                        list(b.to_array())
+                        + [cfg["dataset"]["classes"].index(b.label), b.score]
+                        for b in group
+                    ],
+                    dtype=np.float32,
+                ).reshape(-1, 9)
+            )
+            for group in local[1:]
+        )
     else:
-        representation = sum(payload(p) for p in clouds)
+        representation = sum(payload(p) for p in clouds[1:])
     return boxes,elapsed_ms,representation
 
 
@@ -927,19 +1048,25 @@ def infer_batch(
     """Batched inference with transparent CUDA OOM batch reduction."""
     if retries is None:
         retries = cfg["training"]["recovery"]["cuda_oom_retries"]
+    base_strategy, _, budget_text = strategy.partition("@")
     try:
+        preprocessing_start = time.perf_counter()
         arrays = [array_inputs(clouds, cfg, strategy) for clouds in cloud_batches]
-        if strategy == "early":
+        if base_strategy == "early":
             arrays = [value[0] for value in arrays]
         bev = device_tensor(np.stack(arrays), device)
         sync(device)
+        preprocessing_ms = (
+            (time.perf_counter() - preprocessing_start) * 1000 / len(cloud_batches)
+        )
         start = time.perf_counter()
+        serialization_ms = 0.0
         with torch.no_grad(), torch.autocast(
             device_type=device.type,
             dtype=torch.float16,
             enabled=mixed_precision(cfg, device),
         ):
-            if strategy == "early":
+            if base_strategy == "early":
                 outputs = model.heads(model.encoder(bev))
                 predictions = [
                     decode(batch_outputs(outputs, i), cfg)
@@ -955,20 +1082,51 @@ def infer_batch(
                 features = model.encoder(
                     bev.reshape(batch * nodes, channels, height, width)
                 ).reshape(batch, nodes, -1, height, width)
-                if strategy == "intermediate":
+                if base_strategy == "intermediate":
                     outputs = model.heads(features.amax(dim=1))
                     predictions = [
                         decode(batch_outputs(outputs, i), cfg) for i in range(batch)
                     ]
+                    serialization_start = time.perf_counter()
                     representations = [
-                        sum(payload(feature) for feature in item.detach().cpu().numpy())
+                        sum(
+                            feature_payload(feature, cfg)
+                            for feature in item[1:].detach().cpu().numpy()
+                        )
                         for item in features
                     ]
+                    serialization_ms = (
+                        (time.perf_counter() - serialization_start)
+                        * 1000
+                        / len(cloud_batches)
+                    )
+                elif base_strategy.startswith("adaptive"):
+                    budget = float(
+                        budget_text or cfg["adaptive_fusion"]["evaluation_budgets"][0]
+                    )
+                    fused, selected = model.adaptive_features(
+                        features, budget, adaptive_selector(strategy)
+                    )
+                    outputs = model.heads(fused)
+                    predictions = [
+                        decode(batch_outputs(outputs, i), cfg) for i in range(batch)
+                    ]
+                    serialization_start = time.perf_counter()
+                    representations = [
+                        adaptive_payload(features[item], selected[item], cfg)
+                        for item in range(batch)
+                    ]
+                    serialization_ms = (
+                        (time.perf_counter() - serialization_start)
+                        * 1000
+                        / len(cloud_batches)
+                    )
                 else:
                     outputs = model.heads(
                         features.reshape(batch * nodes, *features.shape[2:])
                     )
                     predictions, representations = [], []
+                    serialization_seconds = 0.0
                     for item in range(batch):
                         local = [
                             decode(batch_outputs(outputs, item * nodes + node), cfg)
@@ -981,6 +1139,7 @@ def infer_batch(
                                 cfg["evaluation"]["max_detections"],
                             )
                         )
+                        serialization_start = time.perf_counter()
                         representations.append(
                             sum(
                                 payload(
@@ -998,13 +1157,24 @@ def infer_batch(
                                         dtype=np.float32,
                                     ).reshape(-1, 9)
                                 )
-                                for group in local
+                                for group in local[1:]
                             )
                         )
+                        serialization_seconds += (
+                            time.perf_counter() - serialization_start
+                        )
+                    serialization_ms = serialization_seconds * 1000 / len(cloud_batches)
         sync(device)
-        per_frame_ms = (time.perf_counter() - start) * 1000 / len(cloud_batches)
+        combined_ms = (time.perf_counter() - start) * 1000 / len(cloud_batches)
+        inference_ms = max(0.0, combined_ms - serialization_ms)
         return list(
-            zip(predictions, [per_frame_ms] * len(predictions), representations)
+            zip(
+                predictions,
+                [inference_ms] * len(predictions),
+                representations,
+                [preprocessing_ms] * len(predictions),
+                [serialization_ms] * len(predictions),
+            )
         )
     except (torch.OutOfMemoryError, RuntimeError) as error:
         if not cuda_oom(error, device):
@@ -1058,19 +1228,117 @@ def infer_batch(
         )
 
 
-def network_rows(cfg,base,raw_bytes,representation_bytes):
-    net = cfg['deployment_assumptions']
+def network_rows(cfg, base, raw_bytes, representation_bytes):
+    net = cfg["deployment_assumptions"]
+    base_strategy = base["strategy"].split("@", 1)[0]
+    if base_strategy.startswith("adaptive"):
+        base_strategy = "adaptive"
     rows = []
-    for placement in ('edge','cloud'):
-        transmitted = representation_bytes if placement=='edge' else raw_bytes
-        for bandwidth in net['bandwidths_mbps']:
-            transmit_ms = transmitted*8/(bandwidth*1e6)*1000
-            total = net['sensing_ms']+net[placement+'_rtt_ms']+net['processing_ms'][placement][base['strategy']]+transmit_ms
-            rows.append(base | {'placement':placement,'bandwidth_mbps':bandwidth,
-                                'assumption_source':net['source'],
-                                'payload_bytes':transmitted,'transmission_ms_model':transmit_ms,
-                                'end_to_end_ms_model':total})
+    for placement in ("edge", "cloud"):
+        transmitted = representation_bytes if placement == "edge" else raw_bytes
+        for bandwidth in net["bandwidths_mbps"]:
+            transmit_ms = transmitted * 8 / (bandwidth * 1e6) * 1000
+            total = (
+                net["sensing_ms"]
+                + net[placement + "_rtt_ms"]
+                + net["processing_ms"][placement][base_strategy]
+                + transmit_ms
+            )
+            rows.append(
+                base
+                | {
+                    "placement": placement,
+                    "bandwidth_mbps": bandwidth,
+                    "assumption_source": net["source"],
+                    "payload_bytes": transmitted,
+                    "transmission_ms_model": transmit_ms,
+                    "end_to_end_ms_model": total,
+                }
+            )
     return rows
+
+
+def simulate_fifo_latency(service_ms, arrival_interval_ms, fixed_ms, deadline_ms):
+    """Return D/D/1-style FIFO latency samples for a measured service trace."""
+    available = 0.0
+    latencies, waits = [], []
+    for index, service in enumerate(service_ms):
+        arrival = index * arrival_interval_ms
+        start = max(arrival, available)
+        wait = start - arrival
+        available = start + service
+        waits.append(wait)
+        latencies.append(fixed_ms + wait + service)
+    values = np.asarray(latencies, dtype=float)
+    return {
+        "frames": len(values),
+        "latency_mean_ms": float(values.mean()),
+        "latency_p50_ms": float(np.quantile(values, 0.50)),
+        "latency_p95_ms": float(np.quantile(values, 0.95)),
+        "latency_p99_ms": float(np.quantile(values, 0.99)),
+        "latency_max_ms": float(values.max()),
+        "queue_wait_mean_ms": float(np.mean(waits)),
+        "queue_wait_p99_ms": float(np.quantile(waits, 0.99)),
+        "deadline_miss_rate": float(np.mean(values > deadline_ms)),
+    }
+
+
+def write_latency_analysis(cfg, traces, output):
+    write_csv(output / "latency_trace.csv", traces)
+    grouped = defaultdict(list)
+    keys = ("seed", "session", "weather", "nodes", "node_count", "strategy")
+    for row in traces:
+        grouped[tuple(row[key] for key in keys)].append(row)
+    summaries = []
+    net, experiment = cfg["deployment_assumptions"], cfg["latency_experiment"]
+    for key, rows in sorted(grouped.items()):
+        base_strategy = key[-1].split("@", 1)[0]
+        if base_strategy.startswith("adaptive"):
+            base_strategy = "adaptive"
+        for placement in ("edge", "cloud"):
+            for bandwidth in net["bandwidths_mbps"]:
+                service = []
+                for row in rows:
+                    payload_bytes = (
+                        float(row["representation_bytes"])
+                        if placement == "edge"
+                        else float(row["raw_bytes"])
+                    )
+                    tx = payload_bytes * 8 / (bandwidth * 1e6) * 1000
+                    serialization = (
+                        float(row["serialization_ms"])
+                        if placement == "edge"
+                        else float(row["raw_serialization_ms"])
+                    )
+                    # The shared FIFO models the receiver service only. Dataset
+                    # loading/label parsing, sender preprocessing, and every
+                    # collaborator encoder are not serialized on that queue.
+                    service.append(
+                        float(net["processing_ms"][placement][base_strategy])
+                        + serialization
+                        + tx
+                    )
+                for burst in experiment["burst_multipliers"]:
+                    interval = experiment["frame_period_ms"] / burst
+                    for deadline in experiment["deadlines_ms"]:
+                        result = simulate_fifo_latency(
+                            service,
+                            interval,
+                            net["sensing_ms"] + net[placement + "_rtt_ms"],
+                            deadline,
+                        )
+                        summaries.append(
+                            dict(zip(keys, key))
+                            | {
+                                "placement": placement,
+                                "bandwidth_mbps": bandwidth,
+                                "burst_multiplier": burst,
+                                "arrival_interval_ms": interval,
+                                "deadline_ms": deadline,
+                                **result,
+                            }
+                        )
+    write_csv(output / "latency_tail_summary.csv", summaries)
 
 
 def run_evaluation(cfg):
@@ -1079,8 +1347,11 @@ def run_evaluation(cfg):
     for sample in samples:
         sessions[sample['session']].append(sample)
     output, device = Path(cfg['output']['root']),device_for(cfg)
-    all_metrics, all_costs = [], []
+    all_metrics, all_costs, all_traces = [], [], []
     for seed in cfg['training']['seeds']:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
         checkpoint = output/f'seed_{seed}'/'best.pt'
         if not checkpoint.exists():
             raise FileNotFoundError(f'Train first; missing {checkpoint}')
@@ -1093,6 +1364,7 @@ def run_evaluation(cfg):
                     "checkpoint_sha256": file_sha256(checkpoint),
                     "dataset": signature(cfg)["dataset"],
                     "evaluation": cfg["evaluation"],
+                    "latency_experiment": cfg["latency_experiment"],
                 },
                 sort_keys=True,
             ).encode()
@@ -1115,21 +1387,28 @@ def run_evaluation(cfg):
                     if part.get("signature") == evaluation_signature:
                         all_metrics.extend(part["metrics"])
                         all_costs.extend(part["costs"])
+                        all_traces.extend(part.get("traces", []))
                         print(
                             f"Resumed evaluation seed={seed} session={session}",
                             flush=True,
                         )
                         write_csv(output / "accuracy.csv", all_metrics)
                         write_csv(output / "latency_communication.csv", all_costs)
+                        write_latency_analysis(cfg, all_traces, output)
                         continue
-            metrics_start, costs_start = len(all_metrics), len(all_costs)
+            metrics_start, costs_start, traces_start = (
+                len(all_metrics),
+                len(all_costs),
+                len(all_traces),
+            )
             common = set.intersection(*(set(f['nodes']) for f in frames))
             groups = choose_groups(common,cfg['evaluation'])
             buckets = defaultdict(list)
             costs = defaultdict(list)
-            batch_size = cfg["evaluation"]["batch_size"]
+            batch_size = cfg["latency_experiment"]["profile_batch_size"]
             for start in range(0, len(frames), batch_size):
                 frame_chunk = frames[start : start + batch_size]
+                load_start = time.perf_counter()
                 prepared = [
                     (
                         annotations(sample["gt"], cfg["dataset"]),
@@ -1140,16 +1419,47 @@ def run_evaluation(cfg):
                     )
                     for sample in frame_chunk
                 ]
+                load_ms = (time.perf_counter() - load_start) * 1000 / len(frame_chunk)
                 for nodes in groups:
                     cloud_batches = [
                         [cloud_by_node[n] for n in nodes]
                         for _, cloud_by_node in prepared
                     ]
+                    raw_serialization_start = time.perf_counter()
                     raw_batch = [
-                        sum(payload(point_cloud) for point_cloud in clouds)
+                        sum(payload(point_cloud) for point_cloud in clouds[1:])
                         for clouds in cloud_batches
                     ]
-                    for strategy in cfg["evaluation"]["strategies"]:
+                    raw_serialization_ms = (
+                        (time.perf_counter() - raw_serialization_start)
+                        * 1000
+                        / len(cloud_batches)
+                    )
+                    strategies = []
+                    for configured in cfg["evaluation"]["strategies"]:
+                        if configured == "adaptive":
+                            strategies.extend(
+                                f"adaptive@{budget:g}"
+                                for budget in cfg["adaptive_fusion"][
+                                    "evaluation_budgets"
+                                ]
+                            )
+                            strategies.extend(
+                                f"adaptive_{selector}@{budget:g}"
+                                for selector in cfg["adaptive_fusion"]["ablations"]
+                                for budget in cfg["adaptive_fusion"][
+                                    "evaluation_budgets"
+                                ]
+                            )
+                        else:
+                            strategies.append(configured)
+                    for strategy in strategies:
+                        # Receiver rotation matters only to asymmetric adaptive
+                        # fusion. Avoid repeating receiver-invariant baselines.
+                        if not strategy.startswith("adaptive") and tuple(
+                            nodes
+                        ) != tuple(sorted(nodes)):
+                            continue
                         key = (nodes, strategy)
                         if strategy not in warmed:
                             infer_batch(
@@ -1164,11 +1474,48 @@ def run_evaluation(cfg):
                         results = infer_batch(
                             model, cloud_batches, cfg, device, strategy, raw_batch
                         )
-                        for (gt, _), raw_bytes, (preds, elapsed, representation) in zip(
-                            prepared, raw_batch, results
+                        for sample, (gt, _), raw_bytes, result in zip(
+                            frame_chunk, prepared, raw_batch, results
                         ):
+                            (
+                                preds,
+                                elapsed,
+                                representation,
+                                preprocessing,
+                                serialization,
+                            ) = result
                             buckets[key].append((preds, gt))
-                            costs[key].append((elapsed, raw_bytes, representation))
+                            costs[key].append(
+                                (
+                                    elapsed,
+                                    raw_bytes,
+                                    representation,
+                                    preprocessing,
+                                    serialization,
+                                )
+                            )
+                            all_traces.append(
+                                {
+                                    "seed": seed,
+                                    "session": session,
+                                    "weather": sample["weather"],
+                                    "sample": sample["id"],
+                                    "nodes": ",".join(nodes),
+                                    "node_count": len(nodes),
+                                    "strategy": strategy,
+                                    "load_ms": load_ms,
+                                    "preprocessing_ms": preprocessing,
+                                    "inference_decode_ms": elapsed,
+                                    "serialization_ms": serialization,
+                                    "raw_serialization_ms": raw_serialization_ms,
+                                    "local_pipeline_ms": load_ms
+                                    + preprocessing
+                                    + elapsed
+                                    + serialization,
+                                    "raw_bytes": raw_bytes,
+                                    "representation_bytes": representation,
+                                }
+                            )
             for (nodes, strategy), values in buckets.items():
                 base = {
                     "seed": seed,
@@ -1191,6 +1538,8 @@ def run_evaluation(cfg):
                     "frames": len(values),
                     "inference_decode_ms_mean": float(measured[:, 0].mean()),
                     "inference_decode_ms_p95": float(np.quantile(measured[:, 0], 0.95)),
+                    "preprocessing_ms_mean": float(measured[:, 3].mean()),
+                    "serialization_ms_mean": float(measured[:, 4].mean()),
                 }
                 all_costs.extend(
                     network_rows(
@@ -1212,10 +1561,12 @@ def run_evaluation(cfg):
                     "session": session,
                     "metrics": all_metrics[metrics_start:],
                     "costs": all_costs[costs_start:],
+                    "traces": all_traces[traces_start:],
                 },
             )
             write_csv(output / "accuracy.csv", all_metrics)
             write_csv(output / "latency_communication.csv", all_costs)
+            write_latency_analysis(cfg, all_traces, output)
     return all_metrics
 
 
@@ -1350,16 +1701,90 @@ def report(cfg):
     tradeoffs = []
     for row in accuracy:
         for cost in costs_by_run[tuple(row[k] for k in run_keys)]:
-            tradeoffs.append({k:row[k] for k in run_keys} | {
-                'class':row['class'],'iou':row['iou'],'ap_3d':row['ap_3d'],
-                'precision':row['precision'],'recall':row['recall'],'f1':row['f1'],
-                'placement':cost['placement'],
-                'bandwidth_mbps':cost['bandwidth_mbps'],'payload_bytes':cost['payload_bytes'],
-                'inference_decode_ms_mean':cost['inference_decode_ms_mean'],
-                'inference_decode_ms_p95':cost['inference_decode_ms_p95'],
-                'transmission_ms_assumed':cost['transmission_ms_model'],
-                'end_to_end_ms_assumed':cost['end_to_end_ms_model']})
-    write_csv(output/'accuracy_latency_tradeoffs.csv',tradeoffs)
+            tradeoffs.append(
+                {k: row[k] for k in run_keys}
+                | {
+                    "class": row["class"],
+                    "iou": row["iou"],
+                    "ap_3d": row["ap_3d"],
+                    "precision": row["precision"],
+                    "recall": row["recall"],
+                    "f1": row["f1"],
+                    "placement": cost["placement"],
+                    "bandwidth_mbps": cost["bandwidth_mbps"],
+                    "payload_bytes": cost["payload_bytes"],
+                    "inference_decode_ms_mean": cost["inference_decode_ms_mean"],
+                    "inference_decode_ms_p95": cost["inference_decode_ms_p95"],
+                    "preprocessing_ms_mean": cost["preprocessing_ms_mean"],
+                    "serialization_ms_mean": cost["serialization_ms_mean"],
+                    "transmission_ms_assumed": cost["transmission_ms_model"],
+                    "end_to_end_ms_assumed": cost["end_to_end_ms_model"],
+                }
+            )
+    write_csv(output / "accuracy_latency_tradeoffs.csv", tradeoffs)
+
+    adaptive_groups = defaultdict(list)
+    for row in tradeoffs:
+        if (
+            row["strategy"].startswith("adaptive")
+            and row["placement"] == "edge"
+            and float(row["bandwidth_mbps"])
+            == max(cfg["deployment_assumptions"]["bandwidths_mbps"])
+            and row["ap_3d"] not in ("", None)
+        ):
+            budget = float(row["strategy"].split("@", 1)[1])
+            selector = adaptive_selector(row["strategy"])
+            key = tuple(
+                row[k] for k in ("weather", "node_count", "class", "iou", "strategy")
+            ) + (selector,)
+            adaptive_groups[key].append(
+                (float(row["ap_3d"]), float(row["payload_bytes"]))
+            )
+    adaptive_rate = []
+    for key, values in sorted(adaptive_groups.items()):
+        weather, node_count, label, iou, strategy, selector = key
+        adaptive_rate.append(
+            {
+                "weather": weather,
+                "node_count": node_count,
+                "class": label,
+                "iou": iou,
+                "strategy": strategy,
+                "selector": selector,
+                "budget_fraction": float(strategy.split("@", 1)[1]),
+                "mean_ap": float(np.mean([value[0] for value in values])),
+                "std_ap": float(np.std([value[0] for value in values])),
+                "mean_payload_bytes": float(np.mean([value[1] for value in values])),
+                "observations": len(values),
+            }
+        )
+    write_csv(output / "adaptive_rate_accuracy.csv", adaptive_rate)
+
+    auc_groups = defaultdict(list)
+    for row in adaptive_rate:
+        key = tuple(
+            row[k] for k in ("weather", "node_count", "class", "iou", "selector")
+        )
+        auc_groups[key].append((row["budget_fraction"], row["mean_ap"]))
+    adaptive_auc = []
+    for key, values in sorted(auc_groups.items()):
+        points = sorted(set(values))
+        if len(points) < 2:
+            continue
+        x = np.asarray([point[0] for point in points], dtype=float)
+        y = np.asarray([point[1] for point in points], dtype=float)
+        log_x = np.log(x)
+        normalized_auc = float(np.trapezoid(y, log_x) / (log_x[-1] - log_x[0]))
+        adaptive_auc.append(
+            dict(zip(("weather", "node_count", "class", "iou", "selector"), key))
+            | {
+                "normalized_log_budget_ap_auc": normalized_auc,
+                "minimum_budget": float(x[0]),
+                "maximum_budget": float(x[-1]),
+                "operating_points": len(points),
+            }
+        )
+    write_csv(output / "adaptive_rate_accuracy_auc.csv", adaptive_auc)
 
     if cfg['output']['plots'] and summary:
         try:
@@ -1463,7 +1888,8 @@ def report(cfg):
         "Single-node rows cover every common real node. The fixed global ROI/GT is unchanged across counts.",
         "Measured inference+decode includes serial node execution and NMS; excludes loading/rasterization/serialization.",
         "End-to-end latency is an analytical estimate using configured literature-derived assumptions.",
-        "Logical payloads use float32 and zlib level 1; protocol headers and packet loss are not modeled.",
+        "Dense payloads use float32 and zlib level 1; adaptive sparse messages use configured index/value widths and zlib level 1.",
+        "Adaptive fusion keeps the first deterministic subset node as a dense local reference and budgets collaborator cells only.",
         "Cloud sends raw cropped points; edge sends raw points/features/local predictions according to strategy.",
         f'Assumption source: {cfg["deployment_assumptions"]["source"]}.',
         weather_limit,
@@ -1494,11 +1920,30 @@ def report(cfg):
 
 def verify_results(cfg):
     """Fail the unattended run if required artifacts or metric invariants are invalid."""
-    output = Path(cfg['output']['root'])
-    required = ['index.json','inventory.json','inspection.json','resolved_config.json',
-                'environment.json','accuracy.csv','accuracy_summary.csv','metrics_overview.csv',
-                'latency_communication.csv','accuracy_latency_tradeoffs.csv','report.md']
-    allowed_empty = ['cooperation_gains.csv','weather_cooperation_summary.csv','node_scaling.csv']
+    output = Path(cfg["output"]["root"])
+    required = [
+        "index.json",
+        "inventory.json",
+        "split_isolation.json",
+        "inspection.json",
+        "resolved_config.json",
+        "environment.json",
+        "accuracy.csv",
+        "accuracy_summary.csv",
+        "metrics_overview.csv",
+        "latency_communication.csv",
+        "latency_trace.csv",
+        "latency_tail_summary.csv",
+        "accuracy_latency_tradeoffs.csv",
+        "report.md",
+    ]
+    allowed_empty = [
+        "cooperation_gains.csv",
+        "weather_cooperation_summary.csv",
+        "node_scaling.csv",
+        "adaptive_rate_accuracy.csv",
+        "adaptive_rate_accuracy_auc.csv",
+    ]
     checks, errors = {}, []
     for name in required:
         path = output/name

@@ -18,7 +18,13 @@ from src.data.coinfra import annotations, calibration, discover, load_cloud, ras
 from src.data.loader import BoundingBox3D
 from src.detection.bev import BEVDetector, decode, loss, targets
 from src.metrics.evaluation import evaluate, iou3d
+from src.network.control import (
+    PastOnlyLinkEstimator,
+    past_frame,
+    select_deadline_budget,
+)
 from src.pipeline import (
+    audit_split_isolation,
     choose_groups,
     indexed,
     inspect,
@@ -26,10 +32,68 @@ from src.pipeline import (
     prune_checkpoints,
     report,
     run_evaluation,
+    simulate_fifo_latency,
     train,
     validation_metrics,
     verify_results,
 )
+
+
+def test_split_audit_rejects_shared_source_across_splits(tmp_path):
+    common = str(tmp_path / "same.npy")
+    base = {
+        "session": "s",
+        "slice": "slice0",
+        "gt": str(tmp_path / "gt.yaml"),
+        "nodes": {"1": {"cloud": common}},
+    }
+    samples = [
+        base | {"id": "train/frame", "split": "train"},
+        base | {"id": "test/frame", "split": "test"},
+    ]
+    with pytest.raises(ValueError, match="Data leakage"):
+        audit_split_isolation(samples)
+
+
+def test_receiver_rotation_is_not_lexicographic():
+    groups = choose_groups(
+        {"10", "2"},
+        {
+            "subset_seed": 1,
+            "node_counts": [2],
+            "subsets_per_count": 1,
+            "receiver_policy": "all",
+        },
+    )
+    assert set(groups) == {("10", "2"), ("2", "10")}
+
+
+def test_deadline_budget_uses_only_past_link_observations():
+    estimator = PastOnlyLinkEstimator(10, alpha=1)
+    estimator.observe(0, delivered_bytes=125_000, duration_ms=100)
+    state = estimator.state(1, queue_ms=10)
+    chosen = select_deadline_budget(
+        [0.01, 0.05, 0.1, 0.25],
+        cells=10_000,
+        channels=32,
+        collaborators=1,
+        state=state,
+        deadline_ms=150,
+        fixed_ms=100,
+    )
+    assert chosen == 0.05
+    with pytest.raises(ValueError, match="follow"):
+        estimator.state(0)
+
+
+def test_stale_lookup_is_strictly_past_and_sequence_local():
+    history = [
+        {"timestamp": str(value), "split": "test", "session": "s", "slice": "a"}
+        for value in (1.0, 1.1, 1.2)
+    ]
+    assert past_frame(history, history[2], 1) is history[1]
+    history[1] = history[1] | {"slice": "other"}
+    assert past_frame(history, history[2], 1) is None
 
 
 @pytest.fixture
@@ -169,9 +233,9 @@ def test_dataset_ap_false_positive_empty_frame():
 
 
 def test_group_selection_no_synthetic_nodes(fixture_config):
-    groups = choose_groups(['4','9'],fixture_config['evaluation'])
-    assert groups==[('4',),('9',),('4','9')]
-    settings = fixture_config['evaluation'] | {'node_counts':[8]}
+    groups = choose_groups(["4", "9"], fixture_config["evaluation"])
+    assert groups == [("4",), ("9",), ("4", "9"), ("9", "4")]
+    settings = fixture_config["evaluation"] | {"node_counts": [8]}
     with pytest.raises(ValueError):
         choose_groups(['4','9'],settings)
 
@@ -223,6 +287,16 @@ def test_network_units(fixture_config):
     assert rows[0]['transmission_ms_model']==pytest.approx(.8)
     assert rows[3]['transmission_ms_model']==pytest.approx(800)
     assert rows[0]['assumption_source']==fixture_config['deployment_assumptions']['source']
+
+
+def test_fifo_latency_reports_queueing_and_deadline_misses():
+    stable = simulate_fifo_latency([20, 20, 20], 100, 10, 100)
+    assert stable["queue_wait_mean_ms"] == 0
+    assert stable["deadline_miss_rate"] == 0
+    overloaded = simulate_fifo_latency([80, 80, 80], 50, 10, 100)
+    assert overloaded["queue_wait_mean_ms"] > 0
+    assert overloaded["latency_p99_ms"] > overloaded["latency_p50_ms"]
+    assert overloaded["deadline_miss_rate"] > 0
 
 
 def test_smoke_profile_is_small_and_split_disjoint():
@@ -327,6 +401,90 @@ def test_batched_detector_and_loss_match_individual_samples(fixture_config):
     torch.testing.assert_close(batched[1], torch.cat([value[1] for value in separate]))
 
 
+def test_encoder_receptive_field_spans_typical_car(fixture_config):
+    model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
+    receptive_cells = 1
+    for layer in model.encoder:
+        if isinstance(layer, torch.nn.Conv2d):
+            receptive_cells += (layer.kernel_size[0] - 1) * layer.dilation[0]
+    assert receptive_cells * 0.4 >= 4.0
+
+
+def test_adaptive_fusion_obeys_spatial_budget(fixture_config):
+    torch.manual_seed(11)
+    model = BEVDetector(
+        fixture_config["dataset"]["classes"],
+        4,
+        fixture_config["dataset"]["objects_per_cell"],
+    )
+    features = torch.rand(2, 3, 4, 10, 10)
+    fused_small, selected_small = model.adaptive_features(features, 0.05)
+    fused_large, selected_large = model.adaptive_features(features, 0.25)
+    assert fused_small.shape == (2, 4, 10, 10)
+    assert selected_small.shape == (2, 2, 10, 10)
+    assert selected_small.sum(dim=(-1, -2)).unique().tolist() == [5]
+    assert selected_large.sum(dim=(-1, -2)).unique().tolist() == [25]
+    assert torch.all(fused_small >= features[:, 0])
+    assert torch.all(fused_large >= features[:, 0])
+
+
+def test_ablation_selectors_change_only_selected_cells(fixture_config):
+    torch.manual_seed(21)
+    model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
+    features = torch.rand(2, 3, 4, 10, 10)
+    energy_fused, energy_mask = model.adaptive_features(features, 0.1, "energy")
+    torch.manual_seed(22)
+    random_fused, random_mask = model.adaptive_features(features, 0.1, "random")
+    assert not torch.equal(random_mask[0, 0], random_mask[0, 1])
+    assert not torch.equal(random_mask[0], random_mask[1])
+    for fused, mask in ((energy_fused, energy_mask), (random_fused, random_mask)):
+        sparse = features[:, 1:] * mask[:, :, None]
+        expected = torch.maximum(features[:, 0], sparse.amax(dim=1))
+        torch.testing.assert_close(fused, expected)
+
+
+def test_adaptive_payload_grows_with_budget(fixture_config):
+    torch.manual_seed(12)
+    model = BEVDetector(
+        fixture_config["dataset"]["classes"],
+        4,
+        fixture_config["dataset"]["objects_per_cell"],
+    )
+    features = torch.rand(1, 3, 4, 16, 16)
+    _, small = model.adaptive_features(features, 0.01)
+    _, large = model.adaptive_features(features, 0.25)
+    small_bytes = pipeline_module.adaptive_payload(
+        features[0], small[0], fixture_config
+    )
+    large_bytes = pipeline_module.adaptive_payload(
+        features[0], large[0], fixture_config
+    )
+    assert 0 < small_bytes < large_bytes
+
+
+def test_dense_and_adaptive_payloads_exclude_receiver_and_use_same_value_width(
+    fixture_config,
+):
+    features = np.ones((3, 4, 8, 8), dtype=np.float32)
+    dense = sum(
+        pipeline_module.feature_payload(item, fixture_config) for item in features[1:]
+    )
+    assert dense == 2 * pipeline_module.feature_payload(features[1], fixture_config)
+    assert pipeline_module.feature_payload(
+        features[0], fixture_config
+    ) < pipeline_module.payload(features[0])
+
+
+def test_duplicate_prediction_is_false_positive():
+    gt = BoundingBox3D(0, 0, 0, 4, 2, 2, 0, "car")
+    first = BoundingBox3D(0, 0, 0, 4, 2, 2, 0, "car", score=0.9)
+    duplicate = BoundingBox3D(0, 0, 0, 4, 2, 2, 0, "car", score=0.8)
+    row = evaluate([([first, duplicate], [gt])], ["car"], [0.5])[0]
+    assert row["true_positives"] == 1
+    assert row["false_positives"] == 1
+    assert row["precision"] == 0.5
+
+
 def test_validation_rejects_empty_split(fixture_config):
     model = BEVDetector(
         fixture_config["dataset"]["classes"],
@@ -367,6 +525,62 @@ def test_validation_oom_splits_only_current_batch(monkeypatch, fixture_config):
     assert all(len(values) == 2 for values in frames.values())
 
 
+def test_optimizer_step_oom_resets_scaler_before_retry(monkeypatch, fixture_config):
+    model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
+    target = targets([], fixture_config["dataset"], (16, 16))
+    examples = [(np.zeros((3, 16, 16), np.float32), target)]
+
+    class Optimizer:
+        def zero_grad(self, set_to_none=True):
+            model.zero_grad(set_to_none=set_to_none)
+
+    class Scaler:
+        def __init__(self):
+            self.state = "ready"
+            self.calls = 0
+
+        def scale(self, value):
+            return value
+
+        def unscale_(self, optimizer):
+            pass
+
+        def step(self, optimizer):
+            if self.state == "stepped":
+                raise RuntimeError("step() has already been called since update()")
+            self.state = "stepped"
+            self.calls += 1
+            if self.calls == 1:
+                raise torch.OutOfMemoryError("out of memory in optimizer step")
+
+        def update(self):
+            self.state = "ready"
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "device_tensor",
+        lambda value, device: torch.as_tensor(value),
+    )
+    monkeypatch.setattr(pipeline_module, "release_cuda_memory", lambda device: None)
+    monkeypatch.setattr(pipeline_module, "wait_for_resources", lambda *args: None)
+    fixture_config["training"]["mixed_precision"] = False
+    scaler = Scaler()
+    losses = pipeline_module.train_examples(
+        model,
+        Optimizer(),
+        scaler,
+        examples,
+        "early",
+        fixture_config,
+        SimpleNamespace(type="cuda"),
+        "test",
+        {"training": 1},
+        retries=1,
+    )
+    assert len(losses) == 1
+    assert scaler.calls == 2
+
+
 def test_decode_accepts_mixed_precision_outputs(fixture_config):
     classes = len(fixture_config["dataset"]["classes"])
     slots = fixture_config["dataset"]["objects_per_cell"]
@@ -403,25 +617,60 @@ def test_end_to_end_train_all_fusions_report(fixture_config):
     report(fixture_config)
     verification = verify_results(fixture_config)
     assert verification['status']=='passed'
-    assert {r['strategy'] for r in rows}=={'early','intermediate','late'}
-    assert {r['node_count'] for r in rows}=={1,2}
-    car_counts = {r['ground_truth'] for r in rows if r['class']=='car'}
-    assert car_counts=={4}
-    output = Path(fixture_config['output']['root'])
-    assert (output/'seed_1/best.pt').exists()
-    assert (output/'report.md').exists()
-    for filename in ('accuracy_summary.csv','metrics_overview.csv','cooperation_gains.csv',
-                     'weather_cooperation_summary.csv','node_scaling.csv',
-                     'accuracy_latency_tradeoffs.csv','verification.json'):
-        assert (output/filename).exists()
+    expected_adaptive = {
+        f"{name}@{budget}"
+        for name in ("adaptive", "adaptive_random", "adaptive_energy")
+        for budget in ("0.01", "0.05", "0.1", "0.25")
+    }
+    assert {r["strategy"] for r in rows} == {
+        "early",
+        "intermediate",
+        "late",
+    } | expected_adaptive
+    assert {r["node_count"] for r in rows} == {1, 2}
+    car_counts = {r["ground_truth"] for r in rows if r["class"] == "car"}
+    assert car_counts == {4}
+    output = Path(fixture_config["output"]["root"])
+    assert (output / "seed_1/best.pt").exists()
+    assert (output / "report.md").exists()
+    for filename in (
+        "accuracy_summary.csv",
+        "metrics_overview.csv",
+        "cooperation_gains.csv",
+        "weather_cooperation_summary.csv",
+        "node_scaling.csv",
+        "accuracy_latency_tradeoffs.csv",
+        "adaptive_rate_accuracy.csv",
+        "adaptive_rate_accuracy_auc.csv",
+        "latency_trace.csv",
+        "latency_tail_summary.csv",
+        "verification.json",
+    ):
+        assert (output / filename).exists()
+    with (output / "adaptive_rate_accuracy.csv").open() as stream:
+        adaptive_rows = list(csv.DictReader(stream))
+    assert adaptive_rows
+    assert {float(row["budget_fraction"]) for row in adaptive_rows} == {
+        0.01,
+        0.05,
+        0.1,
+        0.25,
+    }
     with (output/'cooperation_gains.csv').open() as stream:
         gain_rows = list(csv.DictReader(stream))
     assert gain_rows
     assert {'ap_gain_over_mean_single','recall_gain_over_mean_single'} <= set(gain_rows[0])
     with (output/'seed_1/training_metrics_seed_1.csv').open() as stream:
         training_rows = list(csv.DictReader(stream))
-    assert {'val_map_early','val_map_intermediate','val_map_late','val_precision','val_f1'} <= set(training_rows[0])
-    assert not (output/'seed_1/training.csv').exists()
+    assert {
+        "val_map_early",
+        "val_map_intermediate",
+        "val_map_late",
+        "val_map_adaptive",
+        "val_precision",
+        "val_f1",
+    } <= set(training_rows[0])
+    assert not (output / "seed_1/training.csv").exists()
     train(fixture_config)
     fixture_config['dataset']['frame_stride']=2
     with pytest.raises(ValueError,match='changed'):

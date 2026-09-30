@@ -14,25 +14,110 @@ class BEVDetector(nn.Module):
         super().__init__()
         self.classes = classes
         self.objects_per_cell = objects_per_cell
-        self.encoder = nn.Sequential(nn.Conv2d(3,hidden,3,padding=1), nn.ReLU(),
-                                     nn.Conv2d(hidden,hidden,3,padding=1), nn.ReLU())
+        # 11x11-cell receptive field: 4.4 m at CoInfra's 0.4 m resolution,
+        # large enough to represent a typical car rather than only a fragment.
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, hidden, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(hidden, hidden, 3, padding=2, dilation=2),
+            nn.ReLU(),
+            nn.Conv2d(hidden, hidden, 3, padding=2, dilation=2),
+            nn.ReLU(),
+        )
         slots = len(classes) * objects_per_cell
         self.heatmap = nn.Conv2d(hidden, slots, 1)
         self.regression = nn.Conv2d(hidden, 8 * slots, 1)
+        # A learned, content-dependent utility map used by budget-conditioned
+        # sparse fusion. One score is produced for every node and BEV cell.
+        self.utility = nn.Sequential(
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(hidden, 1, 1),
+        )
         nn.init.constant_(self.heatmap.bias, -2.19)
 
     def heads(self, features):
         return self.heatmap(features), self.regression(features)
 
+    def adaptive_features(self, features, budget, selector="learned"):
+        """Fuse a dense reference with top-utility collaborator cells.
+
+        The first node is the reference observation. Each additional node may
+        transmit only ``budget`` of its spatial cells. Feature values remain
+        differentiable; the discrete top-k decision is intentionally explicit
+        so evaluation has a deterministic byte budget.
+        """
+        if not 0 < budget <= 1:
+            raise ValueError("adaptive budget must be in (0, 1]")
+        if features.ndim != 5:
+            raise ValueError("adaptive fusion expects [batch, nodes, channels, H, W]")
+        batch, nodes, channels, height, width = features.shape
+        if nodes == 1:
+            empty = torch.zeros(
+                batch, 0, height, width, dtype=torch.bool, device=features.device
+            )
+            return features[:, 0], empty
+        collaborators = features[:, 1:]
+        flat = collaborators.reshape(batch * (nodes - 1), channels, height, width)
+        learned_scores = self.utility(flat).reshape(batch, nodes - 1, height * width)
+        if selector == "learned":
+            scores = learned_scores
+        elif selector == "energy":
+            scores = (
+                collaborators.float()
+                .abs()
+                .mean(dim=2)
+                .reshape(batch, nodes - 1, height * width)
+            )
+        elif selector == "random":
+            # Evaluation seeds PyTorch once per run. Drawing a full tensor keeps
+            # this reproducible while giving each frame and collaborator an
+            # independent spatial sample.
+            scores = torch.rand(
+                batch, nodes - 1, height * width, device=features.device
+            )
+        else:
+            raise ValueError(f"unknown adaptive selector: {selector}")
+        count = max(1, min(height * width, math.ceil(budget * height * width)))
+        selected = scores.topk(count, dim=-1).indices
+        hard_mask = torch.zeros_like(scores)
+        hard_mask.scatter_(-1, selected, 1.0)
+        # Straight-through relaxation: forward communication is exactly top-k,
+        # while every utility score receives a useful training gradient.
+        # Only the proposed learned selector needs the surrogate gradient.
+        if selector == "learned":
+            soft_mask = learned_scores.sigmoid()
+            gate = hard_mask + soft_mask - soft_mask.detach()
+        else:
+            gate = hard_mask
+        mask = hard_mask.bool().reshape(batch, nodes - 1, height, width)
+        # Selection methods differ only in which cells they choose. All three
+        # transmit and fuse the same unscaled encoder features.
+        sparse = collaborators * gate.reshape(batch, nodes - 1, 1, height, width)
+        # Encoder ReLUs make zero a safe identity for missing collaborator cells.
+        fused = torch.maximum(features[:, 0], sparse.amax(dim=1))
+        return fused, mask
+
     def forward(self, bev, mode="early"):
-        if mode == "intermediate" and bev.ndim == 5:
+        base_mode, _, budget_text = mode.partition("@")
+        if base_mode in {"intermediate", "adaptive"} and bev.ndim == 5:
             batch, nodes, channels, height, width = bev.shape
             features = self.encoder(bev.reshape(batch * nodes, channels, height, width))
-            features = features.reshape(batch, nodes, *features.shape[1:]).amax(dim=1)
+            features = features.reshape(batch, nodes, *features.shape[1:])
+            if base_mode == "adaptive":
+                budget = float(budget_text) if budget_text else 0.1
+                features, _ = self.adaptive_features(features, budget)
+            else:
+                features = features.amax(dim=1)
         else:
             features = self.encoder(bev)
-            if mode == "intermediate":
+            if base_mode == "intermediate":
                 features = features.amax(dim=0, keepdim=True)
+            elif base_mode == "adaptive":
+                if features.ndim != 4:
+                    raise ValueError("unexpected adaptive feature shape")
+                budget = float(budget_text) if budget_text else 0.1
+                features, _ = self.adaptive_features(features[None], budget)
         return self.heads(features)
 
 

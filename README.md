@@ -5,8 +5,9 @@ The default server configuration uses an ego vehicle, connected vehicles, and
 roadside units from selected Adver-City clear, rain, fog, and fog-plus-heavy-rain
 scenarios. CoInfra remains available for real multi-RSU adverse-weather tests.
 
-The project compares early, intermediate, and late fusion for 1, 2, 4, and 8
-RSUs. It measures rotated 3D AP, precision, recall, F1, TP/FP/FN counts,
+The project compares early, intermediate, late, and budget-conditioned adaptive
+sparse fusion for 1, 2, 4, and 8 RSUs. It measures rotated 3D AP, precision,
+recall, F1, TP/FP/FN counts,
 matched-box 3D IoU, center/yaw/size errors, representation size, local inference
 time, and analytical edge/cloud latency. Edge/cloud deployment is not executed;
 latency uses explicit configuration assumptions that must be cited in a paper.
@@ -21,6 +22,8 @@ vehicle and roadside sensor viewpoints in simulation.
 3. What accuracy, communication, and assumed-latency trade-offs result?
 4. Does the paired cooperation gain persist across recorded weather conditions?
 5. Which object classes benefit most?
+6. Can learned utility-per-byte selection preserve cooperative accuracy while
+   transmitting only 1--25% of collaborator BEV cells?
 
 Weather comparisons are observational. Recording date, traffic, lighting, and
 weather are confounded, so results do not identify a causal weather effect.
@@ -188,6 +191,23 @@ of the publisher's detector. It predicts car, truck, bus, bicycle, and pedestria
 - **Early fusion:** combine globally aligned points before rasterization.
 - **Intermediate fusion:** encode each RSU BEV and max-fuse its feature map.
 - **Late fusion:** detect per RSU and merge boxes with class-wise rotated 3D NMS.
+- **Adaptive fusion:** retain one dense reference node and transmit only the
+  highest-utility spatial cells from collaborator feature maps. A learned
+  utility head is trained end-to-end with a straight-through top-k mask. One
+  model is trained across several budgets and evaluated at 1%, 5%, 10%, and
+  25% collaborator-cell budgets.
+
+The same byte-budget sweep includes deterministic random-cell and feature-energy
+selectors. These are ablations of the learned utility head, not separately
+trained models, and appear as `adaptive_random@...` and `adaptive_energy@...`
+in result files.
+
+For adaptive fusion, the first node in the deterministic subset is the fusion
+reference and therefore does not contribute to the transmitted collaborator
+payload. Sparse messages contain flattened cell indices and feature vectors
+serialized as configured integer and floating-point widths, then compressed
+with zlib level 1. This reference-node assumption must be stated in papers and
+should be tested with a reference-rotation ablation before a final submission.
 
 All strategies use the same weights and evaluation frames. Every single common
 RSU is evaluated; larger node combinations are sampled deterministically. The
@@ -208,6 +228,10 @@ The configured output directory contains:
 - `weather_cooperation_summary.csv` with weather-stratified paired gains;
 - `node_scaling.csv` with changes between successive configured node counts;
 - `latency_communication.csv` with measured local timing and assumed latency;
+- `latency_trace.csv` with per-frame loading, preprocessing, inference/decoding,
+  serialization, and payload measurements;
+- `latency_tail_summary.csv` with p50/p95/p99 and maximum latency, queue waiting,
+  and deadline-miss rates under periodic and burst arrivals;
 - `accuracy_latency_tradeoffs.csv` joining accuracy and deployment costs;
 - `accuracy_by_nodes.png`, `cooperation_gain_by_weather.png`,
   `latency_by_bandwidth.png`, and `report.md`;
@@ -219,6 +243,17 @@ computed only for matched true positives. Undefined classes and match metrics ar
 left blank rather than treated as zero. Summary statistics are descriptive, not
 confidence intervals. `run.sh` executes verification after report generation and
 returns a nonzero exit code if required results are missing or inconsistent.
+
+## Latency experiment
+
+The latency trace separates measured local stages from network modeling. GPU
+timing is synchronized around inference. The queue experiment replays the
+measured per-frame service trace through a FIFO server at the configured frame
+period and at 2x/4x burst arrival rates. For every placement, bandwidth, and
+deadline it reports mean, p50, p95, p99, maximum, queue waiting, and deadline
+miss rate. Transmission and RTT remain modeled unless an external network
+testbed is used. Run the final latency experiment with evaluation batch size 1
+so batch-amortized throughput is not reported as per-request response time.
 
 ## Scientific scope
 
