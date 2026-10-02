@@ -1,1 +1,1 @@
-"""CoInfra pipeline components."""
+"""Detection models and BEV target utilities for ECCO."""

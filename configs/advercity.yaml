@@ -60,6 +60,8 @@ training:
     minimum_free_disk_gb: 20
     minimum_free_gpu_gb: 2
     cuda_oom_retries: 3
+    # Preserve stale per-seed artifacts and retrain only that seed during unattended runs.
+    on_incompatible: quarantine
 evaluation:
   receiver_policy: all
   batch_size: 8
@@ -80,7 +82,7 @@ adaptive_fusion:
 latency_experiment:
   frame_period_ms: 100.0
   profile_batch_size: 1
-  # Must exceed sensing plus the smallest configured RTT (105 ms).
+  # Must exceed sensing plus the largest configured RTT (140 ms).
   deadlines_ms: [150.0, 250.0]
   burst_multipliers: [1, 2, 4]
 deployment_assumptions:

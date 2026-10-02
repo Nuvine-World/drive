@@ -462,6 +462,25 @@ def test_adaptive_payload_grows_with_budget(fixture_config):
     assert 0 < small_bytes < large_bytes
 
 
+def test_random_selector_is_independent_of_global_rng_history(fixture_config):
+    model = BEVDetector(
+        fixture_config["dataset"]["classes"],
+        4,
+        fixture_config["dataset"]["objects_per_cell"],
+    )
+    features = torch.rand(1, 3, 4, 8, 8)
+    first_generator = torch.Generator().manual_seed(123)
+    _, first = model.adaptive_features(
+        features, 0.1, "random", generators=[first_generator]
+    )
+    torch.rand(1000)
+    second_generator = torch.Generator().manual_seed(123)
+    _, second = model.adaptive_features(
+        features, 0.1, "random", generators=[second_generator]
+    )
+    assert torch.equal(first, second)
+
+
 def test_dense_and_adaptive_payloads_exclude_receiver_and_use_same_value_width(
     fixture_config,
 ):
@@ -476,13 +495,90 @@ def test_dense_and_adaptive_payloads_exclude_receiver_and_use_same_value_width(
 
 
 def test_duplicate_prediction_is_false_positive():
-    gt = BoundingBox3D(0, 0, 0, 4, 2, 2, 0, "car")
-    first = BoundingBox3D(0, 0, 0, 4, 2, 2, 0, "car", score=0.9)
-    duplicate = BoundingBox3D(0, 0, 0, 4, 2, 2, 0, "car", score=0.8)
-    row = evaluate([([first, duplicate], [gt])], ["car"], [0.5])[0]
+    truths = [
+        BoundingBox3D(-0.5, 0, 0, 4, 2, 2, 0, "car"),
+        BoundingBox3D(0.5, 0, 0, 4, 2, 2, 0, "car"),
+    ]
+    first = BoundingBox3D(-0.2, 0, 0, 4, 2, 2, 0, "car", score=0.9)
+    duplicate = BoundingBox3D(-0.2, 0, 0, 4, 2, 2, 0, "car", score=0.8)
+    row = evaluate([([first, duplicate], truths)], ["car"], [0.5])[0]
     assert row["true_positives"] == 1
     assert row["false_positives"] == 1
     assert row["precision"] == 0.5
+
+
+def test_evaluation_fingerprint_covers_evaluation_only_settings(
+    fixture_config, tmp_path
+):
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"weights")
+    original = pipeline_module.evaluation_fingerprint(fixture_config, checkpoint)
+    variants = []
+    for section, key, value in (
+        ("adaptive_fusion", "evaluation_budgets", [0.5]),
+        ("deployment_assumptions", "edge_rtt_ms", 123.0),
+        (
+            "training",
+            "mixed_precision",
+            not fixture_config["training"]["mixed_precision"],
+        ),
+    ):
+        changed = copy.deepcopy(fixture_config)
+        changed[section][key] = value
+        variants.append(pipeline_module.evaluation_fingerprint(changed, checkpoint))
+    assert all(value != original for value in variants)
+
+
+def test_finite_bursts_recover_between_groups():
+    arrivals = pipeline_module.finite_burst_arrivals(8, 100.0, 4)
+    assert arrivals[:4] == [0.0, 25.0, 50.0, 75.0]
+    assert arrivals[4] == 400.0
+
+
+def test_cooperation_gain_uses_only_participating_single_nodes(fixture_config):
+    output = Path(fixture_config["output"]["root"])
+    output.mkdir(parents=True)
+    fixture_config["output"]["plots"] = False
+    base = {
+        "seed": 1,
+        "session": "session",
+        "weather": "sunny",
+        "strategy": "early",
+        "class": "car",
+        "iou": 0.5,
+        "precision": 0.5,
+        "recall": 0.5,
+        "f1": 0.5,
+        "mean_matched_iou_3d": 0.6,
+        "mean_center_error_m": 1.0,
+        "mean_yaw_error_deg": 2.0,
+        "mean_size_iou": 0.7,
+        "true_positives": 1,
+        "false_positives": 1,
+        "false_negatives": 1,
+        "ground_truth": 2,
+        "predictions": 2,
+        "frames": 1,
+    }
+    rows = [
+        base | {"nodes": "A", "node_count": 1, "ap_3d": 0.9},
+        base | {"nodes": "B", "node_count": 1, "ap_3d": 0.1},
+        base | {"nodes": "C", "node_count": 1, "ap_3d": 0.8},
+        base | {"nodes": "B,C", "node_count": 2, "ap_3d": 0.5},
+    ]
+    with (output / "accuracy.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    (output / "latency_communication.csv").write_text("")
+
+    report(fixture_config)
+
+    with (output / "cooperation_gains.csv").open() as stream:
+        gain = next(csv.DictReader(stream))
+    assert float(gain["single_node_ap_mean"]) == pytest.approx(0.45)
+    assert float(gain["single_node_ap_best"]) == pytest.approx(0.8)
+    assert gain["nodes"] == "B,C"
 
 
 def test_validation_rejects_empty_split(fixture_config):
@@ -715,6 +811,26 @@ def test_completed_training_can_extend_epochs(fixture_config):
     train(fixture_config)
     completion = Path(fixture_config["output"]["root"]) / "seed_1/complete.json"
     assert json.loads(completion.read_text())["epochs"] == 2
+
+
+def test_incompatible_seed_is_quarantined_and_retrained(fixture_config):
+    torch.set_num_threads(1)
+    train(fixture_config)
+    output = Path(fixture_config["output"]["root"])
+    original = torch.load(
+        output / "seed_1/best.pt", map_location="cpu", weights_only=True
+    )
+
+    fixture_config["training"]["learning_rate"] *= 2
+    train(fixture_config)
+
+    replacement = torch.load(
+        output / "seed_1/best.pt", map_location="cpu", weights_only=True
+    )
+    quarantined = list((output / "stale_checkpoints").glob("seed_1_*"))
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "best.pt").exists()
+    assert original["signature"] != replacement["signature"]
 
 
 def test_evaluation_reuses_completed_session_parts(monkeypatch, fixture_config):

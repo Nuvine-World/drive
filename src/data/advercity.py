@@ -31,7 +31,8 @@ def annotations(path, cfg):
     a multi-day run.  The strict CoInfra reader remains unchanged.
     """
     with open(path) as stream:
-        raw = yaml.safe_load(stream)
+        loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+        raw = yaml.load(stream, Loader=loader)
     if isinstance(raw, dict):
         raw = first(raw, "objects", "annotations", "data")
     if not isinstance(raw, list):

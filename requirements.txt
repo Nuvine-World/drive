@@ -1,10 +1,7 @@
-numpy>=1.26,<3
+numpy>=2.0,<3
 PyYAML>=6,<7
-torch>=2.2,<3
+torch>=2.4,<3
 shapely>=2,<3
 huggingface_hub>=0.34,<2
-pytest>=8,<10
 matplotlib>=3.8,<4
 py7zr>=0.22,<2
-black>=25,<26
-darker>=3,<4

@@ -301,13 +301,11 @@ def convert_scenario(extracted, destination, name, cfg):
     vehicles = []
     for agent in agents:
         raw = frame_yaml(agent, first_frame)
-        if 'RSU' in raw:
-            is_rsu = bool(raw['RSU'])
-        else:
-            try:
-                is_rsu = int(agent.name) < 0
-            except ValueError:
-                is_rsu = False
+        try:
+            inferred_rsu = int(agent.name) < 0
+        except ValueError:
+            inferred_rsu = False
+        is_rsu = bool(raw["RSU"]) if "RSU" in raw else inferred_rsu
         if not is_rsu:
             vehicles.append(agent)
     if not vehicles:
@@ -332,9 +330,14 @@ def convert_scenario(extracted, destination, name, cfg):
         valid_nodes = 0
         for agent in agents:
             raw = frame_yaml(agent, frame)
-            node_types[agent.name] = 'rsu' if raw.get('RSU') else 'vehicle'
-            points = read_ply(agent / f'{frame}_lidar.ply')
-            relative = world_to_ego @ matrix(raw['lidar_pose'])
+            try:
+                inferred_rsu = int(agent.name) < 0
+            except ValueError:
+                inferred_rsu = False
+            is_rsu = bool(raw["RSU"]) if "RSU" in raw else inferred_rsu
+            node_types[agent.name] = "rsu" if is_rsu else "vehicle"
+            points = read_ply(agent / f"{frame}_lidar.ply")
+            relative = world_to_ego @ matrix(raw["lidar_pose"])
             points = transform_points(points, relative)
             keep = ((points[:, :3] >= bounds[:3]) & (points[:, :3] < bounds[3:])).all(axis=1)
             points = points[keep]
@@ -380,9 +383,16 @@ def prepare(cfg, preview=False):
     root.mkdir(parents=True, exist_ok=True)
     archives.mkdir(parents=True, exist_ok=True)
     extraction.mkdir(parents=True, exist_ok=True)
+    scenarios = selected_scenarios(cfg)
+    if not preview and all(
+        (root / name / "scenario.yaml").is_file() for name in scenarios
+    ):
+        print(
+            "All configured Adver-City scenarios are already prepared; offline check passed"
+        )
+        return
     files = remote_files()
     checksums = remote_checksums()
-    scenarios = selected_scenarios(cfg)
     unknown = sorted(set(scenarios) - set(files))
     if unknown:
         raise ValueError(f'Scenarios not in official release: {unknown}')
@@ -403,12 +413,18 @@ def prepare(cfg, preview=False):
         archive = archives / item['name']
         ensure_space(work, item['size'], reserve)
         expected = checksums.get(item['name'])
-        if archive.exists() and (archive.stat().st_size != item['size'] or sha256(archive) != expected):
-            archive.unlink()
+        archive_digest = None
+        if archive.exists():
+            archive_digest = sha256(archive)
+            if archive.stat().st_size != item["size"] or archive_digest != expected:
+                archive.unlink()
+                archive_digest = None
         if not archive.exists():
             url = f'{FILE_URL}/{urllib.parse.quote(item["name"])}'
             download(url, archive, item['size'])
-        if not expected or sha256(archive) != expected:
+        if archive_digest is None:
+            archive_digest = sha256(archive)
+        if not expected or archive_digest != expected:
             raise ValueError(f'Publisher checksum mismatch: {archive}')
         scenario_extract = extraction / name
         if scenario_extract.exists():

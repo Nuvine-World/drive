@@ -2,6 +2,7 @@
 
 import argparse
 import fcntl
+import os
 from pathlib import Path
 import sys
 import traceback
@@ -18,11 +19,10 @@ def check_runtime(cfg):
     import shapely  # noqa: F401
     import torch  # noqa: F401
 
-    for name in ("GradScaler",):
-        if not hasattr(torch.amp, name):
-            raise RuntimeError(
-                f"Installed torch {torch.__version__} lacks torch.amp.{name}"
-            )
+    if not hasattr(torch.amp, "GradScaler"):
+        raise RuntimeError(
+            f"Installed torch {torch.__version__} lacks torch.amp.GradScaler"
+        )
     if not hasattr(torch, "OutOfMemoryError"):
         raise RuntimeError(
             f"Installed torch {torch.__version__} lacks torch.OutOfMemoryError"
@@ -113,23 +113,35 @@ def acquire_run_lock(cfg, stage):
         )
     stream.seek(0)
     stream.truncate()
-    stream.write(f'pid={__import__("os").getpid()}\n')
+    stream.write(f"pid={os.getpid()}\n")
     stream.flush()
     return stream
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', default=str(PROJECT/'configs/advercity.yaml'))
-    parser.add_argument('--stage', choices=STAGES, default='check')
-    parser.add_argument('--overwrite', action='store_true',
-                        help='restart training and replace checkpoints')
-    parser.add_argument('--smoke', action='store_true',
-                        help='use the smallest split-disjoint end-to-end profile')
-    parser.add_argument('--skip-prepare', action='store_true',
-                        help='never download or convert data; use an existing prepared dataset')
-    parser.add_argument('--require-data', action='store_true',
-                        help='check all configured prepared sessions before starting')
+    parser.add_argument("--config", default=str(PROJECT / "configs/coinfra.yaml"))
+    parser.add_argument("--stage", choices=STAGES, default="check")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="restart training and replace checkpoints",
+    )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="use the smallest split-disjoint end-to-end profile",
+    )
+    parser.add_argument(
+        "--skip-prepare",
+        action="store_true",
+        help="never download or convert data; use an existing prepared dataset",
+    )
+    parser.add_argument(
+        "--require-data",
+        action="store_true",
+        help="check all configured prepared sessions before starting",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -155,7 +167,11 @@ if __name__ == "__main__":
             f"Fatal configuration or data error: {error}", file=sys.stderr, flush=True
         )
         raise SystemExit(2)
-    except (TimeoutError, OSError, RuntimeError):
+    except RuntimeError as error:
+        traceback.print_exc()
+        print(f"Fatal runtime error: {error}", file=sys.stderr, flush=True)
+        raise SystemExit(2)
+    except (TimeoutError, OSError):
         traceback.print_exc()
         print(
             "Transient runtime failure; safe to retry without --overwrite.",

@@ -7,6 +7,17 @@ import yaml
 PROJECT = Path(__file__).resolve().parents[1]
 
 
+def validate_splits(splits):
+    seen = set()
+    for split in ("train", "val", "test"):
+        sessions = splits[split]
+        if not sessions or seen.intersection(sessions):
+            raise ValueError(
+                "Splits must be nonempty and recording sessions must not overlap"
+            )
+        seen.update(sessions)
+
+
 def resolve(path):
     p = Path(path).expanduser()
     return p.resolve() if p.is_absolute() else (PROJECT / p).resolve()
@@ -14,11 +25,12 @@ def resolve(path):
 
 def enable_smoke(cfg):
     """Apply a tiny, still split-disjoint, end-to-end experiment profile."""
-    smoke = cfg['dataset']['smoke']
-    smoke['enabled'] = True
-    cfg['dataset']['splits'] = smoke['splits']
-    cfg['training']['epochs'] = smoke['epochs']
-    cfg['training']['seeds'] = cfg['training']['seeds'][:smoke['seeds']]
+    smoke = cfg["dataset"]["smoke"]
+    smoke["enabled"] = True
+    cfg["dataset"]["splits"] = smoke["splits"]
+    validate_splits(cfg["dataset"]["splits"])
+    cfg["training"]["epochs"] = smoke["epochs"]
+    cfg["training"]["seeds"] = cfg["training"]["seeds"][: smoke["seeds"]]
     # Keep the profile tiny while still exercising the cooperative code path.
     cfg["training"]["node_counts"] = [1, 2]
     cfg["evaluation"]["node_counts"] = [1, 2]
@@ -91,12 +103,7 @@ def load_config(path):
         raise ValueError("Smoke-mode limits must be positive")
     if not d["classes"] or len(d["classes"]) != len(set(d["classes"])):
         raise ValueError("Classes must be nonempty and unique")
-    seen = set()
-    for split in ('train', 'val', 'test'):
-        sessions = d['splits'][split]
-        if not sessions or seen.intersection(sessions):
-            raise ValueError('Splits must be nonempty and recording sessions must not overlap')
-        seen.update(sessions)
+    validate_splits(d["splits"])
     if not e["strategies"] or not set(e["strategies"]) <= {
         "early",
         "intermediate",
@@ -135,24 +142,43 @@ def load_config(path):
         raise ValueError("training.require_cuda must be boolean")
     checkpointing = t.setdefault("checkpointing", {})
     if not isinstance(checkpointing, dict):
-        raise ValueError('training.checkpointing must be a mapping')
-    checkpointing.setdefault('keep_best', 3)
-    checkpointing.setdefault('weights', {'val_loss_quality': .34, 'val_map': .33,
-                                          'val_recall': .33})
-    if (not isinstance(checkpointing['keep_best'], int) or
-            isinstance(checkpointing['keep_best'], bool) or checkpointing['keep_best'] < 1):
-        raise ValueError('training.checkpointing.keep_best must be positive')
-    weights = checkpointing['weights']
-    expected = {'val_loss_quality','val_map','val_recall'}
-    if (not isinstance(weights, dict) or set(weights) != expected or
-            any(not isinstance(v, (int,float)) or not math.isfinite(v) or v < 0
-                for v in weights.values()) or sum(weights.values()) <= 0):
-        raise ValueError(f'Checkpoint weights must be nonnegative and contain {sorted(expected)}')
-    recovery = t.setdefault('recovery', {})
-    defaults = {'resume': True, 'save_every_epochs': 1, 'wait_for_resources': True,
-                'poll_seconds': 60, 'timeout_minutes': 0,
-                'minimum_free_disk_gb': 5, 'minimum_free_gpu_gb': 2,
-                'cuda_oom_retries': 3}
+        raise ValueError("training.checkpointing must be a mapping")
+    checkpointing.setdefault("keep_best", 3)
+    checkpointing.setdefault(
+        "weights", {"val_loss_quality": 0.34, "val_map": 0.33, "val_recall": 0.33}
+    )
+    if (
+        not isinstance(checkpointing["keep_best"], int)
+        or isinstance(checkpointing["keep_best"], bool)
+        or checkpointing["keep_best"] < 1
+    ):
+        raise ValueError("training.checkpointing.keep_best must be positive")
+    weights = checkpointing["weights"]
+    expected = {"val_loss_quality", "val_map", "val_recall"}
+    if (
+        not isinstance(weights, dict)
+        or set(weights) != expected
+        or any(
+            not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0
+            for v in weights.values()
+        )
+        or sum(weights.values()) <= 0
+    ):
+        raise ValueError(
+            f"Checkpoint weights must be nonnegative and contain {sorted(expected)}"
+        )
+    recovery = t.setdefault("recovery", {})
+    defaults = {
+        "resume": True,
+        "save_every_epochs": 1,
+        "wait_for_resources": True,
+        "poll_seconds": 60,
+        "timeout_minutes": 0,
+        "minimum_free_disk_gb": 5,
+        "minimum_free_gpu_gb": 2,
+        "cuda_oom_retries": 3,
+        "on_incompatible": "fail",
+    }
     for key, value in defaults.items():
         recovery.setdefault(key, value)
     if (
@@ -167,10 +193,25 @@ def load_config(path):
         or recovery["cuda_oom_retries"] < 0
     ):
         raise ValueError("Recovery space and retry values must be nonnegative")
+    if recovery["on_incompatible"] not in {"fail", "quarantine"}:
+        raise ValueError("training.recovery.on_incompatible must be fail or quarantine")
     if any(n < 1 for n in e["node_counts"] + t["node_counts"]):
         raise ValueError("Node counts must be positive")
+    if 1 not in e["node_counts"]:
+        raise ValueError(
+            "evaluation.node_counts must include 1 for cooperation baselines"
+        )
     if e["subsets_per_count"] < 1 or e["max_detections"] < 1:
         raise ValueError("Invalid evaluation limits")
+    e.setdefault("late_max_detections", e["max_detections"] * max(e["node_counts"]))
+    if (
+        not isinstance(e["late_max_detections"], int)
+        or isinstance(e["late_max_detections"], bool)
+        or e["late_max_detections"] < e["max_detections"]
+    ):
+        raise ValueError(
+            "evaluation.late_max_detections must be an integer no smaller than max_detections"
+        )
     e.setdefault("receiver_policy", "all")
     if e["receiver_policy"] not in {"all", "first"}:
         raise ValueError("evaluation.receiver_policy must be all or first")
@@ -204,6 +245,12 @@ def load_config(path):
             raise ValueError(f"adaptive_fusion.{key} contains duplicates")
     if adaptive["index_bytes"] not in (2, 4) or adaptive["value_bytes"] not in (2, 4):
         raise ValueError("adaptive fusion byte widths must be 2 or 4")
+    height = math.ceil((d["bounds"][4] - d["bounds"][1]) / d["resolution"])
+    width = math.ceil((d["bounds"][3] - d["bounds"][0]) / d["resolution"])
+    if adaptive["index_bytes"] == 2 and height * width > 2**16:
+        raise ValueError(
+            "adaptive_fusion.index_bytes=2 cannot address every configured BEV cell"
+        )
     if not isinstance(adaptive["ablations"], list) or not set(
         adaptive["ablations"]
     ) <= {"random", "energy"}:

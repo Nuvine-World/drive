@@ -9,7 +9,8 @@ from src.data.loader import BoundingBox3D
 
 def read_yaml(path):
     with open(path) as stream:
-        return yaml.safe_load(stream)
+        loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+        return yaml.load(stream, Loader=loader)
 
 
 def first(d, *keys):
@@ -104,7 +105,15 @@ def discover(cfg):
             if smoke.get('enabled'):
                 slice_dirs = slice_dirs[:smoke['slices_per_session']]
             for slice_dir in slice_dirs:
-                frames = sorted((slice_dir / 'PcImage').glob('*'), key=lambda p: float(p.name))
+                frames = []
+                for candidate in (slice_dir / "PcImage").iterdir():
+                    try:
+                        timestamp = float(candidate.name)
+                    except ValueError:
+                        continue
+                    if candidate.is_dir():
+                        frames.append((timestamp, candidate))
+                frames = [candidate for _, candidate in sorted(frames)]
                 frames = frames[::d['frame_stride']]
                 if d.get('max_frames_per_slice') is not None:
                     frames = frames[:d['max_frames_per_slice']]

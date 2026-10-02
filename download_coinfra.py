@@ -207,7 +207,7 @@ if __name__ == "__main__":
         print("\nInterrupted. Rerun the same command to resume.", file=sys.stderr)
         sys.exit(130)
     except Exception as exc:
-        message = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+        message = str(exc) or type(exc).__name__
         print(
             f"Error: {message}\nFor remote failures, check connectivity and dataset access; "
             "use `hf auth login` if authentication is required. Rerun to resume.",

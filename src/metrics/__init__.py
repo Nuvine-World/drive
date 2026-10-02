@@ -1,1 +1,1 @@
-"""CoInfra pipeline components."""
+"""Detection and localization metrics for ECCO."""

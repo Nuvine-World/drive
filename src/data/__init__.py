@@ -1,1 +1,1 @@
-"""CoInfra pipeline components."""
+"""Dataset readers and shared data interfaces for ECCO."""

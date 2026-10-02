@@ -12,7 +12,10 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
 fi
 
 printf '%s\n' 'Checking shell scripts...'
-bash -n run.sh preflight.sh run_coinfra_at_11pm.sh
+bash -n run.sh preflight.sh
+if [[ -f run_coinfra_at_11pm.sh ]]; then
+  bash -n run_coinfra_at_11pm.sh
+fi
 
 printf '%s\n' 'Running automated tests...'
 "$PYTHON_BIN" -m pytest -q

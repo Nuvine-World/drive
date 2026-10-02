@@ -10,8 +10,21 @@ def polygon(box):
     return Polygon(corners @ np.array([[c,s],[-s,c]]) + [box.x,box.y])
 
 
-def iou3d(a, b):
-    intersection = polygon(a).intersection(polygon(b)).area
+def iou3d(a, b, polygons=None):
+    # If the horizontal bounding circles do not intersect, neither can the boxes.
+    radius_a = math.hypot(a.length, a.width) / 2
+    radius_b = math.hypot(b.length, b.width) / 2
+    if math.hypot(a.x - b.x, a.y - b.y) > radius_a + radius_b:
+        return 0.0
+    if polygons is None:
+        polygon_a, polygon_b = polygon(a), polygon(b)
+    else:
+        if id(a) not in polygons:
+            polygons[id(a)] = polygon(a)
+        if id(b) not in polygons:
+            polygons[id(b)] = polygon(b)
+        polygon_a, polygon_b = polygons[id(a)], polygons[id(b)]
+    intersection = polygon_a.intersection(polygon_b).area
     z = max(0, min(a.z+a.height/2, b.z+b.height/2)-max(a.z-a.height/2, b.z-b.height/2))
     intersection *= z
     union = a.length*a.width*a.height + b.length*b.width*b.height - intersection
@@ -47,14 +60,24 @@ def evaluate(frames, classes, thresholds):
         count = sum(map(len, truths))
         predictions = sorted([(p.score, i, p) for i, (pred, _) in enumerate(frames)
                               for p in pred if p.label == label], key=lambda v: v[0], reverse=True)
+        polygons = {}
+        overlaps = {
+            (id(pred), j): iou3d(pred, gt, polygons)
+            for _, frame_index, pred in predictions
+            for j, gt in enumerate(truths[frame_index])
+        }
         for threshold in thresholds:
             matched = [set() for _ in frames]
             tp = []
             matched_ious, center_errors, yaw_errors, size_ious = [], [], [], []
             for _, i, pred in predictions:
-                candidates = [(iou3d(pred, gt), j) for j, gt in enumerate(truths[i]) if j not in matched[i]]
+                # Standard ranked detection matching: select the best GT first;
+                # a duplicate whose best GT is already claimed is a false positive.
+                candidates = [
+                    (overlaps[(id(pred), j)], j) for j in range(len(truths[i]))
+                ]
                 overlap, j = max(candidates, default=(0.0, -1))
-                success = j >= 0 and overlap >= threshold
+                success = j >= 0 and j not in matched[i] and overlap >= threshold
                 tp.append(int(success))
                 if success:
                     matched[i].add(j)

@@ -1,9 +1,8 @@
 # ECCO on Adver-City and CoInfra
 
 ECCO evaluates cooperative LiDAR perception with Adver-City or CoInfra-I2I.
-The default server configuration uses an ego vehicle, connected vehicles, and
-roadside units from selected Adver-City clear, rain, fog, and fog-plus-heavy-rain
-scenarios. CoInfra remains available for real multi-RSU adverse-weather tests.
+With no explicit configuration, `run.sh` executes CoInfra followed by Adver-City.
+Passing either dataset configuration runs only that dataset.
 
 The project compares early, intermediate, late, and budget-conditioned adaptive
 sparse fusion for 1, 2, 4, and 8 RSUs. It measures rotated 3D AP, precision,
@@ -37,6 +36,12 @@ machine before installing the remaining dependencies.
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m pytest -q
+```
+
+Optional local commit hook:
+
+```bash
+git config core.hooksPath githooks
 ```
 
 ## Adver-City server run

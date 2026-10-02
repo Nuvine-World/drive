@@ -1,4 +1,4 @@
-"""Reproducible CoInfra preprocessing, training, inference and network sweeps."""
+"""ECCO preprocessing, training, inference, evaluation, and reporting pipeline."""
 import csv
 import gc
 import hashlib
@@ -21,6 +21,8 @@ import torch
 from src.data.api import annotations, discover, load_cloud, rasterize
 from src.detection.bev import BEVDetector, targets, loss, decode
 from src.metrics.evaluation import evaluate, nms
+
+EVALUATION_VERSION = 2
 
 
 def write_json(path, value):
@@ -142,7 +144,7 @@ def validate_examples(model, examples, cfg, device, retries):
                         nms(
                             [box for group in local for box in group],
                             cfg["evaluation"]["nms_iou"],
-                            cfg["evaluation"]["max_detections"],
+                            cfg["evaluation"]["late_max_detections"],
                         ),
                         item[2],
                     )
@@ -171,7 +173,7 @@ def validate_examples(model, examples, cfg, device, retries):
     if retries > 0:
         wait_for_resources(cfg, device, "single-example validation CUDA OOM")
         return validate_examples(model, examples, cfg, device, retries - 1)
-    raise RuntimeError(
+    raise ValueError(
         "CUDA cannot fit one validation example after resource retries; reduce "
         "resolution, hidden_channels, or node_counts, or use training.device=cpu. "
         f"Original error: {oom_message}"
@@ -320,7 +322,6 @@ def signature(cfg):
         "nodes",
         "frame_stride",
         "max_frames_per_slice",
-        "max_timestamp_delta_s",
         "annotation_file",
         "yaw_unit",
         "classes",
@@ -328,18 +329,22 @@ def signature(cfg):
         "bounds",
         "resolution",
         "objects_per_cell",
-        "splits",
     )
     training_keys = (
         "hidden_channels",
         "learning_rate",
         "weight_decay",
+        "batch_size",
+        "mixed_precision",
         "modes",
         "node_counts",
     )
     return {
         "model_version": 2,
-        "dataset": {key: d.get(key) for key in dataset_keys},
+        "dataset": {
+            **{key: d.get(key) for key in dataset_keys},
+            "splits": {name: d["splits"][name] for name in ("train", "val")},
+        },
         "training": {key: t.get(key) for key in training_keys},
         # Evaluation budgets, selectors, and serialization widths do not change
         # learned weights. Keeping them out permits post-training sweeps without
@@ -391,12 +396,61 @@ def checkpoint_compatible(state, cfg):
     return isinstance(saved_cfg, dict) and signature(saved_cfg) == current
 
 
+def quarantine_seed_directory(seed_directory, reason):
+    """Preserve stale seed artifacts and leave the seed ready for retraining."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    quarantine_root = seed_directory.parent / "stale_checkpoints"
+    quarantine_root.mkdir(parents=True, exist_ok=True)
+    destination = quarantine_root / f"{seed_directory.name}_{timestamp}_{os.getpid()}"
+    suffix = 1
+    while destination.exists():
+        destination = quarantine_root / (
+            f"{seed_directory.name}_{timestamp}_{os.getpid()}_{suffix}"
+        )
+        suffix += 1
+    seed_directory.replace(destination)
+    print(
+        f"[{utc_now()}] QUARANTINED {seed_directory} -> {destination} ({reason}); "
+        "retraining this seed",
+        flush=True,
+    )
+    return destination
+
+
+def handle_incompatible_seed(cfg, seed_directory, reason):
+    action = cfg["training"]["recovery"]["on_incompatible"]
+    if action == "fail":
+        raise ValueError(
+            f"{seed_directory} {reason}; choose another output directory or set "
+            "training.recovery.on_incompatible=quarantine"
+        )
+    return quarantine_seed_directory(seed_directory, reason)
+
+
 def file_sha256(path):
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def evaluation_fingerprint(cfg, checkpoint):
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "evaluation_version": EVALUATION_VERSION,
+                "checkpoint_sha256": file_sha256(checkpoint),
+                "dataset": signature(cfg)["dataset"],
+                "evaluation": cfg["evaluation"],
+                "adaptive_fusion": cfg["adaptive_fusion"],
+                "latency_experiment": cfg["latency_experiment"],
+                "deployment_assumptions": cfg["deployment_assumptions"],
+                "mixed_precision": cfg["training"]["mixed_precision"],
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
 
 
 def device_for(cfg):
@@ -592,7 +646,26 @@ def prepare_training_example(plan, cfg):
 
 
 def submit_training_batch(executor, plans, cfg):
-    return [executor.submit(prepare_training_example, plan, cfg) for plan in plans]
+    def prepare_batch():
+        examples = [prepare_training_example(plan, cfg) for plan in plans]
+        return {
+            "bev": np.stack([example[0] for example in examples]),
+            "target": tuple(
+                np.stack([example[1][index] for example in examples])
+                for index in range(3)
+            ),
+        }
+
+    # Stack the large dense targets on a preprocessing worker instead of
+    # blocking the GPU-owning training thread.
+    return [executor.submit(prepare_batch)]
+
+
+def slice_training_batch(batch, start, stop):
+    return {
+        "bev": batch["bev"][start:stop],
+        "target": tuple(value[start:stop] for value in batch["target"]),
+    }
 
 
 def cuda_oom(error, device):
@@ -620,13 +693,18 @@ def train_examples(
     retries,
 ):
     """Train the largest batch that fits, recursively splitting on CUDA OOM."""
-    optimizer_step_started = False
+    if isinstance(examples, list):
+        examples = {
+            "bev": np.stack([example[0] for example in examples]),
+            "target": tuple(
+                np.stack([example[1][index] for example in examples])
+                for index in range(3)
+            ),
+        }
+    scaler_needs_update = False
     try:
-        bev = device_tensor(np.stack([example[0] for example in examples]), device)
-        target = tuple(
-            device_tensor(np.stack([example[1][index] for example in examples]), device)
-            for index in range(3)
-        )
+        bev = device_tensor(examples["bev"], device)
+        target = tuple(device_tensor(value, device) for value in examples["target"])
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(
             device_type=device.type,
@@ -638,24 +716,26 @@ def train_examples(
             raise ValueError("Nonfinite training loss")
         scaler.scale(value).backward()
         scaler.unscale_(optimizer)
+        scaler_needs_update = True
         torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
-        optimizer_step_started = True
         scaler.step(optimizer)
         scaler.update()
-        return [float(value.detach())] * len(examples)
+        scaler_needs_update = False
+        return [float(value.detach())] * len(examples["bev"])
     except (torch.OutOfMemoryError, RuntimeError) as error:
         if not cuda_oom(error, device):
             raise
         oom_message = str(error)
     optimizer.zero_grad(set_to_none=True)
-    if optimizer_step_started:
+    if scaler_needs_update:
         # GradScaler records a per-optimizer STEPPED state before invoking the
         # optimizer. Clear that state so an OOM inside optimizer.step does not
         # make the smaller retry fail with "step() has already been called".
         scaler.update()
     gc.collect()
     release_cuda_memory(device)
-    if len(examples) == 1:
+    example_count = len(examples["bev"])
+    if example_count == 1:
         if retries > 0:
             wait_for_resources(cfg, device, f"{context} single-example CUDA OOM")
             return train_examples(
@@ -670,41 +750,41 @@ def train_examples(
                 runtime_batches,
                 retries - 1,
             )
-        raise RuntimeError(
+        raise ValueError(
             f"CUDA {mode} OOM retries exhausted ({context}). Reduce batch_size, "
             "resolution, hidden_channels, or node_counts, or set training.device=cpu. "
             f"Original error: {oom_message}"
         )
-    midpoint = len(examples) // 2
+    midpoint = example_count // 2
     runtime_batches["training"] = min(runtime_batches["training"], midpoint)
     print(
         f"[{utc_now()}] CUDA OOM ({context}); reducing batch "
-        f"{len(examples)} -> {midpoint}+{len(examples)-midpoint}",
+        f"{example_count} -> {midpoint}+{example_count-midpoint}",
         flush=True,
     )
     return train_examples(
-            model,
-            optimizer,
-            scaler,
-            examples[:midpoint],
-            mode,
-            cfg,
-            device,
-            context,
-            runtime_batches,
-            retries,
-        ) + train_examples(
-            model,
-            optimizer,
-            scaler,
-            examples[midpoint:],
-            mode,
-            cfg,
-            device,
-            context,
-            runtime_batches,
-            retries,
-        )
+        model,
+        optimizer,
+        scaler,
+        slice_training_batch(examples, 0, midpoint),
+        mode,
+        cfg,
+        device,
+        context,
+        runtime_batches,
+        retries,
+    ) + train_examples(
+        model,
+        optimizer,
+        scaler,
+        slice_training_batch(examples, midpoint, example_count),
+        mode,
+        cfg,
+        device,
+        context,
+        runtime_batches,
+        retries,
+    )
 
 
 def prepare_validation_example(sample, cfg):
@@ -776,20 +856,33 @@ def train(cfg, overwrite=False):
         if path.exists() and completion.exists() and not overwrite:
             state = torch.load(path,map_location='cpu',weights_only=True)
             if not checkpoint_compatible(state, cfg):
-                raise ValueError(
-                    f"{path} belongs to a different config; use another output directory"
+                handle_incompatible_seed(
+                    cfg, path.parent, "contains a checkpoint from a different config"
                 )
-            completed_epochs = int(json.loads(completion.read_text()).get("epochs", 0))
-            if completed_epochs >= cfg["training"]["epochs"]:
-                print(f"Skipping existing checkpoint {path}; --overwrite retrains it")
-                continue
-            if not latest.exists():
-                raise ValueError(
-                    f"Cannot extend seed {seed}: missing recovery checkpoint {latest}"
+            else:
+                completed_epochs = int(
+                    json.loads(completion.read_text()).get("epochs", 0)
                 )
-            print(
-                f'Extending seed={seed} from {completed_epochs} to {cfg["training"]["epochs"]} epochs'
-            )
+                if completed_epochs >= cfg["training"]["epochs"]:
+                    print(
+                        f"Skipping existing checkpoint {path}; --overwrite retrains it"
+                    )
+                    continue
+                if not latest.exists():
+                    raise ValueError(
+                        f"Cannot extend seed {seed}: missing recovery checkpoint {latest}"
+                    )
+                print(
+                    f'Extending seed={seed} from {completed_epochs} to {cfg["training"]["epochs"]} epochs'
+                )
+        if latest.exists() and not overwrite:
+            recovery_state = torch.load(latest, map_location="cpu", weights_only=True)
+            if not checkpoint_compatible(recovery_state, cfg):
+                handle_incompatible_seed(
+                    cfg,
+                    path.parent,
+                    "contains a recovery checkpoint from a different config",
+                )
         if overwrite:
             for stale in list(path.parent.glob('epoch_*.pt')) + list(path.parent.glob('epoch_*.json')):
                 stale.unlink()
@@ -855,12 +948,13 @@ def train(cfg, overwrite=False):
                     executor, batches, submit_training_batch, cfg
                 ):
                     mode = plans[0][1]
+                    prepared_batch = examples[0]
                     train_losses.extend(
                         train_examples(
                             model,
                             optimizer,
                             scaler,
-                            examples,
+                            prepared_batch,
                             mode,
                             cfg,
                             device,
@@ -876,12 +970,20 @@ def train(cfg, overwrite=False):
             if not all(np.isfinite(v) for v in (val, val_map, val_recall)):
                 raise ValueError('Nonfinite validation metric')
             score = selection_score(cfg, val, val_map, val_recall)
-            row = {'timestamp_utc':utc_now(), 'seed':seed, 'epoch':epoch+1,
-                   'train_loss':float(np.mean(train_losses)), 'val_loss':val,
-                   'val_map':val_map, 'val_recall':val_recall,
-                   'val_loss_quality':1.0/(1.0+val), 'selection_score':score,
-                   'learning_rate':optimizer.param_groups[0]['lr'],
-                   'elapsed_seconds':time.perf_counter()-started} | validation_details
+            row = {
+                "timestamp_utc": utc_now(),
+                "seed": seed,
+                "epoch": epoch + 1,
+                "train_loss": float(np.mean(train_losses)),
+                "val_loss": val,
+                "val_map": val_map,
+                "val_recall": val_recall,
+                "val_loss_quality": 1.0 / (1.0 + val),
+                "selection_score": score,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+                "effective_batch_size": runtime_batches["training"],
+                "elapsed_seconds": time.perf_counter() - started,
+            } | validation_details
             history.append(row)
             path.parent.mkdir(parents=True, exist_ok=True)
             candidate = path.parent/f'epoch_{epoch+1:04d}.pt'
@@ -970,14 +1072,17 @@ def feature_payload(array, cfg):
 def adaptive_payload(feature_nodes, selected, cfg):
     """Serialize selected collaborator cells as int32 indices and fp16 values."""
     total = 0
-    feature_nodes = feature_nodes.detach().float().cpu().numpy()
-    selected = selected.detach().cpu().numpy()
     index_dtype = "<u2" if cfg["adaptive_fusion"]["index_bytes"] == 2 else "<u4"
     value_dtype = "<f2" if cfg["adaptive_fusion"]["value_bytes"] == 2 else "<f4"
     for node, mask in zip(feature_nodes[1:], selected):
-        indices = np.flatnonzero(mask).astype(index_dtype, copy=False)
-        values = node.reshape(node.shape[0], -1)[:, indices].T.astype(
-            value_dtype, copy=False
+        device_indices = mask.flatten().nonzero(as_tuple=False).flatten()
+        indices = device_indices.detach().cpu().numpy().astype(index_dtype, copy=False)
+        values = (
+            node.flatten(1)[:, device_indices]
+            .T.detach()
+            .cpu()
+            .numpy()
+            .astype(value_dtype, copy=False)
         )
         total += len(zlib.compress(indices.tobytes() + values.tobytes(), level=1))
     return total
@@ -986,6 +1091,11 @@ def adaptive_payload(feature_nodes, selected, cfg):
 def adaptive_selector(strategy):
     base = strategy.split("@", 1)[0]
     return base.split("_", 1)[1] if "_" in base else "learned"
+
+
+def stable_random_seed(*parts):
+    digest = hashlib.sha256("\0".join(map(str, parts)).encode()).digest()
+    return int.from_bytes(digest[:8], "little") % (2**63 - 1)
 
 
 def infer(model, clouds, cfg, device, strategy):
@@ -1011,7 +1121,7 @@ def infer(model, clouds, cfg, device, strategy):
             boxes = nms(
                 [b for group in local for b in group],
                 cfg["evaluation"]["nms_iou"],
-                cfg["evaluation"]["max_detections"],
+                cfg["evaluation"]["late_max_detections"],
             )
         else:
             boxes = decode(model.heads(features),cfg)
@@ -1043,7 +1153,16 @@ def infer(model, clouds, cfg, device, strategy):
 
 
 def infer_batch(
-    model, cloud_batches, cfg, device, strategy, raw_payloads=None, retries=None
+    model,
+    cloud_batches,
+    cfg,
+    device,
+    strategy,
+    raw_payloads=None,
+    retries=None,
+    random_seeds=None,
+    prepared_bevs=None,
+    preprocessing_overheads_ms=None,
 ):
     """Batched inference with transparent CUDA OOM batch reduction."""
     if retries is None:
@@ -1051,7 +1170,11 @@ def infer_batch(
     base_strategy, _, budget_text = strategy.partition("@")
     try:
         preprocessing_start = time.perf_counter()
-        arrays = [array_inputs(clouds, cfg, strategy) for clouds in cloud_batches]
+        arrays = (
+            prepared_bevs
+            if prepared_bevs is not None
+            else [array_inputs(clouds, cfg, strategy) for clouds in cloud_batches]
+        )
         if base_strategy == "early":
             arrays = [value[0] for value in arrays]
         bev = device_tensor(np.stack(arrays), device)
@@ -1059,6 +1182,8 @@ def infer_batch(
         preprocessing_ms = (
             (time.perf_counter() - preprocessing_start) * 1000 / len(cloud_batches)
         )
+        if preprocessing_overheads_ms is not None:
+            preprocessing_ms += float(np.mean(preprocessing_overheads_ms))
         start = time.perf_counter()
         serialization_ms = 0.0
         with torch.no_grad(), torch.autocast(
@@ -1075,7 +1200,9 @@ def infer_batch(
                 representations = (
                     raw_payloads
                     if raw_payloads is not None
-                    else [sum(payload(p) for p in clouds) for clouds in cloud_batches]
+                    else [
+                        sum(payload(p) for p in clouds[1:]) for clouds in cloud_batches
+                    ]
                 )
             else:
                 batch, nodes, channels, height, width = bev.shape
@@ -1104,8 +1231,16 @@ def infer_batch(
                     budget = float(
                         budget_text or cfg["adaptive_fusion"]["evaluation_budgets"][0]
                     )
+                    selector = adaptive_selector(strategy)
+                    generators = None
+                    if selector == "random" and random_seeds is not None:
+                        generators = []
+                        for random_seed in random_seeds:
+                            generator = torch.Generator(device=device)
+                            generator.manual_seed(random_seed)
+                            generators.append(generator)
                     fused, selected = model.adaptive_features(
-                        features, budget, adaptive_selector(strategy)
+                        features, budget, selector, generators=generators
                     )
                     outputs = model.heads(fused)
                     predictions = [
@@ -1136,7 +1271,7 @@ def infer_batch(
                             nms(
                                 [box for group in local for box in group],
                                 cfg["evaluation"]["nms_iou"],
-                                cfg["evaluation"]["max_detections"],
+                                cfg["evaluation"]["late_max_detections"],
                             )
                         )
                         serialization_start = time.perf_counter()
@@ -1195,8 +1330,11 @@ def infer_batch(
                 strategy,
                 raw_payloads,
                 retries - 1,
+                random_seeds,
+                prepared_bevs,
+                preprocessing_overheads_ms,
             )
-        raise RuntimeError(
+        raise ValueError(
             f"CUDA cannot fit one {strategy} evaluation frame after resource "
             "retries; reduce resolution, hidden_channels, or node_counts, or "
             f"use training.device=cpu. Original error: {oom_message}"
@@ -1209,23 +1347,43 @@ def infer_batch(
     )
     left_payloads = raw_payloads[:midpoint] if raw_payloads is not None else None
     right_payloads = raw_payloads[midpoint:] if raw_payloads is not None else None
+    left_seeds = random_seeds[:midpoint] if random_seeds is not None else None
+    right_seeds = random_seeds[midpoint:] if random_seeds is not None else None
+    left_bevs = prepared_bevs[:midpoint] if prepared_bevs is not None else None
+    right_bevs = prepared_bevs[midpoint:] if prepared_bevs is not None else None
+    left_overheads = (
+        preprocessing_overheads_ms[:midpoint]
+        if preprocessing_overheads_ms is not None
+        else None
+    )
+    right_overheads = (
+        preprocessing_overheads_ms[midpoint:]
+        if preprocessing_overheads_ms is not None
+        else None
+    )
     return infer_batch(
-            model,
-            cloud_batches[:midpoint],
-            cfg,
-            device,
-            strategy,
-            left_payloads,
-            retries,
-        ) + infer_batch(
-            model,
-            cloud_batches[midpoint:],
-            cfg,
-            device,
-            strategy,
-            right_payloads,
-            retries,
-        )
+        model,
+        cloud_batches[:midpoint],
+        cfg,
+        device,
+        strategy,
+        left_payloads,
+        retries,
+        left_seeds,
+        left_bevs,
+        left_overheads,
+    ) + infer_batch(
+        model,
+        cloud_batches[midpoint:],
+        cfg,
+        device,
+        strategy,
+        right_payloads,
+        retries,
+        right_seeds,
+        right_bevs,
+        right_overheads,
+    )
 
 
 def network_rows(cfg, base, raw_bytes, representation_bytes):
@@ -1258,12 +1416,29 @@ def network_rows(cfg, base, raw_bytes, representation_bytes):
     return rows
 
 
-def simulate_fifo_latency(service_ms, arrival_interval_ms, fixed_ms, deadline_ms):
+def finite_burst_arrivals(frame_count, frame_period_ms, burst_multiplier):
+    """Finite bursts with recovery gaps and the original long-run frame rate."""
+    if burst_multiplier == 1:
+        return [index * frame_period_ms for index in range(frame_count)]
+    return [
+        (index // burst_multiplier) * burst_multiplier * frame_period_ms
+        + (index % burst_multiplier) * frame_period_ms / burst_multiplier
+        for index in range(frame_count)
+    ]
+
+
+def simulate_fifo_latency(
+    service_ms, arrival_interval_ms, fixed_ms, deadline_ms, arrival_times_ms=None
+):
     """Return D/D/1-style FIFO latency samples for a measured service trace."""
     available = 0.0
     latencies, waits = [], []
-    for index, service in enumerate(service_ms):
-        arrival = index * arrival_interval_ms
+    arrivals = (
+        arrival_times_ms
+        if arrival_times_ms is not None
+        else [index * arrival_interval_ms for index in range(len(service_ms))]
+    )
+    for arrival, service in zip(arrivals, service_ms):
         start = max(arrival, available)
         wait = start - arrival
         available = start + service
@@ -1292,9 +1467,6 @@ def write_latency_analysis(cfg, traces, output):
     summaries = []
     net, experiment = cfg["deployment_assumptions"], cfg["latency_experiment"]
     for key, rows in sorted(grouped.items()):
-        base_strategy = key[-1].split("@", 1)[0]
-        if base_strategy.startswith("adaptive"):
-            base_strategy = "adaptive"
         for placement in ("edge", "cloud"):
             for bandwidth in net["bandwidths_mbps"]:
                 service = []
@@ -1310,22 +1482,23 @@ def write_latency_analysis(cfg, traces, output):
                         if placement == "edge"
                         else float(row["raw_serialization_ms"])
                     )
-                    # The shared FIFO models the receiver service only. Dataset
-                    # loading/label parsing, sender preprocessing, and every
-                    # collaborator encoder are not serialized on that queue.
+                    # Replay measured receiver compute rather than a configured
+                    # constant. Loading and sender preprocessing remain outside
+                    # the shared receiver queue.
                     service.append(
-                        float(net["processing_ms"][placement][base_strategy])
-                        + serialization
-                        + tx
+                        float(row["inference_decode_ms"]) + serialization + tx
                     )
                 for burst in experiment["burst_multipliers"]:
-                    interval = experiment["frame_period_ms"] / burst
+                    arrivals = finite_burst_arrivals(
+                        len(service), experiment["frame_period_ms"], burst
+                    )
                     for deadline in experiment["deadlines_ms"]:
                         result = simulate_fifo_latency(
                             service,
-                            interval,
+                            experiment["frame_period_ms"],
                             net["sensing_ms"] + net[placement + "_rtt_ms"],
                             deadline,
+                            arrival_times_ms=arrivals,
                         )
                         summaries.append(
                             dict(zip(keys, key))
@@ -1333,7 +1506,12 @@ def write_latency_analysis(cfg, traces, output):
                                 "placement": placement,
                                 "bandwidth_mbps": bandwidth,
                                 "burst_multiplier": burst,
-                                "arrival_interval_ms": interval,
+                                "arrival_interval_ms": experiment["frame_period_ms"],
+                                "within_burst_interval_ms": (
+                                    experiment["frame_period_ms"] / burst
+                                ),
+                                "utilization": float(np.mean(service))
+                                / experiment["frame_period_ms"],
                                 "deadline_ms": deadline,
                                 **result,
                             }
@@ -1358,17 +1536,7 @@ def run_evaluation(cfg):
         state = torch.load(checkpoint,map_location=device,weights_only=True)
         if not checkpoint_compatible(state, cfg):
             raise ValueError("Checkpoint data/model configuration mismatch")
-        evaluation_signature = hashlib.sha256(
-            json.dumps(
-                {
-                    "checkpoint_sha256": file_sha256(checkpoint),
-                    "dataset": signature(cfg)["dataset"],
-                    "evaluation": cfg["evaluation"],
-                    "latency_experiment": cfg["latency_experiment"],
-                },
-                sort_keys=True,
-            ).encode()
-        ).hexdigest()
+        evaluation_signature = evaluation_fingerprint(cfg, checkpoint)
         model = make_model(cfg, device)
         model.load_state_dict(state["model"])
         model.eval()
@@ -1392,9 +1560,6 @@ def run_evaluation(cfg):
                             f"Resumed evaluation seed={seed} session={session}",
                             flush=True,
                         )
-                        write_csv(output / "accuracy.csv", all_metrics)
-                        write_csv(output / "latency_communication.csv", all_costs)
-                        write_latency_analysis(cfg, all_traces, output)
                         continue
             metrics_start, costs_start, traces_start = (
                 len(all_metrics),
@@ -1409,32 +1574,60 @@ def run_evaluation(cfg):
             for start in range(0, len(frames), batch_size):
                 frame_chunk = frames[start : start + batch_size]
                 load_start = time.perf_counter()
+                prepared = []
+                for sample in frame_chunk:
+                    cloud_by_node = {
+                        n: load_cloud(sample["nodes"][n], cfg["dataset"]["bounds"])
+                        for n in common
+                    }
+                    prepared.append(
+                        (
+                            annotations(sample["gt"], cfg["dataset"]),
+                            cloud_by_node,
+                            None,
+                            None,
+                            None,
+                        )
+                    )
+                load_ms = (time.perf_counter() - load_start) * 1000 / len(frame_chunk)
+                raw_serialization_start = time.perf_counter()
                 prepared = [
                     (
-                        annotations(sample["gt"], cfg["dataset"]),
-                        {
-                            n: load_cloud(sample["nodes"][n], cfg["dataset"]["bounds"])
-                            for n in common
-                        },
+                        gt,
+                        cloud_by_node,
+                        {node: payload(cloud) for node, cloud in cloud_by_node.items()},
+                        None,
+                        None,
                     )
-                    for sample in frame_chunk
+                    for gt, cloud_by_node, _, _, _ in prepared
                 ]
-                load_ms = (time.perf_counter() - load_start) * 1000 / len(frame_chunk)
+                raw_serialization_ms = (
+                    (time.perf_counter() - raw_serialization_start)
+                    * 1000
+                    / len(frame_chunk)
+                )
+                cached = []
+                for gt, cloud_by_node, raw_by_node, _, _ in prepared:
+                    bev_by_node, bev_ms_by_node = {}, {}
+                    for node, cloud in cloud_by_node.items():
+                        raster_start = time.perf_counter()
+                        bev_by_node[node] = rasterize(cloud, cfg["dataset"])
+                        bev_ms_by_node[node] = (
+                            time.perf_counter() - raster_start
+                        ) * 1000
+                    cached.append(
+                        (gt, cloud_by_node, raw_by_node, bev_by_node, bev_ms_by_node)
+                    )
+                prepared = cached
                 for nodes in groups:
                     cloud_batches = [
                         [cloud_by_node[n] for n in nodes]
-                        for _, cloud_by_node in prepared
+                        for _, cloud_by_node, _, _, _ in prepared
                     ]
-                    raw_serialization_start = time.perf_counter()
                     raw_batch = [
-                        sum(payload(point_cloud) for point_cloud in clouds[1:])
-                        for clouds in cloud_batches
+                        sum(raw_by_node[node] for node in nodes[1:])
+                        for _, _, raw_by_node, _, _ in prepared
                     ]
-                    raw_serialization_ms = (
-                        (time.perf_counter() - raw_serialization_start)
-                        * 1000
-                        / len(cloud_batches)
-                    )
                     strategies = []
                     for configured in cfg["evaluation"]["strategies"]:
                         if configured == "adaptive":
@@ -1461,7 +1654,23 @@ def run_evaluation(cfg):
                         ) != tuple(sorted(nodes)):
                             continue
                         key = (nodes, strategy)
-                        if strategy not in warmed:
+                        random_seeds = [
+                            stable_random_seed(seed, sample["id"], *nodes, strategy)
+                            for sample in frame_chunk
+                        ]
+                        prepared_bevs = None
+                        preprocessing_overheads = None
+                        if not strategy.startswith("early"):
+                            prepared_bevs = [
+                                np.stack([bev_by_node[node] for node in nodes])
+                                for _, _, _, bev_by_node, _ in prepared
+                            ]
+                            preprocessing_overheads = [
+                                sum(bev_ms_by_node[node] for node in nodes)
+                                for _, _, _, _, bev_ms_by_node in prepared
+                            ]
+                        warmup_key = (strategy, len(nodes), len(cloud_batches))
+                        if warmup_key not in warmed:
                             infer_batch(
                                 model,
                                 cloud_batches[:1],
@@ -1469,12 +1678,31 @@ def run_evaluation(cfg):
                                 device,
                                 strategy,
                                 raw_batch[:1],
+                                random_seeds=random_seeds[:1],
+                                prepared_bevs=(
+                                    prepared_bevs[:1]
+                                    if prepared_bevs is not None
+                                    else None
+                                ),
+                                preprocessing_overheads_ms=(
+                                    preprocessing_overheads[:1]
+                                    if preprocessing_overheads is not None
+                                    else None
+                                ),
                             )
-                            warmed.add(strategy)
+                            warmed.add(warmup_key)
                         results = infer_batch(
-                            model, cloud_batches, cfg, device, strategy, raw_batch
+                            model,
+                            cloud_batches,
+                            cfg,
+                            device,
+                            strategy,
+                            raw_batch,
+                            random_seeds=random_seeds,
+                            prepared_bevs=prepared_bevs,
+                            preprocessing_overheads_ms=preprocessing_overheads,
                         )
-                        for sample, (gt, _), raw_bytes, result in zip(
+                        for sample, (gt, _, _, _, _), raw_bytes, result in zip(
                             frame_chunk, prepared, raw_batch, results
                         ):
                             (
@@ -1564,9 +1792,9 @@ def run_evaluation(cfg):
                     "traces": all_traces[traces_start:],
                 },
             )
-            write_csv(output / "accuracy.csv", all_metrics)
-            write_csv(output / "latency_communication.csv", all_costs)
-            write_latency_analysis(cfg, all_traces, output)
+    write_csv(output / "accuracy.csv", all_metrics)
+    write_csv(output / "latency_communication.csv", all_costs)
+    write_latency_analysis(cfg, all_traces, output)
     return all_metrics
 
 
@@ -1634,34 +1862,50 @@ def report(cfg):
             'mean_size_iou':weighted('mean_size_iou'),'class_observations':len(rows)})
     write_csv(output/'metrics_overview.csv',overview)
 
-    paired = defaultdict(lambda: defaultdict(list))
+    comparison_dimensions = ("seed", "session", "weather", "strategy", "class", "iou")
+    single_nodes = defaultdict(dict)
+    multi_subsets = defaultdict(list)
     for row in accuracy:
         ap, recall = number(row, 'ap_3d'), number(row, 'recall')
-        if ap is not None:
-            key = tuple(row[k] for k in ('seed','session','weather','strategy','class','iou'))
-            paired[key][int(row['node_count'])].append((ap, recall))
-    gains = []
-    for key, counts in sorted(paired.items()):
-        if 1 not in counts:
+        if ap is None:
             continue
-        baseline_ap = [v[0] for v in counts[1]]
-        baseline_recall = [v[1] for v in counts[1]]
-        for count, values in sorted(counts.items()):
-            if count==1:
-                continue
-            aps, recalls = zip(*values)
-            mean_ap, mean_recall = float(np.mean(aps)), float(np.mean(recalls))
-            gains.append(dict(zip(('seed','session','weather','strategy','class','iou'),key)) |
-                         {'node_count':count,'multi_node_ap_mean':mean_ap,
-                          'single_node_ap_mean':float(np.mean(baseline_ap)),
-                          'single_node_ap_best':max(baseline_ap),
-                          'ap_gain_over_mean_single':mean_ap-float(np.mean(baseline_ap)),
-                          'ap_gain_over_best_single':mean_ap-max(baseline_ap),
-                          'multi_node_recall_mean':mean_recall,
-                          'single_node_recall_mean':float(np.mean(baseline_recall)),
-                          'single_node_recall_best':max(baseline_recall),
-                          'recall_gain_over_mean_single':mean_recall-float(np.mean(baseline_recall)),
-                          'recall_gain_over_best_single':mean_recall-max(baseline_recall)})
+        key = tuple(row[k] for k in comparison_dimensions)
+        nodes = tuple(sorted(filter(None, row["nodes"].split(","))))
+        if int(row["node_count"]) == 1:
+            single_nodes[key][nodes[0]] = (ap, recall)
+        else:
+            # Receiver rotations share one unordered participant set. Average
+            # those rotations before comparing with the same participating nodes.
+            multi_subsets[(key, nodes)].append((ap, recall))
+    gains = []
+    for (key, nodes), values in sorted(multi_subsets.items()):
+        baselines = single_nodes.get(key, {})
+        if any(node not in baselines for node in nodes):
+            continue
+        baseline_ap = [baselines[node][0] for node in nodes]
+        baseline_recall = [baselines[node][1] for node in nodes]
+        aps, recalls = zip(*values)
+        mean_ap, mean_recall = float(np.mean(aps)), float(np.mean(recalls))
+        baseline_ap_mean = float(np.mean(baseline_ap))
+        baseline_recall_mean = float(np.mean(baseline_recall))
+        gains.append(
+            dict(zip(comparison_dimensions, key))
+            | {
+                "nodes": ",".join(nodes),
+                "node_count": len(nodes),
+                "receiver_rotations": len(values),
+                "multi_node_ap_mean": mean_ap,
+                "single_node_ap_mean": baseline_ap_mean,
+                "single_node_ap_best": max(baseline_ap),
+                "ap_gain_over_mean_single": mean_ap - baseline_ap_mean,
+                "ap_gain_over_best_single": mean_ap - max(baseline_ap),
+                "multi_node_recall_mean": mean_recall,
+                "single_node_recall_mean": baseline_recall_mean,
+                "single_node_recall_best": max(baseline_recall),
+                "recall_gain_over_mean_single": mean_recall - baseline_recall_mean,
+                "recall_gain_over_best_single": mean_recall - max(baseline_recall),
+            }
+        )
     write_csv(output/'cooperation_gains.csv',gains)
 
     weather_groups = defaultdict(list)
@@ -1679,6 +1923,13 @@ def report(cfg):
             'recall_positive_rate':float(np.mean(np.asarray(recall)>0)),
             'paired_observations':len(values)})
     write_csv(output/'weather_cooperation_summary.csv',weather_summary)
+
+    paired = defaultdict(lambda: defaultdict(list))
+    for row in accuracy:
+        ap, recall = number(row, "ap_3d"), number(row, "recall")
+        if ap is not None:
+            key = tuple(row[k] for k in comparison_dimensions)
+            paired[key][int(row["node_count"])].append((ap, recall))
 
     scaling = []
     for key, counts in sorted(paired.items()):
@@ -1795,19 +2046,39 @@ def report(cfg):
         if matplotlib is not None:
             matplotlib.use('Agg')
             import matplotlib.pyplot as plt
+
+            primary_iou = min(float(row["iou"]) for row in summary)
+            adaptive_primary = (
+                f'adaptive@{max(cfg["adaptive_fusion"]["evaluation_budgets"]):g}'
+            )
+            plotted_strategies = {"early", "intermediate", "late", adaptive_primary}
             grouped = defaultdict(list)
             for row in summary:
-                grouped[(row['strategy'], row['class'])].append(
-                    (int(row['node_count']), float(row['mean_ap'])))
+                if (
+                    float(row["iou"]) == primary_iou
+                    and row["strategy"] in plotted_strategies
+                ):
+                    label = (
+                        "adaptive"
+                        if row["strategy"] == adaptive_primary
+                        else row["strategy"]
+                    )
+                    grouped[label].append(
+                        (int(row["node_count"]), float(row["mean_ap"]))
+                    )
             figure, axis = plt.subplots(figsize=(10, 6))
-            for (strategy, label), values in sorted(grouped.items()):
+            for strategy, values in sorted(grouped.items()):
                 by_count = defaultdict(list)
                 for count, value in values:
                     by_count[count].append(value)
                 x = sorted(by_count)
                 y = [float(np.mean(by_count[count])) for count in x]
-                axis.plot(x, y, marker='o', label=f'{strategy}/{label}')
-            axis.set(xlabel='node count', ylabel='mean AP', title='Test AP by node count and fusion')
+                axis.plot(x, y, marker="o", label=strategy)
+            axis.set(
+                xlabel="node count",
+                ylabel="macro mean AP",
+                title=f"Test AP by node count and fusion (IoU={primary_iou:g})",
+            )
             axis.set_ylim(0, 1)
             axis.legend(fontsize=8, ncol=2)
             axis.grid(alpha=.25)
@@ -1834,17 +2105,31 @@ def report(cfg):
             figure, axis = plt.subplots(figsize=(9, 5))
             latency_groups = defaultdict(list)
             for row in costs:
-                latency_groups[(row['placement'], float(row['bandwidth_mbps']))].append(
-                    float(row['end_to_end_ms_model']))
-            for placement in ('edge','cloud'):
-                points = sorted((bandwidth, float(np.mean(values)))
-                                for (name, bandwidth), values in latency_groups.items()
-                                if name == placement)
+                strategy = row["strategy"].split("@", 1)[0].split("_", 1)[0]
+                latency_groups[
+                    (row["placement"], strategy, float(row["bandwidth_mbps"]))
+                ].append(float(row["end_to_end_ms_model"]))
+            for placement, strategy in sorted(
+                {(key[0], key[1]) for key in latency_groups}
+            ):
+                points = sorted(
+                    (bandwidth, float(np.mean(values)))
+                    for (name, method, bandwidth), values in latency_groups.items()
+                    if name == placement and method == strategy
+                )
                 if points:
-                    axis.plot([p[0] for p in points], [p[1] for p in points],
-                              marker='o', label=placement)
-            axis.set(xlabel='assumed bandwidth (Mbps)', ylabel='mean assumed end-to-end latency (ms)',
-                     title='Analytical latency by placement and bandwidth', xscale='log')
+                    axis.plot(
+                        [p[0] for p in points],
+                        [p[1] for p in points],
+                        marker="o",
+                        label=f"{placement}/{strategy}",
+                    )
+            axis.set(
+                xlabel="assumed bandwidth (Mbps)",
+                ylabel="mean assumed end-to-end latency (ms)",
+                title="Analytical latency by placement and bandwidth",
+                xscale="log",
+            )
             axis.legend()
             axis.grid(alpha=.25)
             figure.tight_layout()
@@ -1886,10 +2171,14 @@ def report(cfg):
         "Matched-object diagnostics include 3D IoU, center error, yaw error, and dimension IoU.",
         "All aggregates are descriptive means, not confidence intervals or causal weather estimates.",
         "Single-node rows cover every common real node. The fixed global ROI/GT is unchanged across counts.",
-        "Measured inference+decode includes serial node execution and NMS; excludes loading/rasterization/serialization.",
+        "Measured inference+decode uses batched node encoding and includes decode/NMS; excludes loading/rasterization/serialization.",
         "End-to-end latency is an analytical estimate using configured literature-derived assumptions.",
         "Dense payloads use float32 and zlib level 1; adaptive sparse messages use configured index/value widths and zlib level 1.",
-        "Adaptive fusion keeps the first deterministic subset node as a dense local reference and budgets collaborator cells only.",
+        (
+            "Adaptive fusion rotates every participating node as the dense local reference and budgets collaborator cells only."
+            if cfg["evaluation"].get("receiver_policy") == "all"
+            else "Adaptive fusion uses the first sorted participating node as the dense local reference and budgets collaborator cells only."
+        ),
         "Cloud sends raw cropped points; edge sends raw points/features/local predictions according to strategy.",
         f'Assumption source: {cfg["deployment_assumptions"]["source"]}.',
         weather_limit,
@@ -1986,6 +2275,9 @@ def verify_results(cfg):
               'accuracy_rows':len(metric_rows),'checks':checks,'errors':errors}
     write_json(output/'verification.json',result)
     if errors:
-        raise RuntimeError('Result verification failed; see verification.json: ' + '; '.join(errors[:5]))
+        raise ValueError(
+            "Result verification failed; see verification.json: "
+            + "; ".join(errors[:5])
+        )
     print(f'Result verification passed: {output / "verification.json"}', flush=True)
     return result

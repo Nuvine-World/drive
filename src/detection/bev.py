@@ -39,7 +39,7 @@ class BEVDetector(nn.Module):
     def heads(self, features):
         return self.heatmap(features), self.regression(features)
 
-    def adaptive_features(self, features, budget, selector="learned"):
+    def adaptive_features(self, features, budget, selector="learned", generators=None):
         """Fuse a dense reference with top-utility collaborator cells.
 
         The first node is the reference observation. Each additional node may
@@ -70,12 +70,24 @@ class BEVDetector(nn.Module):
                 .reshape(batch, nodes - 1, height * width)
             )
         elif selector == "random":
-            # Evaluation seeds PyTorch once per run. Drawing a full tensor keeps
-            # this reproducible while giving each frame and collaborator an
-            # independent spatial sample.
-            scores = torch.rand(
-                batch, nodes - 1, height * width, device=features.device
-            )
+            if generators is None:
+                scores = torch.rand(
+                    batch, nodes - 1, height * width, device=features.device
+                )
+            else:
+                if len(generators) != batch:
+                    raise ValueError("one random generator is required per batch item")
+                scores = torch.stack(
+                    [
+                        torch.rand(
+                            nodes - 1,
+                            height * width,
+                            device=features.device,
+                            generator=generator,
+                        )
+                        for generator in generators
+                    ]
+                )
         else:
             raise ValueError(f"unknown adaptive selector: {selector}")
         count = max(1, min(height * width, math.ceil(budget * height * width)))
@@ -204,17 +216,25 @@ def decode(outputs, cfg):
         flat_heatmaps == maxima, flat_heatmaps, torch.zeros_like(flat_heatmaps)
     ).flatten()
     values, indices = scores.topk(min(settings["max_detections"], scores.numel()))
-    reg = regression[0].float().reshape(classes, slots, 8, h, w).detach().cpu().numpy()
+    reg = regression[0].float().reshape(classes * slots, 8, h * w)
+    selected_channels = torch.div(indices, h * w, rounding_mode="floor")
+    selected_cells = indices.remainder(h * w)
+    selected_regression = (
+        reg[selected_channels, :, selected_cells].detach().cpu().numpy()
+    )
     boxes = []
-    for score, index in zip(values.detach().cpu().tolist(),indices.detach().cpu().tolist()):
+    for score, index, v in zip(
+        values.detach().cpu().tolist(),
+        indices.detach().cpu().tolist(),
+        selected_regression,
+    ):
         if score < settings['score_threshold']:
             continue
         channel, cell = divmod(index, h * w)
         c, slot = divmod(channel, slots)
         iy, ix = divmod(cell, w)
-        v = reg[c, slot, :, iy, ix]
         if not np.isfinite(v).all():
-            raise ValueError('Nonfinite model output')
+            continue
         x = d['bounds'][0]+(ix+float(v[0]))*d['resolution']
         y = d['bounds'][1]+(iy+float(v[1]))*d['resolution']
         if not in_bounds(x,y,float(v[2]),d['bounds']):
