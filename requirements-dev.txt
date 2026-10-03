@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8,<10
+black>=25,<26
+darker>=3,<4

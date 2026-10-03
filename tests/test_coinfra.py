@@ -133,6 +133,14 @@ def fixture_config(tmp_path):
     cfg["training"].update(
         seeds=[1],
         epochs=1,
+        minimum_epochs=1,
+        early_stopping_patience=0,
+        scheduler={
+            "enabled": False,
+            "factor": 0.5,
+            "patience": 5,
+            "minimum_learning_rate": 1e-5,
+        },
         device="cpu",
         require_cuda=False,
         hidden_channels=4,

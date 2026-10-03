@@ -858,16 +858,17 @@ def train(cfg, overwrite=False):
         latest = path.parent/'latest.pt'
         completion = path.parent/'complete.json'
         if path.exists() and completion.exists() and not overwrite:
+            completion_state = json.loads(completion.read_text())
             state = torch.load(path,map_location='cpu',weights_only=True)
             if not checkpoint_compatible(state, cfg):
                 handle_incompatible_seed(
                     cfg, path.parent, "contains a checkpoint from a different config"
                 )
             else:
-                completed_epochs = int(
-                    json.loads(completion.read_text()).get("epochs", 0)
-                )
-                if completed_epochs >= cfg["training"]["epochs"]:
+                completed_epochs = int(completion_state.get("epochs", 0))
+                if completed_epochs >= cfg["training"][
+                    "epochs"
+                ] or completion_state.get("stopped_early", False):
                     print(
                         f"Skipping existing checkpoint {path}; --overwrite retrains it"
                     )
@@ -904,7 +905,20 @@ def train(cfg, overwrite=False):
             weight_decay=cfg["training"]["weight_decay"],
         )
         scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision(cfg, device))
+        scheduler_cfg = cfg["training"]["scheduler"]
+        scheduler = (
+            torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="max",
+                factor=scheduler_cfg["factor"],
+                patience=scheduler_cfg["patience"],
+                min_lr=scheduler_cfg["minimum_learning_rate"],
+            )
+            if scheduler_cfg["enabled"]
+            else None
+        )
         best_score, history, start_epoch = -float("inf"), [], 0
+        epochs_without_improvement = 0
         if (
             not overwrite
             and latest.exists()
@@ -926,6 +940,31 @@ def train(cfg, overwrite=False):
             start_epoch = int(state["epoch"])
             best_score = float(state["best_score"])
             history = state["history"]
+            if "epochs_without_improvement" in state:
+                epochs_without_improvement = int(state["epochs_without_improvement"])
+            else:
+                # Recover early-stopping progress from legacy history. The
+                # historical best may improve by less than min_delta, so track
+                # the patience reference independently of checkpoint selection.
+                patience_best = -float("inf")
+                for historical_row in history:
+                    historical_score = float(historical_row["selection_score"])
+                    if (
+                        historical_score
+                        > patience_best + cfg["training"]["early_stopping_min_delta"]
+                    ):
+                        patience_best = historical_score
+                        epochs_without_improvement = 0
+                    else:
+                        epochs_without_improvement += 1
+            if scheduler is not None:
+                if state.get("scheduler") is not None:
+                    scheduler.load_state_dict(state["scheduler"])
+                else:
+                    # Backward-compatible continuation from checkpoints created
+                    # before scheduler state was recorded.
+                    for historical_row in history:
+                        scheduler.step(float(historical_row["selection_score"]))
             rng.setstate(state["python_rng_state"])
             torch.set_rng_state(state["torch_rng_state"].cpu())
             if device.type == "cuda" and state.get("cuda_rng_state") is not None:
@@ -974,6 +1013,7 @@ def train(cfg, overwrite=False):
             if not all(np.isfinite(v) for v in (val, val_map, val_recall)):
                 raise ValueError('Nonfinite validation metric')
             score = selection_score(cfg, val, val_map, val_recall)
+            previous_best_score = best_score
             row = {
                 "timestamp_utc": utc_now(),
                 "seed": seed,
@@ -1006,6 +1046,15 @@ def train(cfg, overwrite=False):
                 best_tmp = path.with_suffix('.tmp')
                 shutil.copyfile(candidate, best_tmp)
                 best_tmp.replace(path)
+            if (
+                score
+                > previous_best_score + cfg["training"]["early_stopping_min_delta"]
+            ):
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+            if scheduler is not None:
+                scheduler.step(score)
             metrics_path = path.parent/f'training_metrics_seed_{seed}.csv'
             write_csv(metrics_path, history)
             if cfg["output"]["plots"]:
@@ -1018,7 +1067,15 @@ def train(cfg, overwrite=False):
                 f"score={score:.4f} kept=[{kept_epochs}]",
                 flush=True,
             )
-            if (epoch + 1) % cfg["training"]["recovery"]["save_every_epochs"] == 0:
+            should_stop = (
+                cfg["training"]["early_stopping_patience"] > 0
+                and epoch + 1 >= cfg["training"]["minimum_epochs"]
+                and epochs_without_improvement
+                >= cfg["training"]["early_stopping_patience"]
+            )
+            if (epoch + 1) % cfg["training"]["recovery"][
+                "save_every_epochs"
+            ] == 0 or should_stop:
                 recovery_state = state | {
                     "optimizer": optimizer.state_dict(),
                     "scaler": (
@@ -1026,6 +1083,10 @@ def train(cfg, overwrite=False):
                     ),
                     "best_score": best_score,
                     "history": history,
+                    "scheduler": (
+                        scheduler.state_dict() if scheduler is not None else None
+                    ),
+                    "epochs_without_improvement": epochs_without_improvement,
                     "python_rng_state": rng.getstate(),
                     "torch_rng_state": torch.get_rng_state(),
                     "cuda_rng_state": (
@@ -1035,12 +1096,31 @@ def train(cfg, overwrite=False):
                     ),
                 }
                 atomic_torch_save(recovery_state, latest)
+            if should_stop:
+                print(
+                    f"Early stopping seed={seed} at epoch={epoch+1}; "
+                    f"no selection-score improvement greater than "
+                    f"{cfg['training']['early_stopping_min_delta']:g} for "
+                    f"{epochs_without_improvement} epochs",
+                    flush=True,
+                )
+                break
         best_state = torch.load(path, map_location='cpu', weights_only=True)
-        write_json(completion,{'timestamp_utc':utc_now(),'epochs':cfg['training']['epochs'],
-                   'best_epoch':best_state['epoch'],'best_validation_loss':best_state['validation_loss'],
-                   'best_validation_map':best_state['validation_map'],
-                   'best_validation_recall':best_state['validation_recall'],
-                   'best_selection_score':best_state['selection_score']})
+        completed_epochs = int(history[-1]["epoch"]) if history else start_epoch
+        write_json(
+            completion,
+            {
+                "timestamp_utc": utc_now(),
+                "epochs": completed_epochs,
+                "target_epochs": cfg["training"]["epochs"],
+                "stopped_early": completed_epochs < cfg["training"]["epochs"],
+                "best_epoch": best_state["epoch"],
+                "best_validation_loss": best_state["validation_loss"],
+                "best_validation_map": best_state["validation_map"],
+                "best_validation_recall": best_state["validation_recall"],
+                "best_selection_score": best_state["selection_score"],
+            },
+        )
 
 
 def choose_groups(nodes, settings):

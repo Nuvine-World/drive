@@ -30,6 +30,9 @@ def enable_smoke(cfg):
     cfg["dataset"]["splits"] = smoke["splits"]
     validate_splits(cfg["dataset"]["splits"])
     cfg["training"]["epochs"] = smoke["epochs"]
+    cfg["training"]["minimum_epochs"] = smoke["epochs"]
+    cfg["training"]["early_stopping_patience"] = 0
+    cfg["training"].setdefault("scheduler", {})["enabled"] = False
     cfg["training"]["seeds"] = cfg["training"]["seeds"][: smoke["seeds"]]
     # Keep the profile tiny while still exercising the cooperative code path.
     cfg["training"]["node_counts"] = [1, 2]
@@ -120,6 +123,41 @@ def load_config(path):
         raise ValueError("Unknown training mode")
     if t["epochs"] < 1 or not t["seeds"] or t["learning_rate"] <= 0:
         raise ValueError("Invalid training configuration")
+    t.setdefault("minimum_epochs", t["epochs"])
+    t.setdefault("early_stopping_patience", 0)
+    t.setdefault("early_stopping_min_delta", 0.0)
+    scheduler = t.setdefault("scheduler", {})
+    if not isinstance(scheduler, dict):
+        raise ValueError("training.scheduler must be a mapping")
+    scheduler.setdefault("enabled", False)
+    scheduler.setdefault("factor", 0.5)
+    scheduler.setdefault("patience", 5)
+    scheduler.setdefault("minimum_learning_rate", 1e-5)
+    if (
+        not isinstance(t["minimum_epochs"], int)
+        or isinstance(t["minimum_epochs"], bool)
+        or not 1 <= t["minimum_epochs"] <= t["epochs"]
+    ):
+        raise ValueError(
+            "training.minimum_epochs must be between 1 and training.epochs"
+        )
+    if (
+        not isinstance(t["early_stopping_patience"], int)
+        or isinstance(t["early_stopping_patience"], bool)
+        or t["early_stopping_patience"] < 0
+        or not isinstance(t["early_stopping_min_delta"], (int, float))
+        or t["early_stopping_min_delta"] < 0
+    ):
+        raise ValueError("Invalid training early-stopping configuration")
+    if (
+        not isinstance(scheduler["enabled"], bool)
+        or not 0 < scheduler["factor"] < 1
+        or not isinstance(scheduler["patience"], int)
+        or isinstance(scheduler["patience"], bool)
+        or scheduler["patience"] < 1
+        or not 0 < scheduler["minimum_learning_rate"] <= t["learning_rate"]
+    ):
+        raise ValueError("Invalid training scheduler configuration")
     t.setdefault("batch_size", 1)
     t.setdefault("preprocessing_workers", 1)
     t.setdefault("mixed_precision", False)

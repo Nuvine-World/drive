@@ -9,7 +9,10 @@ __pycache__/
 /advercity_work/
 /outputs/
 /logs/
-/docs/decisions/
-/docs/review/
 *.pt
 .cache/
+output.txt
+*.aux
+*.log
+/docs
+*.tex

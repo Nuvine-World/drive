@@ -34,8 +34,18 @@ dataset:
            2025_11_27_heavysnow, 2025_03_24_rainy, 2025_04_02_freezingrain]
 training:
   seeds: [42, 43, 44]
-  epochs: 30
+  # Continue existing 30-epoch checkpoints, reduce LR on validation-score
+  # plateaus, and stop only after the minimum training horizon.
+  epochs: 100
+  minimum_epochs: 30
+  early_stopping_patience: 12
+  early_stopping_min_delta: 0.0005
   learning_rate: 0.001
+  scheduler:
+    enabled: true
+    factor: 0.5
+    patience: 5
+    minimum_learning_rate: 0.00001
   weight_decay: 0.0001
   device: auto
   require_cuda: true
