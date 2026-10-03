@@ -55,6 +55,23 @@ def test_split_audit_rejects_shared_source_across_splits(tmp_path):
         audit_split_isolation(samples)
 
 
+def test_write_csv_accepts_fields_added_to_later_rows(tmp_path):
+    path = tmp_path / "metrics.csv"
+    pipeline_module.write_csv(
+        path,
+        [
+            {"epoch": 1, "loss": 0.5},
+            {"epoch": 2, "loss": 0.25, "effective_batch_size": 4},
+        ],
+    )
+
+    with path.open() as stream:
+        rows = list(csv.DictReader(stream))
+
+    assert rows[0] == {"epoch": "1", "loss": "0.5", "effective_batch_size": ""}
+    assert rows[1]["effective_batch_size"] == "4"
+
+
 def test_receiver_rotation_is_not_lexicographic():
     groups = choose_groups(
         {"10", "2"},

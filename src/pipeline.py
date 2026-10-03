@@ -34,7 +34,11 @@ def write_csv(path, rows):
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     with temporary.open("w", newline="") as stream:
         if rows:
-            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            # Resumed runs can append metrics introduced by a newer version of
+            # the pipeline to history loaded from an older checkpoint.  Keep
+            # first-seen column order while including keys from every row.
+            fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+            writer = csv.DictWriter(stream, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
         stream.flush()
