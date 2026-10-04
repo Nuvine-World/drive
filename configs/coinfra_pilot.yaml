@@ -48,7 +48,9 @@ training:
   weight_decay: 0.0001
   device: auto
   require_cuda: true
-  hidden_channels: 32
+  # Still compact, but large enough to test whether the 32-channel model was
+  # capacity-limited across recording sessions.
+  hidden_channels: 64
   # Predict on a half-resolution grid after a strided, large-context encoder.
   output_stride: 2
   # RTX 4090/3090 server profile. CUDA OOM recovery will split a training
@@ -82,6 +84,7 @@ evaluation:
   node_counts: [1, 8]
   subsets_per_count: 1
   subset_seed: 17
+  ap_score_threshold: 0.01
   score_threshold: 0.15
   nms_iou: 0.2
   iou_thresholds: [0.5, 0.7]

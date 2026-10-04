@@ -82,6 +82,9 @@ evaluation:
   node_counts: [1, 2, 4, 8]
   subsets_per_count: 5
   subset_seed: 17
+  # Retain low-confidence candidates for a complete AP curve; precision/recall
+  # use the separate deployed operating threshold below.
+  ap_score_threshold: 0.01
   score_threshold: 0.15
   nms_iou: 0.2
   iou_thresholds: [0.5, 0.7]

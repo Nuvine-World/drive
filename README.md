@@ -222,7 +222,8 @@ fixed global ground truth is unchanged between node subsets.
 
 The configured output directory contains:
 
-- `index.json`, `inventory.json`, `inspection.json`, and `resolved_config.json`;
+- `index.json`, `inventory.json`, `inspection.json`, `class_inventory.json`, and
+  `resolved_config.json`;
 - `environment.json` with software and platform versions;
 - `seed_N/best.pt`, `latest.pt`, retained epoch checkpoints, and completion state;
 - `seed_N/training_metrics_seed_N.csv` and training curves;
@@ -242,8 +243,11 @@ The configured output directory contains:
   `latency_by_bandwidth.png`, and `report.md`;
 - `verification.json`, written only after required artifacts and metric invariants are checked.
 
-AP is confidence-ranked across a complete session/subset. Precision, recall, and
-F1 use `evaluation.score_threshold` after class-wise NMS. Localization errors are
+AP is confidence-ranked across a complete session/subset using candidates retained
+at `evaluation.ap_score_threshold`. Precision, recall, F1, and localization
+diagnostics use the stricter deployed operating point in
+`evaluation.score_threshold` after class-wise NMS. This prevents the operating
+threshold from truncating the precision-recall curve. Localization errors are
 computed only for matched true positives. Undefined classes and match metrics are
 left blank rather than treated as zero. Summary statistics are descriptive, not
 confidence intervals. `run.sh` executes verification after report generation and

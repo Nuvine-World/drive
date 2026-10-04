@@ -22,7 +22,7 @@ from src.data.api import annotations, discover, load_cloud, rasterize
 from src.detection.bev import BEVDetector, targets, loss, decode
 from src.metrics.evaluation import evaluate, nms
 
-EVALUATION_VERSION = 2
+EVALUATION_VERSION = 3
 
 
 def write_json(path, value):
@@ -213,15 +213,31 @@ def _validation_metrics(model, samples, cfg, device, batch_size):
                 frames[strategy].extend(batch_frames[strategy])
     details, all_aps, all_precisions, all_recalls, all_f1s = {}, [], [], [], []
     for strategy, strategy_frames in frames.items():
-        rows = evaluate(strategy_frames, cfg['dataset']['classes'], cfg['evaluation']['iou_thresholds'])
-        aps = [r['ap_3d'] for r in rows if r['ap_3d'] is not None]
-        precisions = [r['precision'] for r in rows if r['precision'] is not None]
-        recalls = [r['recall'] for r in rows if r['recall'] is not None]
-        f1s = [r['f1'] for r in rows if r['f1'] is not None]
-        details[f'val_map_{strategy}'] = float(np.mean(aps)) if aps else 0.0
-        details[f'val_precision_{strategy}'] = float(np.mean(precisions)) if precisions else 0.0
-        details[f'val_recall_{strategy}'] = float(np.mean(recalls)) if recalls else 0.0
-        details[f'val_f1_{strategy}'] = float(np.mean(f1s)) if f1s else 0.0
+        rows = evaluate(
+            strategy_frames,
+            cfg["dataset"]["classes"],
+            cfg["evaluation"]["iou_thresholds"],
+            cfg["evaluation"]["score_threshold"],
+        )
+        aps = [r["ap_3d"] for r in rows if r["ap_3d"] is not None]
+        precisions = [r["precision"] for r in rows if r["precision"] is not None]
+        recalls = [r["recall"] for r in rows if r["recall"] is not None]
+        f1s = [r["f1"] for r in rows if r["f1"] is not None]
+        details[f"val_map_{strategy}"] = float(np.mean(aps)) if aps else 0.0
+        details[f"val_precision_{strategy}"] = (
+            float(np.mean(precisions)) if precisions else 0.0
+        )
+        details[f"val_recall_{strategy}"] = float(np.mean(recalls)) if recalls else 0.0
+        details[f"val_f1_{strategy}"] = float(np.mean(f1s)) if f1s else 0.0
+        primary_iou = cfg["evaluation"]["iou_thresholds"][0]
+        for result in rows:
+            if result["iou"] != primary_iou:
+                continue
+            label = result["class"]
+            details[f"val_ap_{strategy}_{label}"] = result["ap_3d"]
+            details[f"val_precision_{strategy}_{label}"] = result["precision"]
+            details[f"val_recall_{strategy}_{label}"] = result["recall"]
+            details[f"val_f1_{strategy}_{label}"] = result["f1"]
         all_aps.extend(aps)
         all_precisions.extend(precisions)
         all_recalls.extend(recalls)
@@ -346,7 +362,7 @@ def signature(cfg):
         "node_counts",
     )
     return {
-        "model_version": 3,
+        "model_version": 4,
         "dataset": {
             **{key: d.get(key) for key in dataset_keys},
             "splits": {name: d["splits"][name] for name in ("train", "val")},
@@ -555,10 +571,16 @@ def validate_node_capacity(samples, cfg):
 def inspect(cfg):
     samples = preprocess(cfg)
     annotation_counts = {}
+    class_inventory = {
+        split: {label: 0 for label in cfg["dataset"]["classes"]}
+        for split in ("train", "val", "test")
+    }
     for sample in samples:
         boxes = annotations(sample["gt"], cfg["dataset"])
         validate_target_centers(boxes, cfg["dataset"], sample["id"])
         annotation_counts[sample["id"]] = len(boxes)
+        for box in boxes:
+            class_inventory[sample["split"]][box.label] += 1
     report = []
     seen = set()
     for sample in samples:
@@ -570,10 +592,15 @@ def inspect(cfg):
         report.append({'sample':sample['id'],'points_in_bounds':{n:len(p) for n,p in clouds.items()},
                        'boxes_in_bounds':annotation_counts[sample['id']]})
         if not any(len(p) for p in clouds.values()):
-            raise ValueError(f'All transformed points outside configured bounds at {sample["id"]}')
-    write_json(Path(cfg['output']['root'])/'inspection.json',report)
-    print(f'Validated annotations in {len(samples)} frames and point transforms in '
-          f'{len(report)} representative slices; see inspection.json')
+            raise ValueError(
+                f'All transformed points outside configured bounds at {sample["id"]}'
+            )
+    write_json(Path(cfg["output"]["root"]) / "inspection.json", report)
+    write_json(Path(cfg["output"]["root"]) / "class_inventory.json", class_inventory)
+    print(
+        f"Validated annotations in {len(samples)} frames and point transforms in "
+        f"{len(report)} representative slices; see inspection.json and class_inventory.json"
+    )
 
 
 def inputs(sample, nodes, cfg):
@@ -1073,11 +1100,22 @@ def train(cfg, overwrite=False):
             if cfg["output"]["plots"]:
                 plot_training(path.parent / f"training_curves_seed_{seed}.png", history)
             kept_epochs = ",".join(str(item[1]) for item in retained)
+            primary_strategy = cfg["evaluation"]["strategies"][0]
+            primary_iou = cfg["evaluation"]["iou_thresholds"][0]
+            class_metrics = {}
+            for metric in ("ap", "precision", "recall"):
+                class_metrics[metric] = ",".join(
+                    f"{label}:{row.get(f'val_{metric}_{primary_strategy}_{label}', 0) or 0:.3f}"
+                    for label in cfg["dataset"]["classes"]
+                )
             print(
                 f'seed={seed} epoch={epoch+1} train={row["train_loss"]:.4f} '
                 f'val={val:.4f} mAP={val_map:.4f} precision={row["val_precision"]:.4f} '
                 f'recall={val_recall:.4f} F1={row["val_f1"]:.4f} '
-                f"score={score:.4f} kept=[{kept_epochs}]",
+                f"score={score:.4f} AP@{primary_iou:.2f}=[{class_metrics['ap']}] "
+                f"P@{primary_iou:.2f}=[{class_metrics['precision']}] "
+                f"R@{primary_iou:.2f}=[{class_metrics['recall']}] "
+                f"kept=[{kept_epochs}]",
                 flush=True,
             )
             should_stop = (
@@ -1857,6 +1895,7 @@ def run_evaluation(cfg):
                         values,
                         cfg["dataset"]["classes"],
                         cfg["evaluation"]["iou_thresholds"],
+                        cfg["evaluation"]["score_threshold"],
                     )
                 )
                 measured = np.array(costs[(nodes, strategy)])
@@ -2264,8 +2303,8 @@ def report(cfg):
             if cfg["dataset"].get("smoke", {}).get("enabled")
             else []
         ),
-        "Accuracy: rotated 3D, globally confidence-ranked AP within each session/subset/seed.",
-        "Precision, recall, and F1 use the configured score threshold after class-wise NMS.",
+        "Accuracy: rotated 3D, globally confidence-ranked AP within each session/subset/seed, using candidates retained at the configured AP score threshold.",
+        "Precision, recall, F1, and localization diagnostics use the configured operating score threshold after class-wise NMS.",
         "Matched-object diagnostics include 3D IoU, center error, yaw error, and dimension IoU.",
         "All aggregates are descriptive means, not confidence intervals or causal weather estimates.",
         "Single-node rows cover every common real node. The fixed global ROI/GT is unchanged across counts.",
@@ -2311,6 +2350,7 @@ def verify_results(cfg):
     required = [
         "index.json",
         "inventory.json",
+        "class_inventory.json",
         "split_isolation.json",
         "inspection.json",
         "resolved_config.json",
@@ -2359,11 +2399,22 @@ def verify_results(cfg):
     for line, row in enumerate(metric_rows, start=2):
         for name in bounded:
             value = row.get(name)
-            if value not in ('',None) and (not math.isfinite(float(value)) or not 0 <= float(value) <= 1):
-                errors.append(f'accuracy.csv line {line}: invalid {name}={value}')
-        tp, fp, fn = (int(row[name]) for name in ('true_positives','false_positives','false_negatives'))
-        if tp+fp != int(row['predictions']) or tp+fn != int(row['ground_truth']):
-            errors.append(f'accuracy.csv line {line}: TP/FP/FN totals are inconsistent')
+            if value not in ("", None) and (
+                not math.isfinite(float(value)) or not 0 <= float(value) <= 1
+            ):
+                errors.append(f"accuracy.csv line {line}: invalid {name}={value}")
+        tp, fp, fn = (
+            int(row[name])
+            for name in ("true_positives", "false_positives", "false_negatives")
+        )
+        if tp + fp != int(row["predictions"]) or tp + fn != int(row["ground_truth"]):
+            errors.append(f"accuracy.csv line {line}: TP/FP/FN totals are inconsistent")
+        if int(row["predictions"]) > int(
+            row.get("ranked_predictions", row["predictions"])
+        ):
+            errors.append(
+                f"accuracy.csv line {line}: operating predictions exceed ranked predictions"
+            )
         for name in ('mean_center_error_m','mean_yaw_error_deg'):
             value = row.get(name)
             if value not in ('',None) and (not math.isfinite(float(value)) or float(value) < 0):

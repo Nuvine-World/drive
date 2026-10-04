@@ -260,28 +260,43 @@ def loss(outputs, target):
     positive = heat.eq(1)
     negative = heat.lt(1)
     negative_weight = (1 - heat).pow(4)
-    axes = tuple(range(1, heat.ndim))
+    # Normalize across the batch per class so abundant cars cannot drown out
+    # the rarer truck, bus, bicycle, and pedestrian positives.
+    axes = (0, 2, 3, 4)
     positive_loss = ((1 - p).pow(2) * p.log() * positive).sum(dim=axes)
     negative_loss = (p.pow(2) * (1 - p).log() * negative_weight * negative).sum(
         dim=axes
     )
     positive_count = positive.sum(dim=axes)
-    focal = -(positive_loss + negative_loss) / positive_count.clamp(min=1)
+    focal_by_class = -(positive_loss + negative_loss) / positive_count.clamp(min=1)
+    focal_weights = torch.where(
+        positive_count > 0,
+        torch.ones_like(focal_by_class),
+        torch.full_like(focal_by_class, 0.05),
+    )
+    focal = (focal_by_class * focal_weights).sum() / focal_weights.sum()
     prediction = regression.float().reshape(batch, classes, slots, 8, height, width)
     prediction = prediction.permute(0, 1, 2, 4, 5, 3)
     expected = reg.permute(0, 1, 2, 4, 5, 3)
     regression_losses = []
-    for index in range(len(reg)):
-        selected = mask[index]
-        regression_losses.append(
-            F.smooth_l1_loss(prediction[index][selected], expected[index][selected])
-            if selected.any()
-            else prediction[index].sum() * 0
-        )
-    return (focal + torch.stack(regression_losses)).mean()
+    for class_index in range(classes):
+        selected = mask[:, class_index]
+        if selected.any():
+            regression_losses.append(
+                F.smooth_l1_loss(
+                    prediction[:, class_index][selected],
+                    expected[:, class_index][selected],
+                )
+            )
+    regression_loss = (
+        torch.stack(regression_losses).mean()
+        if regression_losses
+        else prediction.sum() * 0
+    )
+    return focal + regression_loss
 
 
-def decode(outputs, cfg):
+def decode(outputs, cfg, score_threshold=None):
     logits, regression = outputs
     settings, d = cfg["evaluation"], cfg["dataset"]
     classes = len(d["classes"])
@@ -301,13 +316,18 @@ def decode(outputs, cfg):
     selected_regression = (
         reg[selected_channels, :, selected_cells].detach().cpu().numpy()
     )
+    threshold = (
+        settings.get("ap_score_threshold", settings["score_threshold"])
+        if score_threshold is None
+        else score_threshold
+    )
     boxes = []
     for score, index, v in zip(
         values.detach().cpu().tolist(),
         indices.detach().cpu().tolist(),
         selected_regression,
     ):
-        if score < settings["score_threshold"]:
+        if score < threshold:
             continue
         channel, cell = divmod(index, h * w)
         c, slot = divmod(channel, slots)

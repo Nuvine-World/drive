@@ -320,7 +320,11 @@ def load_config(path):
         raise ValueError("evaluation.batch_size must be positive")
     if any(not 0 < x <= 1 for x in e["iou_thresholds"]):
         raise ValueError("Invalid IoU threshold")
-    if not 0 <= e["score_threshold"] <= 1 or not 0 < e["nms_iou"] <= 1:
+    e.setdefault("ap_score_threshold", e["score_threshold"])
+    if (
+        not 0 <= e["ap_score_threshold"] <= e["score_threshold"] <= 1
+        or not 0 < e["nms_iou"] <= 1
+    ):
         raise ValueError("Invalid detection thresholds")
     adaptive = cfg.setdefault("adaptive_fusion", {})
     adaptive.setdefault("training_budgets", [0.01, 0.05, 0.1])

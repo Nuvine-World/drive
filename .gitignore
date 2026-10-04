@@ -16,3 +16,4 @@ output.txt
 *.log
 /docs
 *.tex
+/*_artifacts

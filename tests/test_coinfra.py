@@ -202,6 +202,7 @@ def test_coinfra_pilot_is_one_seed_early_fusion_profile():
     assert cfg["training"]["seeds"] == [42]
     assert cfg["training"]["epochs"] == 30
     assert cfg["training"]["minimum_epochs"] == 20
+    assert cfg["training"]["hidden_channels"] == 64
     assert cfg["training"]["modes"] == ["early"]
     assert cfg["training"]["node_counts"] == [8]
     assert cfg["training"]["checkpointing"]["weights"] == {
@@ -212,6 +213,8 @@ def test_coinfra_pilot_is_one_seed_early_fusion_profile():
     assert cfg["evaluation"]["strategies"] == ["early"]
     assert cfg["evaluation"]["node_counts"] == [1, 8]
     assert cfg["evaluation"]["subsets_per_count"] == 1
+    assert cfg["evaluation"]["ap_score_threshold"] == 0.01
+    assert cfg["evaluation"]["score_threshold"] == 0.15
     assert Path(cfg["output"]["root"]).name == "coinfra_pilot"
 
 
@@ -273,6 +276,24 @@ def test_dataset_ap_false_positive_empty_frame():
     assert rows[0]['mean_yaw_error_deg']==pytest.approx(0)
     assert rows[0]['mean_size_iou']==pytest.approx(1)
     assert rows[1]['ap_3d'] is None
+
+
+def test_ap_threshold_is_separate_from_operating_point():
+    gt = BoundingBox3D(0, 0, 0, 4, 2, 2, 0, "car")
+    false_positive = BoundingBox3D(20, 20, 0, 4, 2, 2, 0, "car", 0.2)
+    low_score_true_positive = copy.copy(gt)
+    low_score_true_positive.score = 0.05
+    row = evaluate(
+        [([false_positive, low_score_true_positive], [gt])],
+        ["car"],
+        [0.5],
+        operating_score_threshold=0.15,
+    )[0]
+    assert row["ap_3d"] == pytest.approx(0.5)
+    assert row["precision"] == 0
+    assert row["recall"] == 0
+    assert row["predictions"] == 1
+    assert row["ranked_predictions"] == 2
 
 
 def test_group_selection_no_synthetic_nodes(fixture_config):
@@ -422,7 +443,7 @@ def test_center_collision_over_slot_capacity_is_explicit(fixture_config):
     assert "delta=(0.000000, 0.000000)" in message
 
 
-def test_batched_detector_and_loss_match_individual_samples(fixture_config):
+def test_batched_detector_and_class_balanced_loss_are_finite(fixture_config):
     torch.manual_seed(7)
     model = BEVDetector(
         fixture_config["dataset"]["classes"],
@@ -442,15 +463,18 @@ def test_batched_detector_and_loss_match_individual_samples(fixture_config):
     )
     batched_outputs = model(bev)
     batched_loss = loss(batched_outputs, target)
-    individual = [
-        loss(
-            (batched_outputs[0][i : i + 1], batched_outputs[1][i : i + 1]),
-            tuple(value[i] for value in target),
-        )
-        for i in range(2)
+    assert torch.isfinite(batched_loss)
+    batched_loss.backward()
+    detector_gradients = [
+        parameter.grad
+        for name, parameter in model.named_parameters()
+        if not name.startswith("utility.")
     ]
-    expected = float(torch.stack(individual).mean().detach())
-    assert float(batched_loss.detach()) == pytest.approx(expected, rel=1e-6)
+    assert detector_gradients
+    assert all(
+        gradient is not None and torch.isfinite(gradient).all()
+        for gradient in detector_gradients
+    )
 
     per_node = torch.randn(2, 2, 3, 16, 16)
     batched = model(per_node, "intermediate")
@@ -788,6 +812,11 @@ def test_decode_preserves_two_objects_from_one_class_cell(fixture_config):
 def test_end_to_end_train_all_fusions_report(fixture_config):
     torch.set_num_threads(1)
     inspect(fixture_config)
+    class_inventory = json.loads(
+        (Path(fixture_config["output"]["root"]) / "class_inventory.json").read_text()
+    )
+    assert class_inventory["train"]["car"] == 4
+    assert class_inventory["train"]["pedestrian"] == 0
     train(fixture_config)
     rows = run_evaluation(fixture_config)
     report(fixture_config)
@@ -809,6 +838,11 @@ def test_end_to_end_train_all_fusions_report(fixture_config):
     output = Path(fixture_config["output"]["root"])
     assert (output / "seed_1/best.pt").exists()
     assert (output / "report.md").exists()
+    with (output / "seed_1/training_metrics_seed_1.csv").open() as stream:
+        training_row = next(csv.DictReader(stream))
+    assert "val_ap_early_car" in training_row
+    assert "val_precision_early_car" in training_row
+    assert "val_recall_early_car" in training_row
     for filename in (
         "accuracy_summary.csv",
         "metrics_overview.csv",
