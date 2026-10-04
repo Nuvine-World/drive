@@ -12,7 +12,7 @@ from prepare_advercity import (
     normalize_boxes,
     read_ply,
 )
-from src.config import PROJECT, load_config
+from src.config import PROJECT, enable_overfit, load_config
 from src.data.advercity import annotations, discover, load_cloud, scenario_weather
 
 
@@ -39,6 +39,14 @@ def make_raw_scenario(root, name='ui_cd_d'):
         (folder / '000060.yaml').write_text(yaml.safe_dump(raw))
         write_ply(folder / '000060_lidar.ply', [[1, 0, 0, .5], [200, 0, 0, .2]])
     return scenario
+
+
+def test_overfit_profile_uses_advercity_node_capacity():
+    cfg = load_config(PROJECT / "configs/advercity.yaml")
+    enable_overfit(cfg)
+    assert cfg["training"]["modes"] == ["early"]
+    assert cfg["training"]["node_counts"] == [5]
+    assert cfg["output"]["root"].endswith("/overfit")
 
 
 def test_convert_and_discover_advercity(tmp_path):

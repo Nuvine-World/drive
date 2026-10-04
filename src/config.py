@@ -44,13 +44,16 @@ def enable_smoke(cfg):
     return cfg
 
 
-def enable_overfit(cfg, frames=32, epochs=100):
+def enable_overfit(cfg, frames=32, optimization_steps=2000):
     """Enable an intentionally leaky tiny-set profile for learning diagnostics.
 
     This profile is never selected from a YAML file.  It must be requested
     explicitly on the command line and writes beneath a separate output root.
     """
     d, t, e = cfg["dataset"], cfg["training"], cfg["evaluation"]
+    overfit_node_count = max(t["node_counts"])
+    batches_per_epoch = math.ceil(frames / t["batch_size"])
+    epochs = math.ceil(optimization_steps / batches_per_epoch)
     training_session = d["splits"]["train"][0]
     d["splits"]["train"] = [training_session]
     d["splits"]["val"] = [training_session]
@@ -69,7 +72,7 @@ def enable_overfit(cfg, frames=32, epochs=100):
             "minimum_epochs": epochs,
             "early_stopping_patience": 0,
             "modes": ["early"],
-            "node_counts": [8],
+            "node_counts": [overfit_node_count],
         }
     )
     t.setdefault("scheduler", {})["enabled"] = False
