@@ -197,6 +197,24 @@ def test_default_coinfra_bounds_use_global_metric_frame(monkeypatch):
     assert bounds[1] < 0 < bounds[4]
 
 
+def test_coinfra_pilot_is_one_seed_early_fusion_profile():
+    cfg = load_config(PROJECT / "configs/coinfra_pilot.yaml")
+    assert cfg["training"]["seeds"] == [42]
+    assert cfg["training"]["epochs"] == 30
+    assert cfg["training"]["minimum_epochs"] == 20
+    assert cfg["training"]["modes"] == ["early"]
+    assert cfg["training"]["node_counts"] == [8]
+    assert cfg["training"]["checkpointing"]["weights"] == {
+        "val_loss_quality": 0.0,
+        "val_map": 0.8,
+        "val_recall": 0.2,
+    }
+    assert cfg["evaluation"]["strategies"] == ["early"]
+    assert cfg["evaluation"]["node_counts"] == [1, 8]
+    assert cfg["evaluation"]["subsets_per_count"] == 1
+    assert Path(cfg["output"]["root"]).name == "coinfra_pilot"
+
+
 def test_zero_yaw_and_empty_gt(fixture_config):
     sample = discover(fixture_config)[0]
     assert annotations(sample['gt'],fixture_config['dataset'])[0].yaw==0
