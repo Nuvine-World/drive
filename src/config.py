@@ -1,4 +1,5 @@
 """Validated configuration with project-relative paths."""
+
 import math
 import os
 from pathlib import Path
@@ -67,8 +68,8 @@ def enable_overfit(cfg, frames=32, epochs=100):
             "epochs": epochs,
             "minimum_epochs": epochs,
             "early_stopping_patience": 0,
-            "modes": ["single"],
-            "node_counts": [1],
+            "modes": ["early"],
+            "node_counts": [8],
         }
     )
     t.setdefault("scheduler", {})["enabled"] = False
@@ -90,32 +91,39 @@ def enable_overfit(cfg, frames=32, epochs=100):
 def load_config(path):
     with open(path) as stream:
         cfg = yaml.safe_load(stream)
-    d, t, e = cfg['dataset'], cfg['training'], cfg['evaluation']
-    dataset_type = d.setdefault('type', 'coinfra')
-    if dataset_type not in ('coinfra', 'advercity'):
-        raise ValueError('dataset.type must be coinfra or advercity')
-    root_environment = 'ADVERCITY_ROOT' if dataset_type == 'advercity' else 'COINFRA_ROOT'
-    d['root'] = str(resolve(os.environ.get(root_environment, d['root'])))
-    if dataset_type == 'advercity':
-        acquisition = d.setdefault('acquisition', {})
-        acquisition['work_dir'] = str(resolve(os.environ.get(
-            'ADVERCITY_WORK_DIR', acquisition.get('work_dir', 'advercity_work'))))
-        acquisition.setdefault('minimum_free_gb', 35)
-        acquisition.setdefault('cleanup_archives', True)
-        acquisition.setdefault('retain_frame_stride', 1)
-        if acquisition['minimum_free_gb'] < 1 or acquisition['retain_frame_stride'] < 1:
-            raise ValueError('Invalid Adver-City acquisition settings')
-    cfg['output']['root'] = str(resolve(cfg['output']['root']))
-    cfg['output'].setdefault('plots', True)
-    smoke = d.setdefault('smoke', {'enabled': False})
-    smoke.setdefault('enabled', False)
-    smoke.setdefault('splits', d['splits'])
-    smoke.setdefault('sessions_per_split', 1)
-    smoke.setdefault('slices_per_session', 1)
-    smoke.setdefault('frames_per_slice', 1)
-    smoke.setdefault('epochs', 2)
-    smoke.setdefault('seeds', 1)
-    if smoke['enabled']:
+    d, t, e = cfg["dataset"], cfg["training"], cfg["evaluation"]
+    dataset_type = d.setdefault("type", "coinfra")
+    if dataset_type not in ("coinfra", "advercity"):
+        raise ValueError("dataset.type must be coinfra or advercity")
+    root_environment = (
+        "ADVERCITY_ROOT" if dataset_type == "advercity" else "COINFRA_ROOT"
+    )
+    d["root"] = str(resolve(os.environ.get(root_environment, d["root"])))
+    if dataset_type == "advercity":
+        acquisition = d.setdefault("acquisition", {})
+        acquisition["work_dir"] = str(
+            resolve(
+                os.environ.get(
+                    "ADVERCITY_WORK_DIR", acquisition.get("work_dir", "advercity_work")
+                )
+            )
+        )
+        acquisition.setdefault("minimum_free_gb", 35)
+        acquisition.setdefault("cleanup_archives", True)
+        acquisition.setdefault("retain_frame_stride", 1)
+        if acquisition["minimum_free_gb"] < 1 or acquisition["retain_frame_stride"] < 1:
+            raise ValueError("Invalid Adver-City acquisition settings")
+    cfg["output"]["root"] = str(resolve(cfg["output"]["root"]))
+    cfg["output"].setdefault("plots", True)
+    smoke = d.setdefault("smoke", {"enabled": False})
+    smoke.setdefault("enabled", False)
+    smoke.setdefault("splits", d["splits"])
+    smoke.setdefault("sessions_per_split", 1)
+    smoke.setdefault("slices_per_session", 1)
+    smoke.setdefault("frames_per_slice", 1)
+    smoke.setdefault("epochs", 2)
+    smoke.setdefault("seeds", 1)
+    if smoke["enabled"]:
         enable_smoke(cfg)
     b = d["bounds"]
     if (

@@ -344,8 +344,8 @@ def test_overfit_profile_is_isolated_and_intentionally_reuses_training_data():
     assert cfg["dataset"]["splits"]["train"] == cfg["dataset"]["splits"]["val"]
     assert cfg["dataset"]["smoke"]["frames_per_slice"] == 32
     assert cfg["training"]["seeds"] == [42]
-    assert cfg["training"]["modes"] == ["single"]
-    assert cfg["training"]["node_counts"] == [1]
+    assert cfg["training"]["modes"] == ["early"]
+    assert cfg["training"]["node_counts"] == [8]
     assert cfg["evaluation"]["strategies"] == ["early"]
     assert cfg["evaluation"]["node_counts"] == [1]
     assert Path(cfg["output"]["root"]).name == "overfit"
