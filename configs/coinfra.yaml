@@ -50,6 +50,8 @@ training:
   device: auto
   require_cuda: true
   hidden_channels: 32
+  # Predict on a half-resolution grid after a strided, large-context encoder.
+  output_stride: 2
   # RTX 4090/3090 server profile. CUDA OOM recovery will split a training
   # batch automatically if an unusually large multi-node sample does not fit.
   batch_size: 8

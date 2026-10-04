@@ -105,9 +105,10 @@ def validate_examples(model, examples, cfg, device, retries):
             early_outputs = model(early)
             batch_loss = float(loss(early_outputs, target))
             batch_size, nodes, channels, height, width = per_node.shape
-            features = model.encoder(
+            encoded = model.encoder(
                 per_node.reshape(batch_size * nodes, channels, height, width)
-            ).reshape(batch_size, nodes, -1, height, width)
+            )
+            features = encoded.reshape(batch_size, nodes, *encoded.shape[1:])
             intermediate = (
                 model.heads(features.amax(dim=1))
                 if "intermediate" in cfg["evaluation"]["strategies"]
@@ -336,6 +337,7 @@ def signature(cfg):
     )
     training_keys = (
         "hidden_channels",
+        "output_stride",
         "learning_rate",
         "weight_decay",
         "batch_size",
@@ -344,7 +346,7 @@ def signature(cfg):
         "node_counts",
     )
     return {
-        "model_version": 2,
+        "model_version": 3,
         "dataset": {
             **{key: d.get(key) for key in dataset_keys},
             "splits": {name: d["splits"][name] for name in ("train", "val")},
@@ -646,10 +648,12 @@ def prepare_training_example(plan, cfg):
     bev = array_inputs(inputs(sample, nodes, cfg), cfg, mode)
     if mode == "early":
         bev = bev[0]
+    stride = cfg["training"]["output_stride"]
+    target_shape = tuple((size + stride - 1) // stride for size in bev.shape[-2:])
     target = targets(
         annotations(sample["gt"], cfg["dataset"]),
         cfg["dataset"],
-        bev.shape[-2:],
+        target_shape,
         sample_id=sample["id"],
     )
     return bev, target
@@ -802,7 +806,9 @@ def prepare_validation_example(sample, cfg):
     early = array_inputs(clouds, cfg, "early")[0]
     per_node = array_inputs(clouds, cfg, "intermediate")
     gt = annotations(sample["gt"], cfg["dataset"])
-    target = targets(gt, cfg["dataset"], early.shape[-2:], sample_id=sample["id"])
+    stride = cfg["training"]["output_stride"]
+    target_shape = tuple((size + stride - 1) // stride for size in early.shape[-2:])
+    target = targets(gt, cfg["dataset"], target_shape, sample_id=sample["id"])
     return early, per_node, gt, target
 
 
@@ -842,6 +848,7 @@ def make_model(cfg,device):
         cfg["dataset"]["classes"],
         cfg["training"]["hidden_channels"],
         cfg["dataset"].get("objects_per_cell", 1),
+        cfg["training"]["output_stride"],
     ).to(device)
 
 
@@ -1296,9 +1303,10 @@ def infer_batch(
                 )
             else:
                 batch, nodes, channels, height, width = bev.shape
-                features = model.encoder(
+                encoded = model.encoder(
                     bev.reshape(batch * nodes, channels, height, width)
-                ).reshape(batch, nodes, -1, height, width)
+                )
+                features = encoded.reshape(batch, nodes, *encoded.shape[1:])
                 if base_strategy == "intermediate":
                     outputs = model.heads(features.amax(dim=1))
                     predictions = [

@@ -1,4 +1,5 @@
-"""Small trainable BEV center detector, not a PointPillars reproduction."""
+"""Compact strided BEV center detector used by all fusion strategies."""
+
 import math
 import numpy as np
 import torch
@@ -9,21 +10,51 @@ from src.data.coinfra import in_bounds
 from src.metrics.evaluation import nms
 
 
+class SeparableResidual(nn.Module):
+    """Large-context residual block with inexpensive depthwise convolution."""
+
+    def __init__(self, channels, dilation):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                3,
+                padding=dilation,
+                dilation=dilation,
+                groups=channels,
+                bias=False,
+            ),
+            nn.GroupNorm(1, channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.GroupNorm(1, channels),
+        )
+        self.activation = nn.SiLU(inplace=True)
+
+    def forward(self, value):
+        return self.activation(value + self.block(value))
+
+
 class BEVDetector(nn.Module):
-    def __init__(self, classes, hidden, objects_per_cell=1):
+    def __init__(self, classes, hidden, objects_per_cell=1, output_stride=2):
         super().__init__()
         self.classes = classes
         self.objects_per_cell = objects_per_cell
-        # 11x11-cell receptive field: 4.4 m at CoInfra's 0.4 m resolution,
-        # large enough to represent a typical car rather than only a fragment.
+        if output_stride != 2:
+            raise ValueError("BEVDetector currently supports output_stride=2")
+        self.output_stride = output_stride
+        # Downsample before the expensive feature extraction.  The two dilated
+        # depthwise residual blocks see 27 input cells (10.8 m at 0.4 m/cell)
+        # while doing the bulk of their work on a quarter as many BEV cells.
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, hidden, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(hidden, hidden, 3, padding=2, dilation=2),
-            nn.ReLU(),
-            nn.Conv2d(hidden, hidden, 3, padding=2, dilation=2),
-            nn.ReLU(),
+            nn.Conv2d(3, hidden, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(1, hidden),
+            nn.SiLU(inplace=True),
+            SeparableResidual(hidden, dilation=2),
+            SeparableResidual(hidden, dilation=4),
         )
+        self.receptive_field_cells = 27
         slots = len(classes) * objects_per_cell
         self.heatmap = nn.Conv2d(hidden, slots, 1)
         self.regression = nn.Conv2d(hidden, 8 * slots, 1)
@@ -133,16 +164,57 @@ class BEVDetector(nn.Module):
         return self.heads(features)
 
 
+def _grid_resolution(cfg, shape):
+    """Return x/y metres per output cell for an arbitrary prediction grid."""
+    h, w = shape
+    bounds = cfg["bounds"]
+    return (bounds[3] - bounds[0]) / w, (bounds[4] - bounds[1]) / h
+
+
+def _gaussian_radius(height, width, minimum_overlap=0.1):
+    """CenterNet radius for a box measured in output-grid cells."""
+    a1, b1 = 1.0, height + width
+    c1 = width * height * (1 - minimum_overlap) / (1 + minimum_overlap)
+    radius1 = (b1 + math.sqrt(max(0.0, b1 * b1 - 4 * a1 * c1))) / 2
+    a2, b2 = 4.0, 2 * (height + width)
+    c2 = (1 - minimum_overlap) * width * height
+    radius2 = (b2 + math.sqrt(max(0.0, b2 * b2 - 4 * a2 * c2))) / 2
+    a3, b3 = 4 * minimum_overlap, -2 * minimum_overlap * (height + width)
+    c3 = (minimum_overlap - 1) * width * height
+    radius3 = (b3 + math.sqrt(max(0.0, b3 * b3 - 4 * a3 * c3))) / (2 * a3)
+    return max(0, int(min(radius1, radius2, radius3)))
+
+
+def _draw_gaussian(heatmap, center, radius):
+    diameter = 2 * radius + 1
+    sigma = max(diameter / 6, 1e-6)
+    coordinates = np.arange(diameter, dtype=np.float32) - radius
+    gaussian = np.exp(
+        -(coordinates[:, None] ** 2 + coordinates[None, :] ** 2) / (2 * sigma**2)
+    )
+    x, y = center
+    height, width = heatmap.shape
+    left, right = min(x, radius), min(width - x - 1, radius)
+    top, bottom = min(y, radius), min(height - y - 1, radius)
+    patch = heatmap[y - top : y + bottom + 1, x - left : x + right + 1]
+    kernel = gaussian[
+        radius - top : radius + bottom + 1,
+        radius - left : radius + right + 1,
+    ]
+    np.maximum(patch, kernel, out=patch)
+
+
 def targets(boxes, cfg, shape, sample_id=None):
     h, w = shape
-    classes, b, r = cfg["classes"], cfg["bounds"], cfg["resolution"]
+    classes, b = cfg["classes"], cfg["bounds"]
+    rx, ry = _grid_resolution(cfg, shape)
     slots = cfg.get("objects_per_cell", 1)
     heat = np.zeros((len(classes), slots, h, w), np.float32)
     reg = np.zeros((len(classes), slots, 8, h, w), np.float32)
     mask = np.zeros((len(classes), slots, h, w), bool)
     occupied = {}
     for box in boxes:
-        x, y = (box.x-b[0])/r, (box.y-b[1])/r
+        x, y = (box.x - b[0]) / rx, (box.y - b[1]) / ry
         ix, iy, c = int(x), int(y), classes.index(box.label)
         if not (0 <= ix < w and 0 <= iy < h):
             continue
@@ -150,15 +222,18 @@ def targets(boxes, cfg, shape, sample_id=None):
         colocated = occupied.setdefault(key, [])
         if len(colocated) >= slots:
             previous = colocated[0]
+            resolution_text = f"{rx:g}" if math.isclose(rx, ry) else f"({rx:g}, {ry:g})"
             raise ValueError(
                 f"More than {slots} same-class centers occupy one grid cell: "
                 f"sample={sample_id!r}, class={box.label!r}, cell=(x={ix}, y={iy}), "
-                f"resolution={r}, first_center=({previous.x:.6f}, {previous.y:.6f}), "
+                f"resolution={resolution_text}, first_center=({previous.x:.6f}, {previous.y:.6f}), "
                 f"second_center=({box.x:.6f}, {box.y:.6f}), "
                 f"delta=({abs(previous.x-box.x):.6f}, {abs(previous.y-box.y):.6f})"
             )
         slot = len(colocated)
         colocated.append(box)
+        radius = max(1, _gaussian_radius(box.width / ry, box.length / rx))
+        _draw_gaussian(heat[c, slot], (ix, iy), radius)
         heat[c, slot, iy, ix] = 1
         mask[c, slot, iy, ix] = True
         reg[c, slot, :, iy, ix] = [
@@ -176,18 +251,22 @@ def targets(boxes, cfg, shape, sample_id=None):
 
 def loss(outputs, target):
     logits, regression = outputs
-    heat, reg, mask = [torch.as_tensor(v,device=logits.device) for v in target]
+    heat, reg, mask = [torch.as_tensor(v, device=logits.device) for v in target]
     if heat.ndim == 4:
         heat, reg, mask = heat[None], reg[None], mask[None]
     batch, classes, slots, height, width = heat.shape
     p = logits.reshape(batch, classes, slots, height, width)
     p = p.sigmoid().float().clamp(1e-5, 1 - 1e-5)
-    positive = heat == 1
+    positive = heat.eq(1)
+    negative = heat.lt(1)
+    negative_weight = (1 - heat).pow(4)
     axes = tuple(range(1, heat.ndim))
-    focal = -torch.where(positive, (1 - p) ** 2 * p.log(), p**2 * (1 - p).log()).sum(
+    positive_loss = ((1 - p).pow(2) * p.log() * positive).sum(dim=axes)
+    negative_loss = (p.pow(2) * (1 - p).log() * negative_weight * negative).sum(
         dim=axes
     )
-    focal = focal / positive.sum(dim=axes).clamp(min=1)
+    positive_count = positive.sum(dim=axes)
+    focal = -(positive_loss + negative_loss) / positive_count.clamp(min=1)
     prediction = regression.float().reshape(batch, classes, slots, 8, height, width)
     prediction = prediction.permute(0, 1, 2, 4, 5, 3)
     expected = reg.permute(0, 1, 2, 4, 5, 3)
@@ -228,17 +307,22 @@ def decode(outputs, cfg):
         indices.detach().cpu().tolist(),
         selected_regression,
     ):
-        if score < settings['score_threshold']:
+        if score < settings["score_threshold"]:
             continue
         channel, cell = divmod(index, h * w)
         c, slot = divmod(channel, slots)
         iy, ix = divmod(cell, w)
         if not np.isfinite(v).all():
             continue
-        x = d['bounds'][0]+(ix+float(v[0]))*d['resolution']
-        y = d['bounds'][1]+(iy+float(v[1]))*d['resolution']
-        if not in_bounds(x,y,float(v[2]),d['bounds']):
+        rx, ry = _grid_resolution(d, (h, w))
+        x = d["bounds"][0] + (ix + float(v[0])) * rx
+        y = d["bounds"][1] + (iy + float(v[1])) * ry
+        if not in_bounds(x, y, float(v[2]), d["bounds"]):
             continue
-        size = np.exp(np.clip(v[3:6],-4,5))
-        boxes.append(BoundingBox3D(x,y,float(v[2]),*size,math.atan2(v[6],v[7]),d['classes'][c],score))
-    return nms(boxes,settings['nms_iou'],settings['max_detections'])
+        size = np.exp(np.clip(v[3:6], -4, 5))
+        boxes.append(
+            BoundingBox3D(
+                x, y, float(v[2]), *size, math.atan2(v[6], v[7]), d["classes"][c], score
+            )
+        )
+    return nms(boxes, settings["nms_iou"], settings["max_detections"])

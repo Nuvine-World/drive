@@ -53,6 +53,7 @@ training:
   device: auto
   require_cuda: true
   hidden_channels: 32
+  output_stride: 2
   batch_size: 8
   preprocessing_workers: 8
   mixed_precision: true

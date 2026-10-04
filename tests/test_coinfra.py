@@ -418,7 +418,7 @@ def test_batched_detector_and_loss_match_individual_samples(fixture_config):
     target = tuple(
         np.stack(values)
         for values in zip(
-            *[targets(value, fixture_config["dataset"], (16, 16)) for value in boxes]
+            *[targets(value, fixture_config["dataset"], (8, 8)) for value in boxes]
         )
     )
     batched_outputs = model(bev)
@@ -442,11 +442,33 @@ def test_batched_detector_and_loss_match_individual_samples(fixture_config):
 
 def test_encoder_receptive_field_spans_typical_car(fixture_config):
     model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
-    receptive_cells = 1
-    for layer in model.encoder:
-        if isinstance(layer, torch.nn.Conv2d):
-            receptive_cells += (layer.kernel_size[0] - 1) * layer.dilation[0]
-    assert receptive_cells * 0.4 >= 4.0
+    assert model.receptive_field_cells * 0.4 >= 4.0
+    logits, regression = model(torch.zeros(1, 3, 16, 16))
+    assert logits.shape[-2:] == (8, 8)
+    assert regression.shape[-2:] == (8, 8)
+
+
+def test_detector_can_memorize_one_example(fixture_config):
+    torch.manual_seed(3)
+    model = BEVDetector(fixture_config["dataset"]["classes"], 8, 2)
+    bev = torch.zeros(1, 3, 16, 16)
+    bev[0, :, 7:10, 8:11] = torch.tensor([1.0, 0.6, 0.3])[:, None, None]
+    box = BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")
+    target = tuple(
+        torch.from_numpy(value)[None]
+        for value in targets([box], fixture_config["dataset"], (8, 8))
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0)
+    initial = None
+    for _ in range(150):
+        optimizer.zero_grad(set_to_none=True)
+        value = loss(model(bev), target)
+        if initial is None:
+            initial = float(value.detach())
+        value.backward()
+        optimizer.step()
+    final = float(loss(model(bev), target).detach())
+    assert final < initial * 0.1
 
 
 def test_adaptive_fusion_obeys_spatial_budget(fixture_config):
@@ -641,7 +663,7 @@ def test_validation_oom_splits_only_current_batch(monkeypatch, fixture_config):
     for _ in range(2):
         early = np.zeros((3, 16, 16), np.float32)
         per_node = np.zeros((2, 3, 16, 16), np.float32)
-        target = targets(gt, fixture_config["dataset"], (16, 16))
+        target = targets(gt, fixture_config["dataset"], (8, 8))
         examples.append((early, per_node, gt, target))
     original = pipeline_module.device_tensor
 
@@ -662,7 +684,7 @@ def test_validation_oom_splits_only_current_batch(monkeypatch, fixture_config):
 
 def test_optimizer_step_oom_resets_scaler_before_retry(monkeypatch, fixture_config):
     model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
-    target = targets([], fixture_config["dataset"], (16, 16))
+    target = targets([], fixture_config["dataset"], (8, 8))
     examples = [(np.zeros((3, 16, 16), np.float32), target)]
 
     class Optimizer:

@@ -175,6 +175,9 @@ def load_config(path):
         raise ValueError("Unknown training mode")
     if t["epochs"] < 1 or not t["seeds"] or t["learning_rate"] <= 0:
         raise ValueError("Invalid training configuration")
+    t.setdefault("output_stride", 2)
+    if t["output_stride"] != 2:
+        raise ValueError("training.output_stride must currently be 2")
     t.setdefault("minimum_epochs", t["epochs"])
     t.setdefault("early_stopping_patience", 0)
     t.setdefault("early_stopping_min_delta", 0.0)
