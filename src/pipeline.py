@@ -489,7 +489,13 @@ def sync(device):
 
 def preprocess(cfg):
     samples = discover(cfg)
-    isolation = audit_split_isolation(samples)
+    if cfg.get("diagnostic_overfit"):
+        isolation = {
+            "samples": len(samples),
+            "status": "intentionally skipped for --overfit diagnostic",
+        }
+    else:
+        isolation = audit_split_isolation(samples)
     validate_node_capacity(samples, cfg)
     counts = defaultdict(int)
     for sample in samples:

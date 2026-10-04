@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import traceback
 
-from src.config import PROJECT, enable_smoke, load_config
+from src.config import PROJECT, enable_overfit, enable_smoke, load_config
 
 
 STAGES = ('check', 'prepare', 'inspect', 'preprocess', 'train', 'evaluate', 'report', 'verify', 'all')
@@ -133,6 +133,11 @@ def main():
         help="use the smallest split-disjoint end-to-end profile",
     )
     parser.add_argument(
+        "--overfit",
+        action="store_true",
+        help="train on and validate against 32 identical frames as a learning diagnostic",
+    )
+    parser.add_argument(
         "--skip-prepare",
         action="store_true",
         help="never download or convert data; use an existing prepared dataset",
@@ -145,8 +150,12 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.smoke and args.overfit:
+        raise ValueError("--smoke and --overfit cannot be combined")
     if args.smoke and not cfg['dataset']['smoke']['enabled']:
         enable_smoke(cfg)
+    if args.overfit:
+        enable_overfit(cfg)
     check_runtime(cfg)
     if args.require_data:
         require_existing_data(cfg)

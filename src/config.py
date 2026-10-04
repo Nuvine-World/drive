@@ -43,6 +43,50 @@ def enable_smoke(cfg):
     return cfg
 
 
+def enable_overfit(cfg, frames=32, epochs=100):
+    """Enable an intentionally leaky tiny-set profile for learning diagnostics.
+
+    This profile is never selected from a YAML file.  It must be requested
+    explicitly on the command line and writes beneath a separate output root.
+    """
+    d, t, e = cfg["dataset"], cfg["training"], cfg["evaluation"]
+    training_session = d["splits"]["train"][0]
+    d["splits"]["train"] = [training_session]
+    d["splits"]["val"] = [training_session]
+    d["smoke"].update(
+        {
+            "enabled": True,
+            "sessions_per_split": 1,
+            "slices_per_session": 1,
+            "frames_per_slice": frames,
+        }
+    )
+    t.update(
+        {
+            "seeds": t["seeds"][:1],
+            "epochs": epochs,
+            "minimum_epochs": epochs,
+            "early_stopping_patience": 0,
+            "modes": ["single"],
+            "node_counts": [1],
+        }
+    )
+    t.setdefault("scheduler", {})["enabled"] = False
+    e.update(
+        {
+            "strategies": ["early"],
+            "node_counts": [1],
+            "subsets_per_count": 1,
+            "iou_thresholds": [0.5],
+        }
+    )
+    cfg["diagnostic_overfit"] = True
+    output = Path(cfg["output"]["root"])
+    if output.name != "overfit":
+        cfg["output"]["root"] = str(output / "overfit")
+    return cfg
+
+
 def load_config(path):
     with open(path) as stream:
         cfg = yaml.safe_load(stream)

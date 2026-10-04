@@ -12,7 +12,7 @@ import pytest
 import torch
 import yaml
 import src.pipeline as pipeline_module
-from src.config import PROJECT, enable_smoke, load_config
+from src.config import PROJECT, enable_overfit, enable_smoke, load_config
 from main import run_pipeline
 from src.data.coinfra import annotations, calibration, discover, load_cloud, rasterize
 from src.data.loader import BoundingBox3D
@@ -335,6 +335,20 @@ def test_smoke_profile_is_small_and_split_disjoint():
     assert cfg["training"]["node_counts"] == [1, 2]
     assert cfg["evaluation"]["node_counts"] == [1, 2]
     assert Path(cfg["output"]["root"]).name == "smoke"
+
+
+def test_overfit_profile_is_isolated_and_intentionally_reuses_training_data():
+    cfg = load_config(PROJECT / "configs/coinfra.yaml")
+    enable_overfit(cfg)
+    assert cfg["diagnostic_overfit"] is True
+    assert cfg["dataset"]["splits"]["train"] == cfg["dataset"]["splits"]["val"]
+    assert cfg["dataset"]["smoke"]["frames_per_slice"] == 32
+    assert cfg["training"]["seeds"] == [42]
+    assert cfg["training"]["modes"] == ["single"]
+    assert cfg["training"]["node_counts"] == [1]
+    assert cfg["evaluation"]["strategies"] == ["early"]
+    assert cfg["evaluation"]["node_counts"] == [1]
+    assert Path(cfg["output"]["root"]).name == "overfit"
 
 
 def test_checkpoint_pruning_keeps_highest_scores(tmp_path):
