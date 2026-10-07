@@ -76,6 +76,8 @@ def enable_overfit(cfg, frames=32, optimization_steps=2000):
         }
     )
     t.setdefault("scheduler", {})["enabled"] = False
+    # Memorization needs the identical frames every epoch.
+    t.setdefault("augmentation", {})["enabled"] = False
     e.update(
         {
             "strategies": ["early"],
@@ -114,6 +116,9 @@ def load_config(path):
         acquisition.setdefault("minimum_free_gb", 35)
         acquisition.setdefault("cleanup_archives", True)
         acquisition.setdefault("retain_frame_stride", 1)
+        acquisition.setdefault("allow_legacy_labels", False)
+        if not isinstance(acquisition["allow_legacy_labels"], bool):
+            raise ValueError("dataset.acquisition.allow_legacy_labels must be boolean")
         if acquisition["minimum_free_gb"] < 1 or acquisition["retain_frame_stride"] < 1:
             raise ValueError("Invalid Adver-City acquisition settings")
     cfg["output"]["root"] = str(resolve(cfg["output"]["root"]))
@@ -144,6 +149,14 @@ def load_config(path):
         or d["objects_per_cell"] < 1
     ):
         raise ValueError("objects_per_cell must be a positive integer")
+    d.setdefault("intensity_max", None)
+    if d["intensity_max"] is not None and (
+        not isinstance(d["intensity_max"], (int, float))
+        or isinstance(d["intensity_max"], bool)
+        or not math.isfinite(d["intensity_max"])
+        or d["intensity_max"] <= 0
+    ):
+        raise ValueError("dataset.intensity_max must be null or a positive number")
     if d["yaw_unit"] not in ("degrees", "radians"):
         raise ValueError("yaw_unit must be degrees or radians")
     if d["frame_stride"] < 1 or d.get("max_timestamp_delta_s", 0) < 0:
@@ -216,6 +229,31 @@ def load_config(path):
         or not 0 < scheduler["minimum_learning_rate"] <= t["learning_rate"]
     ):
         raise ValueError("Invalid training scheduler configuration")
+    augmentation = t.setdefault("augmentation", {})
+    if not isinstance(augmentation, dict):
+        raise ValueError("training.augmentation must be a mapping")
+    augmentation.setdefault("enabled", False)
+    augmentation.setdefault("flip_x", True)
+    augmentation.setdefault("flip_y", True)
+    augmentation.setdefault("rotation_degrees", 22.5)
+    augmentation.setdefault("scale_range", [0.95, 1.05])
+    scale_range = augmentation["scale_range"]
+    if (
+        any(
+            not isinstance(augmentation[key], bool)
+            for key in ("enabled", "flip_x", "flip_y")
+        )
+        or not isinstance(augmentation["rotation_degrees"], (int, float))
+        or not 0 <= augmentation["rotation_degrees"] <= 180
+        or not isinstance(scale_range, list)
+        or len(scale_range) != 2
+        or not all(
+            isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+            for value in scale_range
+        )
+        or scale_range[0] > scale_range[1]
+    ):
+        raise ValueError("Invalid training.augmentation configuration")
     t.setdefault("batch_size", 1)
     t.setdefault("preprocessing_workers", 1)
     t.setdefault("mixed_precision", False)
@@ -320,6 +358,21 @@ def load_config(path):
         raise ValueError("evaluation.batch_size must be positive")
     if any(not 0 < x <= 1 for x in e["iou_thresholds"]):
         raise ValueError("Invalid IoU threshold")
+    class_iou = e.setdefault("class_iou_thresholds", {})
+    if not isinstance(class_iou, dict) or any(
+        label not in d["classes"]
+        or not isinstance(values, list)
+        or len(values) != len(e["iou_thresholds"])
+        or any(
+            not isinstance(value, (int, float)) or not 0 < value <= 1
+            for value in values
+        )
+        for label, values in class_iou.items()
+    ):
+        raise ValueError(
+            "evaluation.class_iou_thresholds must map configured classes to one "
+            "IoU in (0, 1] per evaluation.iou_thresholds level"
+        )
     e.setdefault("ap_score_threshold", e["score_threshold"])
     if (
         not 0 <= e["ap_score_threshold"] <= e["score_threshold"] <= 1

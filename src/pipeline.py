@@ -19,10 +19,20 @@ from collections import defaultdict
 import numpy as np
 import torch
 from src.data.api import annotations, discover, load_cloud, rasterize
-from src.detection.bev import BEVDetector, targets, loss, decode
+from src.data.augmentation import augment_scene, sample_parameters
+from src.detection.bev import (
+    BEVDetector,
+    TargetCollisionError,
+    decode,
+    loss,
+    output_shape,
+    target_cell,
+    targets,
+)
 from src.metrics.evaluation import evaluate, nms
 
-EVALUATION_VERSION = 3
+EVALUATION_VERSION = 4
+MODEL_VERSION = 5
 
 
 def write_json(path, value):
@@ -89,7 +99,12 @@ def plot_training(path, rows):
 
 
 def validate_examples(model, examples, cfg, device, retries):
-    """Validate one prepared batch, splitting only that batch after CUDA OOM."""
+    """Validate one prepared batch, splitting only that batch after CUDA OOM.
+
+    Every frame is scored twice: with all of its nodes (each configured fusion
+    strategy) and with one deterministic single node, so checkpoint selection
+    sees both sides of the cooperation comparison.
+    """
     try:
         early = device_tensor(np.stack([item[0] for item in examples]), device)
         per_node = device_tensor(np.stack([item[1] for item in examples]), device)
@@ -103,12 +118,17 @@ def validate_examples(model, examples, cfg, device, retries):
             enabled=mixed_precision(cfg, device),
         ):
             early_outputs = model(early)
-            batch_loss = float(loss(early_outputs, target))
             batch_size, nodes, channels, height, width = per_node.shape
             encoded = model.encoder(
                 per_node.reshape(batch_size * nodes, channels, height, width)
             )
             features = encoded.reshape(batch_size, nodes, *encoded.shape[1:])
+            single_nodes = torch.as_tensor(
+                [item[4] for item in examples], device=features.device
+            )
+            single = model.heads(
+                features[torch.arange(batch_size, device=features.device), single_nodes]
+            )
             intermediate = (
                 model.heads(features.amax(dim=1))
                 if "intermediate" in cfg["evaluation"]["strategies"]
@@ -124,8 +144,23 @@ def validate_examples(model, examples, cfg, device, retries):
                 if "late" in cfg["evaluation"]["strategies"]
                 else None
             )
-        frames = {strategy: [] for strategy in cfg["evaluation"]["strategies"]}
+        # Per-sample losses keep validation loss independent of batch size,
+        # batch composition, and OOM splitting.
+        losses = []
+        for index in range(batch_size):
+            sample_target = tuple(value[index : index + 1] for value in target)
+            losses.append(
+                0.5
+                * (
+                    float(loss(batch_outputs(early_outputs, index), sample_target))
+                    + float(loss(batch_outputs(single, index), sample_target))
+                )
+            )
+        frames = {strategy: [] for strategy in validation_views(cfg)}
         for index, item in enumerate(examples):
+            frames["single"].append(
+                (decode(batch_outputs(single, index), cfg), item[2])
+            )
             if "early" in frames:
                 frames["early"].append(
                     (decode(batch_outputs(early_outputs, index), cfg), item[2])
@@ -154,7 +189,7 @@ def validate_examples(model, examples, cfg, device, retries):
                         item[2],
                     )
                 )
-        return [batch_loss] * len(examples), frames
+        return losses, frames
     except (torch.OutOfMemoryError, RuntimeError) as error:
         if not cuda_oom(error, device):
             raise
@@ -172,8 +207,7 @@ def validate_examples(model, examples, cfg, device, retries):
         left = validate_examples(model, examples[:midpoint], cfg, device, retries)
         right = validate_examples(model, examples[midpoint:], cfg, device, retries)
         return left[0] + right[0], {
-            strategy: left[1][strategy] + right[1][strategy]
-            for strategy in cfg["evaluation"]["strategies"]
+            view: left[1][view] + right[1][view] for view in validation_views(cfg)
         }
     if retries > 0:
         wait_for_resources(cfg, device, "single-example validation CUDA OOM")
@@ -185,9 +219,17 @@ def validate_examples(model, examples, cfg, device, retries):
     )
 
 
+def validation_views(cfg):
+    return [*cfg["evaluation"]["strategies"], "single"]
+
+
+def _mean(values):
+    return float(np.mean(values)) if values else 0.0
+
+
 def _validation_metrics(model, samples, cfg, device, batch_size):
     losses = []
-    frames = {strategy: [] for strategy in cfg['evaluation']['strategies']}
+    frames = {view: [] for view in validation_views(cfg)}
     grouped = defaultdict(list)
     for sample in samples:
         grouped[len(sample["nodes"])].append(sample)
@@ -209,44 +251,51 @@ def _validation_metrics(model, samples, cfg, device, batch_size):
                 model, examples, cfg, device, retries
             )
             losses.extend(batch_losses)
-            for strategy in frames:
-                frames[strategy].extend(batch_frames[strategy])
-    details, all_aps, all_precisions, all_recalls, all_f1s = {}, [], [], [], []
-    for strategy, strategy_frames in frames.items():
+            for view in frames:
+                frames[view].extend(batch_frames[view])
+    # Selection metrics use the primary IoU level only. Averaging in the
+    # strict level (AP@0.7 is near zero early in training) would halve the
+    # number without adding signal. Every level is still logged.
+    details = {}
+    levels = cfg["evaluation"]["iou_thresholds"]
+    for view, view_frames in frames.items():
         rows = evaluate(
-            strategy_frames,
+            view_frames,
             cfg["dataset"]["classes"],
-            cfg["evaluation"]["iou_thresholds"],
+            levels,
             cfg["evaluation"]["score_threshold"],
+            cfg["evaluation"]["class_iou_thresholds"],
         )
-        aps = [r["ap_3d"] for r in rows if r["ap_3d"] is not None]
-        precisions = [r["precision"] for r in rows if r["precision"] is not None]
-        recalls = [r["recall"] for r in rows if r["recall"] is not None]
-        f1s = [r["f1"] for r in rows if r["f1"] is not None]
-        details[f"val_map_{strategy}"] = float(np.mean(aps)) if aps else 0.0
-        details[f"val_precision_{strategy}"] = (
-            float(np.mean(precisions)) if precisions else 0.0
-        )
-        details[f"val_recall_{strategy}"] = float(np.mean(recalls)) if recalls else 0.0
-        details[f"val_f1_{strategy}"] = float(np.mean(f1s)) if f1s else 0.0
-        primary_iou = cfg["evaluation"]["iou_thresholds"][0]
+        for level, nominal in enumerate(levels):
+            level_rows = [r for r in rows if r["iou_level"] == level]
+            suffix = "" if level == 0 else f"_iou{nominal:g}"
+            for metric, key in (
+                ("map", "ap_3d"),
+                ("precision", "precision"),
+                ("recall", "recall"),
+                ("f1", "f1"),
+            ):
+                details[f"val_{metric}_{view}{suffix}"] = _mean(
+                    [r[key] for r in level_rows if r[key] is not None]
+                )
         for result in rows:
-            if result["iou"] != primary_iou:
+            if result["iou_level"] != 0:
                 continue
             label = result["class"]
-            details[f"val_ap_{strategy}_{label}"] = result["ap_3d"]
-            details[f"val_precision_{strategy}_{label}"] = result["precision"]
-            details[f"val_recall_{strategy}_{label}"] = result["recall"]
-            details[f"val_f1_{strategy}_{label}"] = result["f1"]
-        all_aps.extend(aps)
-        all_precisions.extend(precisions)
-        all_recalls.extend(recalls)
-        all_f1s.extend(f1s)
+            details[f"val_ap_{view}_{label}"] = result["ap_3d"]
+            details[f"val_precision_{view}_{label}"] = result["precision"]
+            details[f"val_recall_{view}_{label}"] = result["recall"]
+            details[f"val_f1_{view}_{label}"] = result["f1"]
+    # Weight the single-node view equally with the cooperative strategies so a
+    # checkpoint is not chosen for multi-node quality alone, which would bias
+    # the single-versus-cooperative comparison made on the test split.
+    strategies = cfg["evaluation"]["strategies"]
+    for metric in ("map", "precision", "recall", "f1"):
+        cooperative = _mean([details[f"val_{metric}_{name}"] for name in strategies])
+        details[f"val_{metric}_cooperative"] = cooperative
+        details[f"val_{metric}"] = 0.5 * (details[f"val_{metric}_single"] + cooperative)
     val_loss = float(np.mean(losses))
-    details['val_precision'] = float(np.mean(all_precisions)) if all_precisions else 0.0
-    details['val_f1'] = float(np.mean(all_f1s)) if all_f1s else 0.0
-    return (val_loss, float(np.mean(all_aps)) if all_aps else 0.0,
-            float(np.mean(all_recalls)) if all_recalls else 0.0, details)
+    return val_loss, details["val_map"], details["val_recall"], details
 
 
 def validation_metrics(model, samples, cfg, device, runtime_batches=None, retries=None):
@@ -256,6 +305,18 @@ def validation_metrics(model, samples, cfg, device, runtime_batches=None, retrie
     return _validation_metrics(
         model, samples, cfg, device, runtime_batches["evaluation"]
     )
+
+
+def patience_progress(history, min_delta):
+    """Early-stopping reference and stale-epoch count implied by ``history``."""
+    reference, stale = -float("inf"), 0
+    for row in history:
+        score = float(row["selection_score"])
+        if score > reference + min_delta:
+            reference, stale = score, 0
+        else:
+            stale += 1
+    return reference, stale
 
 
 def selection_score(cfg, val_loss, val_map, val_recall):
@@ -350,6 +411,7 @@ def signature(cfg):
         "bounds",
         "resolution",
         "objects_per_cell",
+        "intensity_max",
     )
     training_keys = (
         "hidden_channels",
@@ -360,9 +422,10 @@ def signature(cfg):
         "mixed_precision",
         "modes",
         "node_counts",
+        "augmentation",
     )
     return {
-        "model_version": 4,
+        "model_version": MODEL_VERSION,
         "dataset": {
             **{key: d.get(key) for key in dataset_keys},
             "splits": {name: d["splits"][name] for name in ("train", "val")},
@@ -575,26 +638,55 @@ def inspect(cfg):
         split: {label: 0 for label in cfg["dataset"]["classes"]}
         for split in ("train", "val", "test")
     }
+    grid = output_shape(cfg["dataset"], cfg["training"]["output_stride"])
+    crowded = None
     for sample in samples:
         boxes = annotations(sample["gt"], cfg["dataset"])
-        validate_target_centers(boxes, cfg["dataset"], sample["id"])
+        needed = validate_target_centers(boxes, cfg["dataset"], sample["id"], grid)
+        if needed and (crowded is None or needed[0] > crowded[0]):
+            crowded = needed
         annotation_counts[sample["id"]] = len(boxes)
         for box in boxes:
             class_inventory[sample["split"]][box.label] += 1
+    slots = cfg["dataset"].get("objects_per_cell", 1)
+    if crowded is not None and crowded[0] > slots:
+        raise ValueError(
+            f"More than {slots} same-class centers occupy one grid cell during "
+            f"inspection; set dataset.objects_per_cell to at least {crowded[0]}. "
+            f"Most crowded cell: {crowded[1]}"
+        )
     report = []
     seen = set()
+    intensity_sample = []
+    sampler = np.random.default_rng(0)
     for sample in samples:
         key = (sample['session'],sample['slice'])
         if key in seen:
             continue
         seen.add(key)
         clouds = {node:load_cloud(value,cfg['dataset']['bounds']) for node,value in sample['nodes'].items()}
-        report.append({'sample':sample['id'],'points_in_bounds':{n:len(p) for n,p in clouds.items()},
-                       'boxes_in_bounds':annotation_counts[sample['id']]})
+        intensities = np.concatenate(
+            [cloud[:, 3] for cloud in clouds.values()] or [np.zeros(0, np.float32)]
+        )
+        entry = {
+            "sample": sample["id"],
+            "points_in_bounds": {n: len(p) for n, p in clouds.items()},
+            "boxes_in_bounds": annotation_counts[sample["id"]],
+        }
+        if len(intensities):
+            entry["intensity_p50"] = float(np.quantile(intensities, 0.5))
+            entry["intensity_p99"] = float(np.quantile(intensities, 0.99))
+            intensity_sample.append(
+                sampler.choice(
+                    intensities, min(len(intensities), 20_000), replace=False
+                )
+            )
+        report.append(entry)
         if not any(len(p) for p in clouds.values()):
             raise ValueError(
                 f'All transformed points outside configured bounds at {sample["id"]}'
             )
+    validate_intensity_scale(intensity_sample, cfg["dataset"])
     write_json(Path(cfg["output"]["root"]) / "inspection.json", report)
     write_json(Path(cfg["output"]["root"]) / "class_inventory.json", class_inventory)
     print(
@@ -607,30 +699,41 @@ def inputs(sample, nodes, cfg):
     return [load_cloud(sample['nodes'][n],cfg['dataset']['bounds']) for n in nodes]
 
 
-def validate_target_centers(boxes, cfg, sample_id):
-    """Detect unrepresentable same-class centers without allocating dense targets."""
-    classes, bounds, resolution = cfg["classes"], cfg["bounds"], cfg["resolution"]
-    slots = cfg.get("objects_per_cell", 1)
-    occupied = {}
+def validate_target_centers(boxes, cfg, sample_id, shape):
+    """Find the most same-class centers sharing one prediction-grid cell.
+
+    Uses the same binning as ``targets`` on the stride-reduced output grid, so
+    inspection and training agree on what fits ``objects_per_cell``. Returns
+    ``(count, description)`` for the most crowded cell, or None.
+    """
+    occupied = defaultdict(list)
     for box in boxes:
-        ix = int((box.x - bounds[0]) / resolution)
-        iy = int((box.y - bounds[1]) / resolution)
-        key = classes.index(box.label), iy, ix
-        colocated = occupied.setdefault(key, [])
-        if len(colocated) >= slots:
-            previous = colocated[0]
-            raise ValueError(
-                f"More than {slots} same-class centers occupy one grid cell during inspection: "
-                f"sample={sample_id!r}, class={box.label!r}, cell=(x={ix}, y={iy}), "
-                f"resolution={resolution}, first_center=({previous.x:.6f}, {previous.y:.6f}), "
-                f"second_center=({box.x:.6f}, {box.y:.6f})"
-            )
-        colocated.append(box)
+        cell = target_cell(box, cfg, shape)
+        if cell is not None:
+            occupied[cell[:3]].append(box)
+    if not occupied:
+        return None
+    (label, ix, iy), colocated = max(occupied.items(), key=lambda item: len(item[1]))
+    centers = ", ".join(f"({box.x:.3f}, {box.y:.3f})" for box in colocated)
+    return len(colocated), (
+        f"sample={sample_id!r}, class={cfg['classes'][label]!r}, "
+        f"output cell=(x={ix}, y={iy}), centers={centers}"
+    )
 
 
-def tensor_inputs(clouds, cfg, device, mode):
-    bevs = array_inputs(clouds, cfg, mode)
-    return device_tensor(bevs, device)
+def validate_intensity_scale(samples, cfg):
+    """Fail when dataset.intensity_max is grossly wrong for the recorded data."""
+    maximum = cfg.get("intensity_max")
+    if not maximum or not samples:
+        return
+    values = np.concatenate(samples)
+    p99 = float(np.quantile(values, 0.99))
+    if p99 > maximum or p99 < 0.01 * maximum:
+        raise ValueError(
+            f"Point intensity p99={p99:g} (p50={float(np.quantile(values, 0.5)):g}) "
+            f"does not match dataset.intensity_max={maximum:g}; set intensity_max "
+            "to the sensor's full-scale intensity"
+        )
 
 
 def array_inputs(clouds, cfg, mode):
@@ -659,7 +762,10 @@ def training_plan(order, cfg, rng, batch_size=None):
         if model_mode == "adaptive":
             budget = rng.choice(cfg["adaptive_fusion"]["training_budgets"])
             model_mode = f"adaptive@{budget:g}"
-        buckets[(model_mode, len(nodes))].append((sample, model_mode, nodes))
+        augmentation = sample_parameters(rng, cfg["training"]["augmentation"])
+        buckets[(model_mode, len(nodes))].append(
+            (sample, model_mode, nodes, augmentation)
+        )
     batches = []
     size = batch_size or cfg["training"]["batch_size"]
     for plans in buckets.values():
@@ -671,18 +777,27 @@ def training_plan(order, cfg, rng, batch_size=None):
 
 
 def prepare_training_example(plan, cfg):
-    sample, mode, nodes = plan
-    bev = array_inputs(inputs(sample, nodes, cfg), cfg, mode)
+    sample, mode, nodes, augmentation = plan
+    clouds = inputs(sample, nodes, cfg)
+    boxes = annotations(sample["gt"], cfg["dataset"])
+    shape = output_shape(cfg["dataset"], cfg["training"]["output_stride"])
+    if augmentation is not None:
+        moved_clouds, moved_boxes = augment_scene(
+            clouds, boxes, augmentation, cfg["dataset"]
+        )
+        try:
+            target = targets(moved_boxes, cfg["dataset"], shape, sample_id=sample["id"])
+        except TargetCollisionError:
+            # Inspection proved the original labels fit; only the rotation or
+            # scale crowded this cell, so train this sample unaugmented.
+            augmentation = None
+        else:
+            clouds = moved_clouds
+    if augmentation is None:
+        target = targets(boxes, cfg["dataset"], shape, sample_id=sample["id"])
+    bev = array_inputs(clouds, cfg, mode)
     if mode == "early":
         bev = bev[0]
-    stride = cfg["training"]["output_stride"]
-    target_shape = tuple((size + stride - 1) // stride for size in bev.shape[-2:])
-    target = targets(
-        annotations(sample["gt"], cfg["dataset"]),
-        cfg["dataset"],
-        target_shape,
-        sample_id=sample["id"],
-    )
     return bev, target
 
 
@@ -829,14 +944,16 @@ def train_examples(
 
 
 def prepare_validation_example(sample, cfg):
-    clouds = inputs(sample, sorted(sample["nodes"]), cfg)
+    nodes = sorted(sample["nodes"])
+    clouds = inputs(sample, nodes, cfg)
     early = array_inputs(clouds, cfg, "early")[0]
     per_node = array_inputs(clouds, cfg, "intermediate")
     gt = annotations(sample["gt"], cfg["dataset"])
-    stride = cfg["training"]["output_stride"]
-    target_shape = tuple((size + stride - 1) // stride for size in early.shape[-2:])
-    target = targets(gt, cfg["dataset"], target_shape, sample_id=sample["id"])
-    return early, per_node, gt, target
+    shape = output_shape(cfg["dataset"], cfg["training"]["output_stride"])
+    target = targets(gt, cfg["dataset"], shape, sample_id=sample["id"])
+    # The single-node view rotates deterministically through every node.
+    single_node = stable_random_seed("validation-single", sample["id"]) % len(nodes)
+    return early, per_node, gt, target, single_node
 
 
 def submit_validation_batch(executor, samples, cfg):
@@ -958,7 +1075,7 @@ def train(cfg, overwrite=False):
             else None
         )
         best_score, history, start_epoch = -float("inf"), [], 0
-        epochs_without_improvement = 0
+        patience_reference, epochs_without_improvement = -float("inf"), 0
         if (
             not overwrite
             and latest.exists()
@@ -980,23 +1097,9 @@ def train(cfg, overwrite=False):
             start_epoch = int(state["epoch"])
             best_score = float(state["best_score"])
             history = state["history"]
-            if "epochs_without_improvement" in state:
-                epochs_without_improvement = int(state["epochs_without_improvement"])
-            else:
-                # Recover early-stopping progress from legacy history. The
-                # historical best may improve by less than min_delta, so track
-                # the patience reference independently of checkpoint selection.
-                patience_best = -float("inf")
-                for historical_row in history:
-                    historical_score = float(historical_row["selection_score"])
-                    if (
-                        historical_score
-                        > patience_best + cfg["training"]["early_stopping_min_delta"]
-                    ):
-                        patience_best = historical_score
-                        epochs_without_improvement = 0
-                    else:
-                        epochs_without_improvement += 1
+            patience_reference, epochs_without_improvement = patience_progress(
+                history, cfg["training"]["early_stopping_min_delta"]
+            )
             if scheduler is not None:
                 if state.get("scheduler") is not None:
                     scheduler.load_state_dict(state["scheduler"])
@@ -1053,7 +1156,6 @@ def train(cfg, overwrite=False):
             if not all(np.isfinite(v) for v in (val, val_map, val_recall)):
                 raise ValueError('Nonfinite validation metric')
             score = selection_score(cfg, val, val_map, val_recall)
-            previous_best_score = best_score
             row = {
                 "timestamp_utc": utc_now(),
                 "seed": seed,
@@ -1086,11 +1188,11 @@ def train(cfg, overwrite=False):
                 best_tmp = path.with_suffix('.tmp')
                 shutil.copyfile(candidate, best_tmp)
                 best_tmp.replace(path)
-            if (
-                score
-                > previous_best_score + cfg["training"]["early_stopping_min_delta"]
-            ):
-                epochs_without_improvement = 0
+            # The patience reference moves only on gains above min_delta, so a
+            # resumed run (rebuilt from history) stops at the same epoch as an
+            # uninterrupted one.
+            if score > patience_reference + cfg["training"]["early_stopping_min_delta"]:
+                patience_reference, epochs_without_improvement = score, 0
             else:
                 epochs_without_improvement += 1
             if scheduler is not None:
@@ -1101,7 +1203,6 @@ def train(cfg, overwrite=False):
                 plot_training(path.parent / f"training_curves_seed_{seed}.png", history)
             kept_epochs = ",".join(str(item[1]) for item in retained)
             primary_strategy = cfg["evaluation"]["strategies"][0]
-            primary_iou = cfg["evaluation"]["iou_thresholds"][0]
             class_metrics = {}
             for metric in ("ap", "precision", "recall"):
                 class_metrics[metric] = ",".join(
@@ -1110,11 +1211,15 @@ def train(cfg, overwrite=False):
                 )
             print(
                 f'seed={seed} epoch={epoch+1} train={row["train_loss"]:.4f} '
-                f'val={val:.4f} mAP={val_map:.4f} precision={row["val_precision"]:.4f} '
+                f"val={val:.4f} mAP={val_map:.4f} "
+                f'(single={row["val_map_single"]:.4f} '
+                f'cooperative={row["val_map_cooperative"]:.4f}) '
+                f'precision={row["val_precision"]:.4f} '
                 f'recall={val_recall:.4f} F1={row["val_f1"]:.4f} '
-                f"score={score:.4f} AP@{primary_iou:.2f}=[{class_metrics['ap']}] "
-                f"P@{primary_iou:.2f}=[{class_metrics['precision']}] "
-                f"R@{primary_iou:.2f}=[{class_metrics['recall']}] "
+                f"score={score:.4f} {primary_strategy} IoU-level-0 "
+                f"AP=[{class_metrics['ap']}] "
+                f"P=[{class_metrics['precision']}] "
+                f"R=[{class_metrics['recall']}] "
                 f"kept=[{kept_epochs}]",
                 flush=True,
             )
@@ -1223,6 +1328,26 @@ def adaptive_payload(feature_nodes, selected, cfg):
     return total
 
 
+def late_payload(boxes, cfg):
+    """Compressed bytes of the local boxes a node sends at the operating point.
+
+    Lower-scoring candidates are kept locally for the AP ranking but would not
+    be transmitted by a deployed node, so they do not count toward payload.
+    """
+    threshold = cfg["evaluation"]["score_threshold"]
+    return payload(
+        np.array(
+            [
+                list(box.to_array())
+                + [cfg["dataset"]["classes"].index(box.label), box.score]
+                for box in boxes
+                if box.score >= threshold
+            ],
+            dtype=np.float32,
+        ).reshape(-1, 9)
+    )
+
+
 def adaptive_selector(strategy):
     base = strategy.split("@", 1)[0]
     return base.split("_", 1)[1] if "_" in base else "learned"
@@ -1231,60 +1356,6 @@ def adaptive_selector(strategy):
 def stable_random_seed(*parts):
     digest = hashlib.sha256("\0".join(map(str, parts)).encode()).digest()
     return int.from_bytes(digest[:8], "little") % (2**63 - 1)
-
-
-def infer(model, clouds, cfg, device, strategy):
-    base_strategy, _, budget_text = strategy.partition("@")
-    bev = tensor_inputs(clouds,cfg,device,strategy)
-    sync(device)
-    start = time.perf_counter()
-    with torch.no_grad():
-        features = model.encoder(bev)
-        if base_strategy == "intermediate":
-            output = model.heads(features.amax(dim=0, keepdim=True))
-            boxes = decode(output, cfg)
-        elif base_strategy.startswith("adaptive"):
-            budget = float(
-                budget_text or cfg["adaptive_fusion"]["evaluation_budgets"][0]
-            )
-            fused, selected = model.adaptive_features(
-                features[None], budget, adaptive_selector(strategy)
-            )
-            boxes = decode(model.heads(fused), cfg)
-        elif base_strategy == "late":
-            local = [decode(model.heads(f[None]), cfg) for f in features]
-            boxes = nms(
-                [b for group in local for b in group],
-                cfg["evaluation"]["nms_iou"],
-                cfg["evaluation"]["late_max_detections"],
-            )
-        else:
-            boxes = decode(model.heads(features),cfg)
-    sync(device)
-    elapsed_ms = (time.perf_counter() - start) * 1000
-    if base_strategy == "intermediate":
-        representation = sum(
-            feature_payload(f, cfg) for f in features[1:].detach().cpu().numpy()
-        )
-    elif base_strategy.startswith("adaptive"):
-        representation = adaptive_payload(features, selected[0], cfg)
-    elif base_strategy == "late":
-        representation = sum(
-            payload(
-                np.array(
-                    [
-                        list(b.to_array())
-                        + [cfg["dataset"]["classes"].index(b.label), b.score]
-                        for b in group
-                    ],
-                    dtype=np.float32,
-                ).reshape(-1, 9)
-            )
-            for group in local[1:]
-        )
-    else:
-        representation = sum(payload(p) for p in clouds[1:])
-    return boxes,elapsed_ms,representation
 
 
 def infer_batch(
@@ -1412,24 +1483,7 @@ def infer_batch(
                         )
                         serialization_start = time.perf_counter()
                         representations.append(
-                            sum(
-                                payload(
-                                    np.array(
-                                        [
-                                            list(box.to_array())
-                                            + [
-                                                cfg["dataset"]["classes"].index(
-                                                    box.label
-                                                ),
-                                                box.score,
-                                            ]
-                                            for box in group
-                                        ],
-                                        dtype=np.float32,
-                                    ).reshape(-1, 9)
-                                )
-                                for group in local[1:]
-                            )
+                            sum(late_payload(group, cfg) for group in local[1:])
                         )
                         serialization_seconds += (
                             time.perf_counter() - serialization_start
@@ -1522,14 +1576,20 @@ def infer_batch(
     )
 
 
-def network_rows(cfg, base, raw_bytes, representation_bytes):
+def network_rows(cfg, base, cloud_bytes, representation_bytes):
+    """Analytical latency rows.
+
+    Edge processing runs at the receiving node, so only collaborators send
+    ``representation_bytes``. Cloud processing needs every participating
+    node, the receiver included, to upload its raw points (``cloud_bytes``).
+    """
     net = cfg["deployment_assumptions"]
     base_strategy = base["strategy"].split("@", 1)[0]
     if base_strategy.startswith("adaptive"):
         base_strategy = "adaptive"
     rows = []
     for placement in ("edge", "cloud"):
-        transmitted = representation_bytes if placement == "edge" else raw_bytes
+        transmitted = representation_bytes if placement == "edge" else cloud_bytes
         for bandwidth in net["bandwidths_mbps"]:
             transmit_ms = transmitted * 8 / (bandwidth * 1e6) * 1000
             total = (
@@ -1594,35 +1654,45 @@ def simulate_fifo_latency(
     }
 
 
-def write_latency_analysis(cfg, traces, output):
-    write_csv(output / "latency_trace.csv", traces)
-    grouped = defaultdict(list)
-    keys = ("seed", "session", "weather", "nodes", "node_count", "strategy")
-    for row in traces:
-        grouped[tuple(row[key] for key in keys)].append(row)
+TRACE_KEYS = ("seed", "session", "weather", "nodes", "node_count", "strategy")
+TRACE_FIELDS = (
+    *TRACE_KEYS[:3],
+    "sample",
+    *TRACE_KEYS[3:],
+    "load_ms",
+    "preprocessing_ms",
+    "inference_decode_ms",
+    "serialization_ms",
+    "cloud_serialization_ms",
+    "local_pipeline_ms",
+    "cloud_raw_bytes",
+    "representation_bytes",
+)
+
+
+def latency_tail_rows(cfg, grouped):
+    """FIFO tail-latency summaries for measured per-frame service traces.
+
+    ``grouped`` maps a ``TRACE_KEYS`` tuple to per-frame tuples of
+    ``(inference_decode_ms, serialization_ms, cloud_serialization_ms,
+    representation_bytes, cloud_raw_bytes)``.
+    """
     summaries = []
     net, experiment = cfg["deployment_assumptions"], cfg["latency_experiment"]
     for key, rows in sorted(grouped.items()):
         for placement in ("edge", "cloud"):
             for bandwidth in net["bandwidths_mbps"]:
                 service = []
-                for row in rows:
-                    payload_bytes = (
-                        float(row["representation_bytes"])
-                        if placement == "edge"
-                        else float(row["raw_bytes"])
-                    )
+                for compute, serialization, cloud_ms, sent, uploaded in rows:
+                    payload_bytes = sent if placement == "edge" else uploaded
                     tx = payload_bytes * 8 / (bandwidth * 1e6) * 1000
-                    serialization = (
-                        float(row["serialization_ms"])
-                        if placement == "edge"
-                        else float(row["raw_serialization_ms"])
-                    )
                     # Replay measured receiver compute rather than a configured
                     # constant. Loading and sender preprocessing remain outside
                     # the shared receiver queue.
                     service.append(
-                        float(row["inference_decode_ms"]) + serialization + tx
+                        compute
+                        + (serialization if placement == "edge" else cloud_ms)
+                        + tx
                     )
                 for burst in experiment["burst_multipliers"]:
                     arrivals = finite_burst_arrivals(
@@ -1637,7 +1707,7 @@ def write_latency_analysis(cfg, traces, output):
                             arrival_times_ms=arrivals,
                         )
                         summaries.append(
-                            dict(zip(keys, key))
+                            dict(zip(TRACE_KEYS, key))
                             | {
                                 "placement": placement,
                                 "bandwidth_mbps": bandwidth,
@@ -1652,7 +1722,239 @@ def write_latency_analysis(cfg, traces, output):
                                 **result,
                             }
                         )
-    write_csv(output / "latency_tail_summary.csv", summaries)
+    return summaries
+
+
+def concatenate_csv(parts, destination):
+    """Stream CSV parts into one file without loading them all into memory."""
+    fieldnames = []
+    for part in parts:
+        with part.open(newline="") as stream:
+            for name in next(csv.reader(stream), []):
+                if name not in fieldnames:
+                    fieldnames.append(name)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    with temporary.open("w", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        if fieldnames:
+            writer.writeheader()
+        for part in parts:
+            with part.open(newline="") as stream:
+                writer.writerows(csv.DictReader(stream))
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(destination)
+
+
+def evaluation_strategies(cfg):
+    strategies = []
+    for configured in cfg["evaluation"]["strategies"]:
+        if configured == "adaptive":
+            budgets = cfg["adaptive_fusion"]["evaluation_budgets"]
+            strategies.extend(f"adaptive@{budget:g}" for budget in budgets)
+            strategies.extend(
+                f"adaptive_{selector}@{budget:g}"
+                for selector in cfg["adaptive_fusion"]["ablations"]
+                for budget in budgets
+            )
+        else:
+            strategies.append(configured)
+    return strategies
+
+
+def evaluation_runs(nodes, strategies):
+    """Computations for one node group, each with the strategy labels it serves.
+
+    Receiver rotation matters only to asymmetric adaptive fusion, so other
+    strategies run once per unordered subset. With one node every strategy
+    reduces to the same single-node detector, so it runs once and is reported
+    under every strategy label.
+    """
+    labels = [
+        strategy
+        for strategy in strategies
+        if strategy.startswith("adaptive") or tuple(nodes) == tuple(sorted(nodes))
+    ]
+    if len(nodes) == 1:
+        return [("early", labels)]
+    return [(label, [label]) for label in labels]
+
+
+def evaluate_session(model, cfg, device, seed, session, frames, warmed, trace_writer):
+    """Evaluate one test session; stream traces and return metrics, costs, tails."""
+    strategies = evaluation_strategies(cfg)
+    bounds = cfg["dataset"]["bounds"]
+    common = set.intersection(*(set(f["nodes"]) for f in frames))
+    groups = choose_groups(common, cfg["evaluation"])
+    buckets, costs, service = defaultdict(list), defaultdict(list), defaultdict(list)
+    batch_size = cfg["latency_experiment"]["profile_batch_size"]
+    for start in range(0, len(frames), batch_size):
+        frame_chunk = frames[start : start + batch_size]
+        load_start = time.perf_counter()
+        loaded = [
+            (
+                annotations(sample["gt"], cfg["dataset"]),
+                {n: load_cloud(sample["nodes"][n], bounds) for n in common},
+            )
+            for sample in frame_chunk
+        ]
+        load_ms = (time.perf_counter() - load_start) * 1000 / len(frame_chunk)
+        prepared = []
+        for gt, cloud_by_node in loaded:
+            raw, raw_ms, bev, bev_ms = {}, {}, {}, {}
+            for node, cloud in cloud_by_node.items():
+                started = time.perf_counter()
+                raw[node] = payload(cloud)
+                raw_ms[node] = (time.perf_counter() - started) * 1000
+                started = time.perf_counter()
+                bev[node] = rasterize(cloud, cfg["dataset"])
+                bev_ms[node] = (time.perf_counter() - started) * 1000
+            prepared.append((gt, cloud_by_node, raw, raw_ms, bev, bev_ms))
+        for nodes in groups:
+            cloud_batches = [[item[1][n] for n in nodes] for item in prepared]
+            # Edge early fusion: collaborators send raw points to the receiver.
+            collaborator_raw = [sum(item[2][n] for n in nodes[1:]) for item in prepared]
+            # Cloud placement: every participating node uploads raw points.
+            cloud_raw = [sum(item[2][n] for n in nodes) for item in prepared]
+            cloud_ms = [sum(item[3][n] for n in nodes) for item in prepared]
+            for strategy, labels in evaluation_runs(nodes, strategies):
+                random_seeds = [
+                    stable_random_seed(seed, sample["id"], *nodes, strategy)
+                    for sample in frame_chunk
+                ]
+                prepared_bevs = preprocessing_overheads = None
+                if strategy != "early" or len(nodes) == 1:
+                    prepared_bevs = [
+                        np.stack([item[4][node] for node in nodes]) for item in prepared
+                    ]
+                    preprocessing_overheads = [
+                        sum(item[5][node] for node in nodes) for item in prepared
+                    ]
+                warmup_key = (strategy, len(nodes), len(cloud_batches))
+                if warmup_key not in warmed:
+                    infer_batch(
+                        model,
+                        cloud_batches[:1],
+                        cfg,
+                        device,
+                        strategy,
+                        collaborator_raw[:1],
+                        random_seeds=random_seeds[:1],
+                        prepared_bevs=(
+                            prepared_bevs[:1] if prepared_bevs is not None else None
+                        ),
+                        preprocessing_overheads_ms=(
+                            preprocessing_overheads[:1]
+                            if preprocessing_overheads is not None
+                            else None
+                        ),
+                    )
+                    warmed.add(warmup_key)
+                results = infer_batch(
+                    model,
+                    cloud_batches,
+                    cfg,
+                    device,
+                    strategy,
+                    collaborator_raw,
+                    random_seeds=random_seeds,
+                    prepared_bevs=prepared_bevs,
+                    preprocessing_overheads_ms=preprocessing_overheads,
+                )
+                for sample, item, uploaded, upload_ms, result in zip(
+                    frame_chunk, prepared, cloud_raw, cloud_ms, results
+                ):
+                    preds, elapsed, representation, preprocessing, serialization = (
+                        result
+                    )
+                    for label in labels:
+                        buckets[(nodes, label)].append((preds, item[0]))
+                        costs[(nodes, label)].append(
+                            (
+                                elapsed,
+                                uploaded,
+                                representation,
+                                preprocessing,
+                                serialization,
+                            )
+                        )
+                        key = (
+                            seed,
+                            session,
+                            sample["weather"],
+                            ",".join(nodes),
+                            len(nodes),
+                            label,
+                        )
+                        service[key].append(
+                            (
+                                elapsed,
+                                serialization,
+                                upload_ms,
+                                representation,
+                                uploaded,
+                            )
+                        )
+                        trace_writer.writerow(
+                            dict(zip(TRACE_KEYS, key))
+                            | {
+                                "sample": sample["id"],
+                                "load_ms": load_ms,
+                                "preprocessing_ms": preprocessing,
+                                "inference_decode_ms": elapsed,
+                                "serialization_ms": serialization,
+                                "cloud_serialization_ms": upload_ms,
+                                "local_pipeline_ms": load_ms
+                                + preprocessing
+                                + elapsed
+                                + serialization,
+                                "cloud_raw_bytes": uploaded,
+                                "representation_bytes": representation,
+                            }
+                        )
+    metrics, cost_rows = [], []
+    for (nodes, strategy), values in buckets.items():
+        base = {
+            "seed": seed,
+            "session": session,
+            "weather": frames[0]["weather"],
+            "nodes": ",".join(nodes),
+            "node_count": len(nodes),
+            "strategy": strategy,
+        }
+        metrics.extend(
+            base | row
+            for row in evaluate(
+                values,
+                cfg["dataset"]["classes"],
+                cfg["evaluation"]["iou_thresholds"],
+                cfg["evaluation"]["score_threshold"],
+                cfg["evaluation"]["class_iou_thresholds"],
+            )
+        )
+        measured = np.array(costs[(nodes, strategy)])
+        cost_base = base | {
+            "frames": len(values),
+            "inference_decode_ms_mean": float(measured[:, 0].mean()),
+            "inference_decode_ms_p95": float(np.quantile(measured[:, 0], 0.95)),
+            "preprocessing_ms_mean": float(measured[:, 3].mean()),
+            "serialization_ms_mean": float(measured[:, 4].mean()),
+        }
+        cost_rows.extend(
+            network_rows(
+                cfg,
+                cost_base,
+                float(measured[:, 1].mean()),
+                float(measured[:, 2].mean()),
+            )
+        )
+    print(
+        f"Evaluated seed={seed} session={session}, frames={len(frames)}, "
+        f"subsets={len(groups)}",
+        flush=True,
+    )
+    return metrics, cost_rows, latency_tail_rows(cfg, service)
 
 
 def run_evaluation(cfg):
@@ -1661,7 +1963,7 @@ def run_evaluation(cfg):
     for sample in samples:
         sessions[sample['session']].append(sample)
     output, device = Path(cfg['output']['root']),device_for(cfg)
-    all_metrics, all_costs, all_traces = [], [], []
+    all_metrics, all_costs, trace_parts, tail_parts = [], [], [], []
     for seed in cfg['training']['seeds']:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -1678,8 +1980,11 @@ def run_evaluation(cfg):
         model.eval()
         warmed = set()
         for session, frames in sessions.items():
-            part_path = output / "eval_parts" / f"seed_{seed}" / f"{session}.json"
-            if part_path.exists():
+            part_directory = output / "eval_parts" / f"seed_{seed}"
+            part_path = part_directory / f"{session}.json"
+            trace_path = part_directory / f"{session}.traces.csv"
+            tail_path = part_directory / f"{session}.latency_tail.csv"
+            if part_path.exists() and trace_path.exists() and tail_path.exists():
                 try:
                     part = json.loads(part_path.read_text())
                 except (OSError, ValueError) as error:
@@ -1691,247 +1996,45 @@ def run_evaluation(cfg):
                     if part.get("signature") == evaluation_signature:
                         all_metrics.extend(part["metrics"])
                         all_costs.extend(part["costs"])
-                        all_traces.extend(part.get("traces", []))
+                        trace_parts.append(trace_path)
+                        tail_parts.append(tail_path)
                         print(
                             f"Resumed evaluation seed={seed} session={session}",
                             flush=True,
                         )
                         continue
-            metrics_start, costs_start, traces_start = (
-                len(all_metrics),
-                len(all_costs),
-                len(all_traces),
-            )
-            common = set.intersection(*(set(f['nodes']) for f in frames))
-            groups = choose_groups(common,cfg['evaluation'])
-            buckets = defaultdict(list)
-            costs = defaultdict(list)
-            batch_size = cfg["latency_experiment"]["profile_batch_size"]
-            for start in range(0, len(frames), batch_size):
-                frame_chunk = frames[start : start + batch_size]
-                load_start = time.perf_counter()
-                prepared = []
-                for sample in frame_chunk:
-                    cloud_by_node = {
-                        n: load_cloud(sample["nodes"][n], cfg["dataset"]["bounds"])
-                        for n in common
-                    }
-                    prepared.append(
-                        (
-                            annotations(sample["gt"], cfg["dataset"]),
-                            cloud_by_node,
-                            None,
-                            None,
-                            None,
-                        )
-                    )
-                load_ms = (time.perf_counter() - load_start) * 1000 / len(frame_chunk)
-                raw_serialization_start = time.perf_counter()
-                prepared = [
-                    (
-                        gt,
-                        cloud_by_node,
-                        {node: payload(cloud) for node, cloud in cloud_by_node.items()},
-                        None,
-                        None,
-                    )
-                    for gt, cloud_by_node, _, _, _ in prepared
-                ]
-                raw_serialization_ms = (
-                    (time.perf_counter() - raw_serialization_start)
-                    * 1000
-                    / len(frame_chunk)
+            # Traces are streamed to disk: a full sweep produces millions of rows.
+            part_directory.mkdir(parents=True, exist_ok=True)
+            temporary = trace_path.with_name(f".{trace_path.name}.{os.getpid()}.tmp")
+            with temporary.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=TRACE_FIELDS)
+                writer.writeheader()
+                metrics, costs, tails = evaluate_session(
+                    model, cfg, device, seed, session, frames, warmed, writer
                 )
-                cached = []
-                for gt, cloud_by_node, raw_by_node, _, _ in prepared:
-                    bev_by_node, bev_ms_by_node = {}, {}
-                    for node, cloud in cloud_by_node.items():
-                        raster_start = time.perf_counter()
-                        bev_by_node[node] = rasterize(cloud, cfg["dataset"])
-                        bev_ms_by_node[node] = (
-                            time.perf_counter() - raster_start
-                        ) * 1000
-                    cached.append(
-                        (gt, cloud_by_node, raw_by_node, bev_by_node, bev_ms_by_node)
-                    )
-                prepared = cached
-                for nodes in groups:
-                    cloud_batches = [
-                        [cloud_by_node[n] for n in nodes]
-                        for _, cloud_by_node, _, _, _ in prepared
-                    ]
-                    raw_batch = [
-                        sum(raw_by_node[node] for node in nodes[1:])
-                        for _, _, raw_by_node, _, _ in prepared
-                    ]
-                    strategies = []
-                    for configured in cfg["evaluation"]["strategies"]:
-                        if configured == "adaptive":
-                            strategies.extend(
-                                f"adaptive@{budget:g}"
-                                for budget in cfg["adaptive_fusion"][
-                                    "evaluation_budgets"
-                                ]
-                            )
-                            strategies.extend(
-                                f"adaptive_{selector}@{budget:g}"
-                                for selector in cfg["adaptive_fusion"]["ablations"]
-                                for budget in cfg["adaptive_fusion"][
-                                    "evaluation_budgets"
-                                ]
-                            )
-                        else:
-                            strategies.append(configured)
-                    for strategy in strategies:
-                        # Receiver rotation matters only to asymmetric adaptive
-                        # fusion. Avoid repeating receiver-invariant baselines.
-                        if not strategy.startswith("adaptive") and tuple(
-                            nodes
-                        ) != tuple(sorted(nodes)):
-                            continue
-                        key = (nodes, strategy)
-                        random_seeds = [
-                            stable_random_seed(seed, sample["id"], *nodes, strategy)
-                            for sample in frame_chunk
-                        ]
-                        prepared_bevs = None
-                        preprocessing_overheads = None
-                        if not strategy.startswith("early"):
-                            prepared_bevs = [
-                                np.stack([bev_by_node[node] for node in nodes])
-                                for _, _, _, bev_by_node, _ in prepared
-                            ]
-                            preprocessing_overheads = [
-                                sum(bev_ms_by_node[node] for node in nodes)
-                                for _, _, _, _, bev_ms_by_node in prepared
-                            ]
-                        warmup_key = (strategy, len(nodes), len(cloud_batches))
-                        if warmup_key not in warmed:
-                            infer_batch(
-                                model,
-                                cloud_batches[:1],
-                                cfg,
-                                device,
-                                strategy,
-                                raw_batch[:1],
-                                random_seeds=random_seeds[:1],
-                                prepared_bevs=(
-                                    prepared_bevs[:1]
-                                    if prepared_bevs is not None
-                                    else None
-                                ),
-                                preprocessing_overheads_ms=(
-                                    preprocessing_overheads[:1]
-                                    if preprocessing_overheads is not None
-                                    else None
-                                ),
-                            )
-                            warmed.add(warmup_key)
-                        results = infer_batch(
-                            model,
-                            cloud_batches,
-                            cfg,
-                            device,
-                            strategy,
-                            raw_batch,
-                            random_seeds=random_seeds,
-                            prepared_bevs=prepared_bevs,
-                            preprocessing_overheads_ms=preprocessing_overheads,
-                        )
-                        for sample, (gt, _, _, _, _), raw_bytes, result in zip(
-                            frame_chunk, prepared, raw_batch, results
-                        ):
-                            (
-                                preds,
-                                elapsed,
-                                representation,
-                                preprocessing,
-                                serialization,
-                            ) = result
-                            buckets[key].append((preds, gt))
-                            costs[key].append(
-                                (
-                                    elapsed,
-                                    raw_bytes,
-                                    representation,
-                                    preprocessing,
-                                    serialization,
-                                )
-                            )
-                            all_traces.append(
-                                {
-                                    "seed": seed,
-                                    "session": session,
-                                    "weather": sample["weather"],
-                                    "sample": sample["id"],
-                                    "nodes": ",".join(nodes),
-                                    "node_count": len(nodes),
-                                    "strategy": strategy,
-                                    "load_ms": load_ms,
-                                    "preprocessing_ms": preprocessing,
-                                    "inference_decode_ms": elapsed,
-                                    "serialization_ms": serialization,
-                                    "raw_serialization_ms": raw_serialization_ms,
-                                    "local_pipeline_ms": load_ms
-                                    + preprocessing
-                                    + elapsed
-                                    + serialization,
-                                    "raw_bytes": raw_bytes,
-                                    "representation_bytes": representation,
-                                }
-                            )
-            for (nodes, strategy), values in buckets.items():
-                base = {
-                    "seed": seed,
-                    "session": session,
-                    "weather": frames[0]["weather"],
-                    "nodes": ",".join(nodes),
-                    "node_count": len(nodes),
-                    "strategy": strategy,
-                }
-                all_metrics.extend(
-                    base | row
-                    for row in evaluate(
-                        values,
-                        cfg["dataset"]["classes"],
-                        cfg["evaluation"]["iou_thresholds"],
-                        cfg["evaluation"]["score_threshold"],
-                    )
-                )
-                measured = np.array(costs[(nodes, strategy)])
-                cost_base = base | {
-                    "frames": len(values),
-                    "inference_decode_ms_mean": float(measured[:, 0].mean()),
-                    "inference_decode_ms_p95": float(np.quantile(measured[:, 0], 0.95)),
-                    "preprocessing_ms_mean": float(measured[:, 3].mean()),
-                    "serialization_ms_mean": float(measured[:, 4].mean()),
-                }
-                all_costs.extend(
-                    network_rows(
-                        cfg,
-                        cost_base,
-                        float(measured[:, 1].mean()),
-                        float(measured[:, 2].mean()),
-                    )
-                )
-            print(
-                f"Evaluated seed={seed} session={session}, frames={len(frames)}, subsets={len(groups)}",
-                flush=True,
-            )
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(trace_path)
+            write_csv(tail_path, tails)
+            # The JSON part is written last; it marks the session as complete.
             write_json(
                 part_path,
                 {
                     "signature": evaluation_signature,
                     "seed": seed,
                     "session": session,
-                    "metrics": all_metrics[metrics_start:],
-                    "costs": all_costs[costs_start:],
-                    "traces": all_traces[traces_start:],
+                    "metrics": metrics,
+                    "costs": costs,
                 },
             )
+            all_metrics.extend(metrics)
+            all_costs.extend(costs)
+            trace_parts.append(trace_path)
+            tail_parts.append(tail_path)
     write_csv(output / "accuracy.csv", all_metrics)
     write_csv(output / "latency_communication.csv", all_costs)
-    write_latency_analysis(cfg, all_traces, output)
+    concatenate_csv(trace_parts, output / "latency_trace.csv")
+    concatenate_csv(tail_parts, output / "latency_tail_summary.csv")
     return all_metrics
 
 
@@ -1947,7 +2050,8 @@ def report(cfg):
 
     metric_names = ('ap_3d','precision','recall','f1','mean_matched_iou_3d',
                     'mean_center_error_m','mean_yaw_error_deg','mean_size_iou')
-    dimensions = ('weather','node_count','strategy','class','iou')
+    # Thresholds may differ by class, so groups across classes use the IoU level.
+    dimensions = ("weather", "node_count", "strategy", "class", "iou_level", "iou")
     aggregates = defaultdict(list)
     for row in accuracy:
         if number(row, 'ap_3d') is not None:
@@ -1970,36 +2074,67 @@ def report(cfg):
     write_csv(output/'accuracy_summary.csv',summary)
 
     overview_groups = defaultdict(list)
-    overview_dimensions = ('weather','node_count','strategy','iou')
+    overview_dimensions = ("weather", "node_count", "strategy", "iou_level")
     for row in accuracy:
         if number(row, 'ap_3d') is not None:
             overview_groups[tuple(row[k] for k in overview_dimensions)].append(row)
     overview = []
     for key, rows in sorted(overview_groups.items()):
-        tp = sum(int(row['true_positives']) for row in rows)
-        fp = sum(int(row['false_positives']) for row in rows)
-        fn = sum(int(row['false_negatives']) for row in rows)
-        macro = lambda name: float(np.mean([number(row,name) for row in rows]))
-        micro_precision = tp/(tp+fp) if tp+fp else 0.0
-        micro_recall = tp/(tp+fn) if tp+fn else 0.0
-        micro_f1 = (2*micro_precision*micro_recall/(micro_precision+micro_recall)
-                    if micro_precision+micro_recall else 0.0)
-        matched = [row for row in rows if number(row,'mean_matched_iou_3d') is not None]
-        matched_count = sum(int(row['true_positives']) for row in matched)
-        weighted = lambda name: (sum(number(row,name)*int(row['true_positives']) for row in matched)/matched_count
-                                 if matched_count else None)
-        overview.append(dict(zip(overview_dimensions,key)) | {
-            'map_3d_macro':macro('ap_3d'),'precision_macro':macro('precision'),
-            'recall_macro':macro('recall'),'f1_macro':macro('f1'),
-            'precision_micro':micro_precision,'recall_micro':micro_recall,'f1_micro':micro_f1,
-            'true_positives':tp,'false_positives':fp,'false_negatives':fn,
-            'mean_matched_iou_3d':weighted('mean_matched_iou_3d'),
-            'mean_center_error_m':weighted('mean_center_error_m'),
-            'mean_yaw_error_deg':weighted('mean_yaw_error_deg'),
-            'mean_size_iou':weighted('mean_size_iou'),'class_observations':len(rows)})
-    write_csv(output/'metrics_overview.csv',overview)
+        tp = sum(int(row["true_positives"]) for row in rows)
+        fp = sum(int(row["false_positives"]) for row in rows)
+        fn = sum(int(row["false_negatives"]) for row in rows)
+        macro = lambda name: float(np.mean([number(row, name) for row in rows]))
+        micro_precision = tp / (tp + fp) if tp + fp else 0.0
+        micro_recall = tp / (tp + fn) if tp + fn else 0.0
+        micro_f1 = (
+            2 * micro_precision * micro_recall / (micro_precision + micro_recall)
+            if micro_precision + micro_recall
+            else 0.0
+        )
+        matched = [
+            row for row in rows if number(row, "mean_matched_iou_3d") is not None
+        ]
+        matched_count = sum(int(row["true_positives"]) for row in matched)
+        weighted = lambda name: (
+            sum(number(row, name) * int(row["true_positives"]) for row in matched)
+            / matched_count
+            if matched_count
+            else None
+        )
+        overview.append(
+            dict(zip(overview_dimensions, key))
+            | {
+                "map_3d_macro": macro("ap_3d"),
+                "precision_macro": macro("precision"),
+                "recall_macro": macro("recall"),
+                "f1_macro": macro("f1"),
+                "precision_micro": micro_precision,
+                "recall_micro": micro_recall,
+                "f1_micro": micro_f1,
+                "true_positives": tp,
+                "false_positives": fp,
+                "false_negatives": fn,
+                "mean_matched_iou_3d": weighted("mean_matched_iou_3d"),
+                "mean_center_error_m": weighted("mean_center_error_m"),
+                "mean_yaw_error_deg": weighted("mean_yaw_error_deg"),
+                "mean_size_iou": weighted("mean_size_iou"),
+                "class_observations": len(rows),
+                "iou_thresholds": ";".join(
+                    sorted({f"{row['class']}:{row['iou']}" for row in rows})
+                ),
+            }
+        )
+    write_csv(output / "metrics_overview.csv", overview)
 
-    comparison_dimensions = ("seed", "session", "weather", "strategy", "class", "iou")
+    comparison_dimensions = (
+        "seed",
+        "session",
+        "weather",
+        "strategy",
+        "class",
+        "iou_level",
+        "iou",
+    )
     single_nodes = defaultdict(dict)
     multi_subsets = defaultdict(list)
     for row in accuracy:
@@ -2047,7 +2182,7 @@ def report(cfg):
 
     weather_groups = defaultdict(list)
     for row in gains:
-        key = tuple(row[k] for k in ('weather','node_count','strategy','class','iou'))
+        key = tuple(row[k] for k in dimensions)
         weather_groups[key].append(row)
     weather_summary = []
     for key, values in sorted(weather_groups.items()):
@@ -2076,11 +2211,16 @@ def report(cfg):
             current_ap = float(np.mean([v[0] for v in counts[current]]))
             previous_recall = float(np.mean([v[1] for v in counts[previous]]))
             current_recall = float(np.mean([v[1] for v in counts[current]]))
-            scaling.append(dict(zip(('seed','session','weather','strategy','class','iou'),key)) | {
-                'from_node_count':previous, 'to_node_count':current,
-                'ap_change':current_ap-previous_ap,
-                'recall_change':current_recall-previous_recall})
-    write_csv(output/'node_scaling.csv',scaling)
+            scaling.append(
+                dict(zip(comparison_dimensions, key))
+                | {
+                    "from_node_count": previous,
+                    "to_node_count": current,
+                    "ap_change": current_ap - previous_ap,
+                    "recall_change": current_recall - previous_recall,
+                }
+            )
+    write_csv(output / "node_scaling.csv", scaling)
 
     costs_by_run = defaultdict(list)
     run_keys = ('seed','session','weather','nodes','node_count','strategy')
@@ -2093,6 +2233,7 @@ def report(cfg):
                 {k: row[k] for k in run_keys}
                 | {
                     "class": row["class"],
+                    "iou_level": row["iou_level"],
                     "iou": row["iou"],
                     "ap_3d": row["ap_3d"],
                     "precision": row["precision"],
@@ -2123,19 +2264,28 @@ def report(cfg):
             budget = float(row["strategy"].split("@", 1)[1])
             selector = adaptive_selector(row["strategy"])
             key = tuple(
-                row[k] for k in ("weather", "node_count", "class", "iou", "strategy")
+                row[k]
+                for k in (
+                    "weather",
+                    "node_count",
+                    "class",
+                    "iou_level",
+                    "iou",
+                    "strategy",
+                )
             ) + (selector,)
             adaptive_groups[key].append(
                 (float(row["ap_3d"]), float(row["payload_bytes"]))
             )
     adaptive_rate = []
     for key, values in sorted(adaptive_groups.items()):
-        weather, node_count, label, iou, strategy, selector = key
+        weather, node_count, label, level, iou, strategy, selector = key
         adaptive_rate.append(
             {
                 "weather": weather,
                 "node_count": node_count,
                 "class": label,
+                "iou_level": level,
                 "iou": iou,
                 "strategy": strategy,
                 "selector": selector,
@@ -2148,11 +2298,10 @@ def report(cfg):
         )
     write_csv(output / "adaptive_rate_accuracy.csv", adaptive_rate)
 
+    auc_dimensions = ("weather", "node_count", "class", "iou_level", "iou", "selector")
     auc_groups = defaultdict(list)
     for row in adaptive_rate:
-        key = tuple(
-            row[k] for k in ("weather", "node_count", "class", "iou", "selector")
-        )
+        key = tuple(row[k] for k in auc_dimensions)
         auc_groups[key].append((row["budget_fraction"], row["mean_ap"]))
     adaptive_auc = []
     for key, values in sorted(auc_groups.items()):
@@ -2164,7 +2313,7 @@ def report(cfg):
         log_x = np.log(x)
         normalized_auc = float(np.trapezoid(y, log_x) / (log_x[-1] - log_x[0]))
         adaptive_auc.append(
-            dict(zip(("weather", "node_count", "class", "iou", "selector"), key))
+            dict(zip(auc_dimensions, key))
             | {
                 "normalized_log_budget_ap_auc": normalized_auc,
                 "minimum_budget": float(x[0]),
@@ -2184,17 +2333,14 @@ def report(cfg):
             matplotlib.use('Agg')
             import matplotlib.pyplot as plt
 
-            primary_iou = min(float(row["iou"]) for row in summary)
+            primary_iou = cfg["evaluation"]["iou_thresholds"][0]
             adaptive_primary = (
                 f'adaptive@{max(cfg["adaptive_fusion"]["evaluation_budgets"]):g}'
             )
             plotted_strategies = {"early", "intermediate", "late", adaptive_primary}
             grouped = defaultdict(list)
             for row in summary:
-                if (
-                    float(row["iou"]) == primary_iou
-                    and row["strategy"] in plotted_strategies
-                ):
+                if int(row["iou_level"]) == 0 and row["strategy"] in plotted_strategies:
                     label = (
                         "adaptive"
                         if row["strategy"] == adaptive_primary
@@ -2214,7 +2360,10 @@ def report(cfg):
             axis.set(
                 xlabel="node count",
                 ylabel="macro mean AP",
-                title=f"Test AP by node count and fusion (IoU={primary_iou:g})",
+                title=(
+                    f"Test AP by node count and fusion (IoU level {primary_iou:g}; "
+                    "class overrides applied)"
+                ),
             )
             axis.set_ylim(0, 1)
             axis.legend(fontsize=8, ncol=2)
@@ -2309,14 +2458,30 @@ def report(cfg):
         "All aggregates are descriptive means, not confidence intervals or causal weather estimates.",
         "Single-node rows cover every common real node. The fixed global ROI/GT is unchanged across counts.",
         "Measured inference+decode uses batched node encoding and includes decode/NMS; excludes loading/rasterization/serialization.",
+        "With one node every strategy reduces to the same detector; it is computed once and reported under each strategy label.",
+        (
+            "IoU levels: "
+            + ", ".join(f"{value:g}" for value in cfg["evaluation"]["iou_thresholds"])
+            + "; per-class overrides: "
+            + (
+                ", ".join(
+                    f"{label} {'/'.join(f'{v:g}' for v in values)}"
+                    for label, values in cfg["evaluation"][
+                        "class_iou_thresholds"
+                    ].items()
+                )
+                or "none"
+            )
+            + "."
+        ),
         "End-to-end latency is an analytical estimate using configured literature-derived assumptions.",
-        "Dense payloads use float32 and zlib level 1; adaptive sparse messages use configured index/value widths and zlib level 1.",
+        "Early fusion sends float32 raw points; dense intermediate features and adaptive sparse messages use the configured value width (sparse messages add index width); late fusion sends float32 boxes at the operating score threshold. All payloads use zlib level 1.",
         (
             "Adaptive fusion rotates every participating node as the dense local reference and budgets collaborator cells only."
             if cfg["evaluation"].get("receiver_policy") == "all"
             else "Adaptive fusion uses the first sorted participating node as the dense local reference and budgets collaborator cells only."
         ),
-        "Cloud sends raw cropped points; edge sends raw points/features/local predictions according to strategy.",
+        "Cloud placement uploads raw cropped points from every participating node, receiver included; edge sends collaborator raw points/features/local predictions according to strategy.",
         f'Assumption source: {cfg["deployment_assumptions"]["source"]}.',
         weather_limit,
         "cooperation_gains.csv uses paired comparisons within session/seed/class/strategy/IoU.",

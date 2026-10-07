@@ -1,4 +1,4 @@
-"""Compact strided BEV center detector used by all fusion strategies."""
+"""Compact two-scale BEV center detector used by all fusion strategies."""
 
 import math
 import numpy as np
@@ -8,6 +8,10 @@ from torch.nn import functional as F
 from src.data.loader import BoundingBox3D
 from src.data.coinfra import in_bounds
 from src.metrics.evaluation import nms
+
+
+class TargetCollisionError(ValueError):
+    """More same-class centers share one output cell than there are slots."""
 
 
 class SeparableResidual(nn.Module):
@@ -36,6 +40,74 @@ class SeparableResidual(nn.Module):
         return self.activation(value + self.block(value))
 
 
+class ResidualBlock(nn.Module):
+    """Dense residual block for the coarse, large-context stage."""
+
+    def __init__(self, channels, dilation):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                channels, channels, 3, padding=dilation, dilation=dilation, bias=False
+            ),
+            nn.GroupNorm(1, channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(
+                channels, channels, 3, padding=dilation, dilation=dilation, bias=False
+            ),
+            nn.GroupNorm(1, channels),
+        )
+        self.activation = nn.SiLU(inplace=True)
+
+    def forward(self, value):
+        return self.activation(value + self.block(value))
+
+
+class BEVEncoder(nn.Module):
+    """Two-scale encoder whose output is the transmitted stride-2 feature map.
+
+    A cheap stride-2 path keeps small-object detail; a dense stride-4 path with
+    twice the channels adds capacity and a receptive field longer than a bus.
+    The ReLU output makes zero mean "no evidence", which is the natural
+    identity for max fusion and keeps empty space compressible.
+    """
+
+    def __init__(self, hidden):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, hidden, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(1, hidden),
+            nn.SiLU(inplace=True),
+        )
+        self.fine = nn.Sequential(
+            SeparableResidual(hidden, dilation=1),
+            SeparableResidual(hidden, dilation=2),
+        )
+        self.down = nn.Sequential(
+            nn.Conv2d(hidden, 2 * hidden, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(1, 2 * hidden),
+            nn.SiLU(inplace=True),
+        )
+        self.coarse = nn.Sequential(
+            ResidualBlock(2 * hidden, dilation=1),
+            ResidualBlock(2 * hidden, dilation=2),
+            ResidualBlock(2 * hidden, dilation=4),
+        )
+        self.lateral = nn.Conv2d(2 * hidden, hidden, 1, bias=False)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(hidden, hidden, 3, padding=1, bias=False),
+            nn.GroupNorm(1, hidden),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, bev):
+        fine = self.fine(self.stem(bev))
+        coarse = self.lateral(self.coarse(self.down(fine)))
+        coarse = F.interpolate(
+            coarse, size=fine.shape[-2:], mode="bilinear", align_corners=False
+        )
+        return self.fuse(fine + coarse)
+
+
 class BEVDetector(nn.Module):
     def __init__(self, classes, hidden, objects_per_cell=1, output_stride=2):
         super().__init__()
@@ -44,17 +116,9 @@ class BEVDetector(nn.Module):
         if output_stride != 2:
             raise ValueError("BEVDetector currently supports output_stride=2")
         self.output_stride = output_stride
-        # Downsample before the expensive feature extraction.  The two dilated
-        # depthwise residual blocks see 27 input cells (10.8 m at 0.4 m/cell)
-        # while doing the bulk of their work on a quarter as many BEV cells.
-        self.encoder = nn.Sequential(
-            nn.Conv2d(3, hidden, 3, stride=2, padding=1, bias=False),
-            nn.GroupNorm(1, hidden),
-            nn.SiLU(inplace=True),
-            SeparableResidual(hidden, dilation=2),
-            SeparableResidual(hidden, dilation=4),
-        )
-        self.receptive_field_cells = 27
+        self.encoder = BEVEncoder(hidden)
+        # Through the stride-4 path: 135 input cells (54 m at 0.4 m/cell).
+        self.receptive_field_cells = 135
         slots = len(classes) * objects_per_cell
         self.heatmap = nn.Conv2d(hidden, slots, 1)
         self.regression = nn.Conv2d(hidden, 8 * slots, 1)
@@ -89,10 +153,9 @@ class BEVDetector(nn.Module):
             )
             return features[:, 0], empty
         collaborators = features[:, 1:]
-        flat = collaborators.reshape(batch * (nodes - 1), channels, height, width)
-        learned_scores = self.utility(flat).reshape(batch, nodes - 1, height * width)
         if selector == "learned":
-            scores = learned_scores
+            flat = collaborators.reshape(batch * (nodes - 1), channels, height, width)
+            scores = self.utility(flat).reshape(batch, nodes - 1, height * width)
         elif selector == "energy":
             scores = (
                 collaborators.float()
@@ -129,7 +192,7 @@ class BEVDetector(nn.Module):
         # while every utility score receives a useful training gradient.
         # Only the proposed learned selector needs the surrogate gradient.
         if selector == "learned":
-            soft_mask = learned_scores.sigmoid()
+            soft_mask = scores.sigmoid()
             gate = hard_mask + soft_mask - soft_mask.detach()
         else:
             gate = hard_mask
@@ -137,7 +200,10 @@ class BEVDetector(nn.Module):
         # Selection methods differ only in which cells they choose. All three
         # transmit and fuse the same unscaled encoder features.
         sparse = collaborators * gate.reshape(batch, nodes - 1, 1, height, width)
-        # Encoder ReLUs make zero a safe identity for missing collaborator cells.
+        # Unsent cells must not take part in max fusion. Filling them with the
+        # lowest finite value (not zero) leaves the receiver's features exactly
+        # unchanged there, whatever the encoder's output range.
+        sparse = sparse.masked_fill(~mask[:, :, None], torch.finfo(sparse.dtype).min)
         fused = torch.maximum(features[:, 0], sparse.amax(dim=1))
         return fused, mask
 
@@ -169,6 +235,29 @@ def _grid_resolution(cfg, shape):
     h, w = shape
     bounds = cfg["bounds"]
     return (bounds[3] - bounds[0]) / w, (bounds[4] - bounds[1]) / h
+
+
+def output_shape(cfg, output_stride):
+    """Prediction-grid shape for the configured bounds, resolution, and stride."""
+    b, r = cfg["bounds"], cfg["resolution"]
+    height = math.ceil((b[4] - b[1]) / r)
+    width = math.ceil((b[3] - b[0]) / r)
+    return (
+        (height + output_stride - 1) // output_stride,
+        (width + output_stride - 1) // output_stride,
+    )
+
+
+def target_cell(box, cfg, shape):
+    """Return ``(class_index, ix, iy, x, y)`` on the prediction grid, or None."""
+    h, w = shape
+    b = cfg["bounds"]
+    rx, ry = _grid_resolution(cfg, shape)
+    x, y = (box.x - b[0]) / rx, (box.y - b[1]) / ry
+    ix, iy = int(x), int(y)
+    if not (0 <= ix < w and 0 <= iy < h):
+        return None
+    return cfg["classes"].index(box.label), ix, iy, x, y
 
 
 def _gaussian_radius(height, width, minimum_overlap=0.1):
@@ -206,7 +295,7 @@ def _draw_gaussian(heatmap, center, radius):
 
 def targets(boxes, cfg, shape, sample_id=None):
     h, w = shape
-    classes, b = cfg["classes"], cfg["bounds"]
+    classes = cfg["classes"]
     rx, ry = _grid_resolution(cfg, shape)
     slots = cfg.get("objects_per_cell", 1)
     heat = np.zeros((len(classes), slots, h, w), np.float32)
@@ -214,16 +303,16 @@ def targets(boxes, cfg, shape, sample_id=None):
     mask = np.zeros((len(classes), slots, h, w), bool)
     occupied = {}
     for box in boxes:
-        x, y = (box.x - b[0]) / rx, (box.y - b[1]) / ry
-        ix, iy, c = int(x), int(y), classes.index(box.label)
-        if not (0 <= ix < w and 0 <= iy < h):
+        cell = target_cell(box, cfg, shape)
+        if cell is None:
             continue
+        c, ix, iy, x, y = cell
         key = c, iy, ix
         colocated = occupied.setdefault(key, [])
         if len(colocated) >= slots:
             previous = colocated[0]
             resolution_text = f"{rx:g}" if math.isclose(rx, ry) else f"({rx:g}, {ry:g})"
-            raise ValueError(
+            raise TargetCollisionError(
                 f"More than {slots} same-class centers occupy one grid cell: "
                 f"sample={sample_id!r}, class={box.label!r}, cell=(x={ix}, y={iy}), "
                 f"resolution={resolution_text}, first_center=({previous.x:.6f}, {previous.y:.6f}), "
@@ -255,16 +344,19 @@ def loss(outputs, target):
     if heat.ndim == 4:
         heat, reg, mask = heat[None], reg[None], mask[None]
     batch, classes, slots, height, width = heat.shape
-    p = logits.reshape(batch, classes, slots, height, width)
-    p = p.sigmoid().float().clamp(1e-5, 1 - 1e-5)
+    # Work in float32 log space. Under AMP an fp16 sigmoid rounds to 1.0 above
+    # a logit of about 8, and a probability clamp then zeroes the gradient of
+    # exactly the confident false positives the loss should correct.
+    x = logits.float().reshape(batch, classes, slots, height, width)
+    p = x.sigmoid()
     positive = heat.eq(1)
     negative = heat.lt(1)
     negative_weight = (1 - heat).pow(4)
     # Normalize across the batch per class so abundant cars cannot drown out
     # the rarer truck, bus, bicycle, and pedestrian positives.
     axes = (0, 2, 3, 4)
-    positive_loss = ((1 - p).pow(2) * p.log() * positive).sum(dim=axes)
-    negative_loss = (p.pow(2) * (1 - p).log() * negative_weight * negative).sum(
+    positive_loss = ((1 - p).pow(2) * F.logsigmoid(x) * positive).sum(dim=axes)
+    negative_loss = (p.pow(2) * F.logsigmoid(-x) * negative_weight * negative).sum(
         dim=axes
     )
     positive_count = positive.sum(dim=axes)

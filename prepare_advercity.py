@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from pathlib import Path
 import numpy as np
 import yaml
+from src.data.advercity import LABEL_FORMAT
 
 
 ITEM_ID = 1079
@@ -222,6 +223,33 @@ def agent_key(path):
     return (0 if value >= 0 else 1, value)
 
 
+def merge_agent_labels(raws):
+    """Union of the vehicle and walker lists from every agent's frame file.
+
+    An agent's file does not necessarily list itself or objects outside its
+    own range, so cooperative ground truth merges all agents, keyed by actor
+    id. The first listing wins; pass the ego's file first.
+    """
+    merged = {}
+    rejected = []
+    for group_name in ("vehicles", "walkers"):
+        group = merged.setdefault(group_name, {})
+        for index, raw in enumerate(raws):
+            objects = raw.get(group_name) or {}
+            if not isinstance(objects, Mapping):
+                rejected.append(f"agent #{index} {group_name}: expected mapping")
+                continue
+            for actor, obj in objects.items():
+                group.setdefault(actor, obj)
+    if rejected:
+        warnings.warn(
+            f"Skipped {len(rejected)} malformed Adver-City label groups "
+            f'({"; ".join(rejected[:3])})',
+            RuntimeWarning,
+        )
+    return merged
+
+
 def normalize_boxes(raw, world_to_ego, ego_yaw, aliases, classes, bounds):
     boxes = []
     groups, rejected = [], []
@@ -328,8 +356,11 @@ def convert_scenario(extracted, destination, name, cfg):
         target = stage / 'frames' / frame
         (target / 'nodes').mkdir(parents=True)
         valid_nodes = 0
+        label_sources = [ego_raw]
         for agent in agents:
-            raw = frame_yaml(agent, frame)
+            raw = ego_raw if agent == ego else frame_yaml(agent, frame)
+            if agent != ego:
+                label_sources.append(raw)
             try:
                 inferred_rsu = int(agent.name) < 0
             except ValueError:
@@ -346,13 +377,25 @@ def convert_scenario(extracted, destination, name, cfg):
                 point_total += len(points)
                 valid_nodes += 1
         if not valid_nodes:
-            raise ValueError(f'All nodes empty after crop in {name}/{frame}')
-        labels = normalize_boxes(ego_raw, world_to_ego, float(ego_pose[4]), aliases, classes, bounds)
-        (target / 'gt.yaml').write_text(yaml.safe_dump(labels, sort_keys=False))
+            raise ValueError(f"All nodes empty after crop in {name}/{frame}")
+        labels = normalize_boxes(
+            merge_agent_labels(label_sources),
+            world_to_ego,
+            float(ego_pose[4]),
+            aliases,
+            classes,
+            bounds,
+        )
+        (target / "gt.yaml").write_text(yaml.safe_dump(labels, sort_keys=False))
     metadata = {
-        'scenario': name, 'frames': len(frames), 'nodes': node_types,
-        'points': point_total, 'source_archive': f'{name}.7z',
-        'format': 1, 'coordinate_frame': 'ego_lidar'
+        "scenario": name,
+        "frames": len(frames),
+        "nodes": node_types,
+        "points": point_total,
+        "source_archive": f"{name}.7z",
+        "format": LABEL_FORMAT,
+        "labels": "merged_from_all_agents",
+        "coordinate_frame": "ego_lidar",
     }
     (stage / 'scenario.yaml').write_text(yaml.safe_dump(metadata, sort_keys=False))
     probe = sorted((stage / 'frames').glob('*/nodes/*.npy'))

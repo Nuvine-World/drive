@@ -46,6 +46,7 @@ def test_overfit_profile_uses_advercity_node_capacity():
     enable_overfit(cfg)
     assert cfg["training"]["modes"] == ["early"]
     assert cfg["training"]["node_counts"] == [5]
+    assert cfg["training"]["augmentation"]["enabled"] is False
     assert cfg["output"]["root"].endswith("/overfit")
 
 
@@ -67,11 +68,11 @@ def test_convert_and_discover_advercity(tmp_path):
     for name, weather in [('ri_fd_d', 'fog'), ('rcnj_fhrd_d', 'fog_heavy_rain')]:
         target = Path(cfg['dataset']['root']) / name
         target.mkdir()
-        (target / 'scenario.yaml').write_text('format: 1\n')
-        frame = target / 'frames/000060'
-        (frame / 'nodes').mkdir(parents=True)
-        np.save(frame / 'nodes/10.npy', np.array([[1, 0, 0, 1]], np.float32))
-        (frame / 'gt.yaml').write_text('objects: []\n')
+        (target / "scenario.yaml").write_text("format: 2\n")
+        frame = target / "frames/000060"
+        (frame / "nodes").mkdir(parents=True)
+        np.save(frame / "nodes/10.npy", np.array([[1, 0, 0, 1]], np.float32))
+        (frame / "gt.yaml").write_text("objects: []\n")
         assert scenario_weather(name) == weather
     samples = discover(cfg)
     assert len(samples) == 3
@@ -80,18 +81,94 @@ def test_convert_and_discover_advercity(tmp_path):
 
 
 def test_advercity_weather_filter_is_applied(tmp_path):
-    root = tmp_path/'prepared'
-    for name in ('ui_cd_d','ri_fd_d'):
-        frame = root/name/'frames/000060'
-        (frame/'nodes').mkdir(parents=True)
-        (root/name/'scenario.yaml').write_text('format: 1\n')
-        np.save(frame/'nodes/10.npy',np.array([[1,0,0,1]],np.float32))
-        (frame/'gt.yaml').write_text('objects: []\n')
-    cfg = load_config(PROJECT/'configs/advercity.yaml')
-    cfg['dataset'].update(root=str(root),weather=['fog'],frame_stride=1,
-                          splits={'train':['ui_cd_d','ri_fd_d'],'val':[],'test':[]})
-    samples = discover(cfg)
+    root = tmp_path / "prepared"
+    for name in ("ui_cd_d", "ri_fd_d"):
+        frame = root / name / "frames/000060"
+        (frame / "nodes").mkdir(parents=True)
+        (root / name / "scenario.yaml").write_text("format: 2\n")
+        np.save(frame / "nodes/10.npy", np.array([[1, 0, 0, 1]], np.float32))
+        (frame / "gt.yaml").write_text("objects: []\n")
+    cfg = load_config(PROJECT / "configs/advercity.yaml")
+    cfg["dataset"].update(
+        root=str(root),
+        weather=["fog"],
+        frame_stride=1,
+        splits={"train": ["ui_cd_d", "ri_fd_d"], "val": [], "test": []},
+    )
+    with pytest.warns(
+        RuntimeWarning, match="excludes configured scenarios: train/ui_cd_d"
+    ):
+        samples = discover(cfg)
     assert [sample['session'] for sample in samples]==['ri_fd_d']
+
+
+def test_legacy_ego_only_labels_are_rejected_unless_allowed(tmp_path):
+    root = tmp_path / "prepared"
+    frame = root / "ui_cd_d" / "frames/000060"
+    (frame / "nodes").mkdir(parents=True)
+    (root / "ui_cd_d" / "scenario.yaml").write_text("format: 1\n")
+    np.save(frame / "nodes/10.npy", np.array([[1, 0, 0, 1]], np.float32))
+    (frame / "gt.yaml").write_text("objects: []\n")
+    cfg = load_config(PROJECT / "configs/advercity.yaml")
+    cfg["dataset"].update(
+        root=str(root),
+        frame_stride=1,
+        splits={"train": ["ui_cd_d"], "val": [], "test": []},
+    )
+    with pytest.raises(ValueError, match="ego vehicle file"):
+        discover(cfg)
+    cfg["dataset"]["acquisition"]["allow_legacy_labels"] = True
+    assert len(discover(cfg)) == 1
+
+
+def test_labels_merge_every_agent_once(tmp_path):
+    raw = tmp_path / "raw"
+    scenario = make_raw_scenario(raw)
+    # Agent 11 lists the ego vehicle (actor 10), which the ego's own file omits,
+    # and repeats actor 1; the RSU lists a walker nobody else reports.
+    other = yaml.safe_load((scenario / "11" / "000060.yaml").read_text())
+    other["vehicles"] = {
+        1: {
+            "class": "car",
+            "location": [5, 0, 0],
+            "center": [0, 0, 0],
+            "extent": [2, 1, 1],
+            "angle": [0, 0, 0],
+        },
+        10: {
+            "class": "car",
+            "location": [0, 0, 0],
+            "center": [0, 0, 0],
+            "extent": [2, 1, 1],
+            "angle": [0, 0, 0],
+        },
+    }
+    (scenario / "11" / "000060.yaml").write_text(yaml.safe_dump(other))
+    rsu = yaml.safe_load((scenario / "-1" / "000060.yaml").read_text())
+    rsu["walkers"] = {
+        7: {
+            "class": "walker",
+            "location": [0, 5, 0],
+            "extent": [0.3, 0.3, 0.9],
+            "angle": [0, 0, 0],
+        }
+    }
+    (scenario / "-1" / "000060.yaml").write_text(yaml.safe_dump(rsu))
+    cfg = load_config(PROJECT / "configs/advercity.yaml")
+    cfg["dataset"].update(
+        root=str(tmp_path / "prepared"), bounds=[-20, -20, -5, 20, 20, 5]
+    )
+    cfg["dataset"]["acquisition"]["retain_frame_stride"] = 1
+    destination = Path(cfg["dataset"]["root"]) / "ui_cd_d"
+    destination.parent.mkdir()
+    result = convert_scenario(raw, destination, "ui_cd_d", cfg)
+    assert result["format"] == 2
+    boxes = annotations(destination / "frames/000060/gt.yaml", cfg["dataset"])
+    assert sorted((box.label, round(box.x), round(box.y)) for box in boxes) == [
+        ("car", 0, 0),
+        ("car", 5, 0),
+        ("pedestrian", 0, 5),
+    ]
 
 
 def test_advercity_skips_only_invalid_annotations(tmp_path):

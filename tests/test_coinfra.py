@@ -5,6 +5,7 @@ import math
 import os
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
@@ -123,6 +124,8 @@ def fixture_config(tmp_path):
         resolution=1,
         frame_stride=1,
         classes=["car", "pedestrian"],
+        # Fixture intensities are standard-normal draws.
+        intensity_max=3.0,
         splits={
             "train": ["2025_01_01_sunny"],
             "val": ["2025_01_02_sunny"],
@@ -146,7 +149,12 @@ def fixture_config(tmp_path):
         hidden_channels=4,
         node_counts=[1, 2],
     )
-    cfg["evaluation"].update(node_counts=[1, 2], max_detections=5, score_threshold=0.01)
+    cfg["evaluation"].update(
+        node_counts=[1, 2],
+        max_detections=5,
+        score_threshold=0.01,
+        class_iou_thresholds={"pedestrian": [0.25, 0.5]},
+    )
     rng = np.random.default_rng(3)
     for sessions in d['splits'].values():
         for session in sessions:
@@ -485,7 +493,9 @@ def test_batched_detector_and_class_balanced_loss_are_finite(fixture_config):
 
 def test_encoder_receptive_field_spans_typical_car(fixture_config):
     model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
-    assert model.receptive_field_cells * 0.4 >= 4.0
+    # Longer than a bus at the 0.4 m CoInfra resolution.
+    assert model.receptive_field_cells * 0.4 >= 15.0
+    assert (model.encoder(torch.randn(2, 3, 16, 16)) >= 0).all()
     logits, regression = model(torch.zeros(1, 3, 16, 16))
     assert logits.shape[-2:] == (8, 8)
     assert regression.shape[-2:] == (8, 8)
@@ -535,16 +545,46 @@ def test_adaptive_fusion_obeys_spatial_budget(fixture_config):
 def test_ablation_selectors_change_only_selected_cells(fixture_config):
     torch.manual_seed(21)
     model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
-    features = torch.rand(2, 3, 4, 10, 10)
+    # Signed features: unsent cells must not act like a zero message.
+    features = torch.randn(2, 3, 4, 10, 10)
     energy_fused, energy_mask = model.adaptive_features(features, 0.1, "energy")
     torch.manual_seed(22)
     random_fused, random_mask = model.adaptive_features(features, 0.1, "random")
     assert not torch.equal(random_mask[0, 0], random_mask[0, 1])
     assert not torch.equal(random_mask[0], random_mask[1])
     for fused, mask in ((energy_fused, energy_mask), (random_fused, random_mask)):
-        sparse = features[:, 1:] * mask[:, :, None]
-        expected = torch.maximum(features[:, 0], sparse.amax(dim=1))
+        sent = features[:, 1:].masked_fill(~mask[:, :, None], -float("inf"))
+        expected = torch.maximum(features[:, 0], sent.amax(dim=1))
         torch.testing.assert_close(fused, expected)
+
+
+def test_adaptive_fusion_leaves_unsent_receiver_cells_unchanged(fixture_config):
+    torch.manual_seed(5)
+    model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
+    features = torch.randn(1, 3, 4, 12, 12) - 1.0
+    for selector in ("learned", "energy", "random"):
+        fused, mask = model.adaptive_features(features, 0.05, selector)
+        unsent = ~mask[0].any(dim=0)
+        assert unsent.any()
+        torch.testing.assert_close(fused[0][:, unsent], features[0, 0][:, unsent])
+
+
+def test_full_budget_adaptive_equals_dense_max_fusion(fixture_config):
+    model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
+    features = torch.randn(2, 3, 4, 6, 6)
+    fused, _ = model.adaptive_features(features, 1.0, "energy")
+    torch.testing.assert_close(fused, features.amax(dim=1))
+
+
+def test_learned_selector_receives_gradient_through_sent_cells(fixture_config):
+    torch.manual_seed(9)
+    model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
+    features = torch.randn(1, 2, 4, 8, 8)
+    fused, _ = model.adaptive_features(features, 0.25, "learned")
+    fused.sum().backward()
+    gradients = [p.grad for p in model.utility.parameters()]
+    assert all(g is not None and torch.isfinite(g).all() for g in gradients)
+    assert any(g.abs().sum() > 0 for g in gradients)
 
 
 def test_adaptive_payload_grows_with_budget(fixture_config):
@@ -649,6 +689,7 @@ def test_cooperation_gain_uses_only_participating_single_nodes(fixture_config):
         "weather": "sunny",
         "strategy": "early",
         "class": "car",
+        "iou_level": 0,
         "iou": 0.5,
         "precision": 0.5,
         "recall": 0.5,
@@ -707,7 +748,7 @@ def test_validation_oom_splits_only_current_batch(monkeypatch, fixture_config):
         early = np.zeros((3, 16, 16), np.float32)
         per_node = np.zeros((2, 3, 16, 16), np.float32)
         target = targets(gt, fixture_config["dataset"], (8, 8))
-        examples.append((early, per_node, gt, target))
+        examples.append((early, per_node, gt, target, 1))
     original = pipeline_module.device_tensor
 
     def oom_for_multi_item(array, device):
@@ -722,6 +763,7 @@ def test_validation_oom_splits_only_current_batch(monkeypatch, fixture_config):
         model, examples, fixture_config, SimpleNamespace(type="cuda"), retries=0
     )
     assert len(losses) == 2
+    assert set(frames) == {*fixture_config["evaluation"]["strategies"], "single"}
     assert all(len(values) == 2 for values in frames.values())
 
 
@@ -881,6 +923,41 @@ def test_end_to_end_train_all_fusions_report(fixture_config):
         "val_f1",
     } <= set(training_rows[0])
     assert not (output / "seed_1/training.csv").exists()
+    first = training_rows[0]
+    assert float(first["val_map"]) == pytest.approx(
+        0.5 * (float(first["val_map_single"]) + float(first["val_map_cooperative"]))
+    )
+    assert "val_map_early_iou0.7" in first
+    # One node: every strategy label reports the same single-node detector.
+    single = defaultdict(set)
+    for row in rows:
+        if row["node_count"] == 1:
+            single[(row["nodes"], row["class"], row["iou_level"])].add(row["ap_3d"])
+    assert single and all(len(values) == 1 for values in single.values())
+    assert {r["iou"] for r in rows if r["class"] == "pedestrian"} == {0.25, 0.5}
+    # Cloud placement uploads every participating node, the receiver included.
+    with (output / "latency_communication.csv").open() as stream:
+        cloud = [r for r in csv.DictReader(stream) if r["placement"] == "cloud"]
+    assert all(float(r["payload_bytes"]) > 0 for r in cloud)
+    with (output / "latency_trace.csv").open() as stream:
+        traces = list(csv.DictReader(stream))
+    single_bytes = {
+        (t["sample"], t["nodes"]): float(t["cloud_raw_bytes"])
+        for t in traces
+        if t["node_count"] == "1"
+    }
+    pairs = [t for t in traces if t["node_count"] == "2"]
+    assert pairs and all(
+        float(t["cloud_raw_bytes"])
+        == sum(single_bytes[(t["sample"], node)] for node in t["nodes"].split(","))
+        for t in pairs
+    )
+    # The streamed trace is exactly the per-session parts, concatenated.
+    part_rows = 0
+    for part in output.glob("eval_parts/seed_1/*.traces.csv"):
+        with part.open() as stream:
+            part_rows += sum(1 for _ in csv.DictReader(stream))
+    assert part_rows == len(traces) > 0
     train(fixture_config)
     fixture_config['dataset']['frame_stride']=2
     with pytest.raises(ValueError,match='changed'):
@@ -958,3 +1035,215 @@ def test_evaluation_reuses_completed_session_parts(monkeypatch, fixture_config):
     )
     second = run_evaluation(fixture_config)
     assert second == first
+
+
+def test_inspection_checks_collisions_on_prediction_grid(fixture_config):
+    d = fixture_config["dataset"]
+    # One metre BEV cells hold at most two of these centers; the 2 m
+    # prediction cells used by targets() hold all three.
+    walkers = [
+        BoundingBox3D(x, 0.1, 0.0, 0.6, 0.6, 1.7, 0.0, "pedestrian")
+        for x in (0.1, 1.1, 1.9)
+    ]
+    grid = pipeline_module.output_shape(d, fixture_config["training"]["output_stride"])
+    assert grid == (8, 8)
+    count, description = pipeline_module.validate_target_centers(
+        walkers, d, "frame", grid
+    )
+    assert count == 3
+    assert "pedestrian" in description
+    with pytest.raises(pipeline_module.TargetCollisionError):
+        targets(walkers, d, grid)
+
+
+def test_inspection_reports_required_slots(fixture_config):
+    samples = discover(fixture_config)
+    crowded = next(sample for sample in samples if sample["split"] == "train")
+    Path(crowded["gt"]).write_text(
+        yaml.safe_dump(
+            {
+                "objects": [
+                    {
+                        "class": "pedestrian",
+                        "position": [x, 0.1, 0],
+                        "dimensions": [0.6, 0.6, 1.7],
+                        "heading": 0.0,
+                    }
+                    for x in (0.1, 1.1, 1.9)
+                ]
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="objects_per_cell to at least 3"):
+        inspect(fixture_config)
+
+
+def test_focal_loss_keeps_gradient_for_confident_false_positive(fixture_config):
+    target = tuple(
+        torch.from_numpy(value)[None]
+        for value in targets([], fixture_config["dataset"], (8, 8))
+    )
+    classes = len(fixture_config["dataset"]["classes"])
+    logits = torch.full((1, classes * 2, 8, 8), -6.0, dtype=torch.float16)
+    logits[0, 0, 3, 3] = 12.0
+    logits.requires_grad_(True)
+    regression = torch.zeros((1, 8 * classes * 2, 8, 8), dtype=torch.float16)
+    loss((logits, regression), target).backward()
+    gradient = float(logits.grad[0, 0, 3, 3])
+    assert math.isfinite(gradient) and gradient > 0
+
+
+def test_late_payload_counts_only_operating_point_boxes(fixture_config):
+    fixture_config["evaluation"]["score_threshold"] = 0.15
+    kept = BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car", 0.9)
+    candidate = BoundingBox3D(3, 0, 0, 4, 2, 2, 0, "car", 0.05)
+    assert pipeline_module.late_payload(
+        [kept, candidate], fixture_config
+    ) == pipeline_module.late_payload([kept], fixture_config)
+
+
+def test_patience_ignores_gains_below_min_delta():
+    history = [{"selection_score": value} for value in (0.5, 0.5004, 0.5008, 0.5012)]
+    reference, stale = pipeline_module.patience_progress(history, 0.0005)
+    assert reference == pytest.approx(0.5008)
+    assert stale == 1
+
+
+def test_augmentation_moves_points_and_boxes_together(fixture_config):
+    from src.data.augmentation import augment_scene
+
+    d = fixture_config["dataset"]
+    box = BoundingBox3D(2.0, 1.0, 0.5, 4.0, 2.0, 1.5, 0.3, "car")
+    ahead = np.array([[2.0 + math.cos(0.3), 1.0 + math.sin(0.3), 0.5, 7.0]], np.float32)
+    for flip_x in (False, True):
+        for flip_y in (False, True):
+            parameters = {
+                "flip_x": flip_x,
+                "flip_y": flip_y,
+                "rotation": 0.4,
+                "scale": 1.05,
+            }
+            (cloud,), (moved,) = augment_scene([ahead], [box], parameters, d)
+            expected = (
+                moved.x + 1.05 * math.cos(moved.yaw),
+                moved.y + 1.05 * math.sin(moved.yaw),
+            )
+            np.testing.assert_allclose(cloud[0, :2], expected, atol=1e-5)
+            assert cloud[0, 3] == 7.0
+            assert moved.length == pytest.approx(4.2)
+
+
+def test_augmented_collision_falls_back_to_original_labels(monkeypatch, fixture_config):
+    sample = next(s for s in discover(fixture_config) if s["split"] == "train")
+    crowd = [
+        BoundingBox3D(0.1, 0.1, 0, 0.6, 0.6, 1.7, 0, "pedestrian") for _ in range(3)
+    ]
+    monkeypatch.setattr(
+        pipeline_module, "augment_scene", lambda clouds, boxes, *args: (clouds, crowd)
+    )
+    plan = (
+        sample,
+        "early",
+        ["4"],
+        {"flip_x": False, "flip_y": False, "rotation": 0.0, "scale": 1.0},
+    )
+    _, (_, _, mask) = pipeline_module.prepare_training_example(plan, fixture_config)
+    assert mask.sum() == 1
+
+
+def test_class_iou_thresholds_apply_per_class():
+    truth = [
+        BoundingBox3D(0, 0, 0, 4, 2, 2, 0, "car"),
+        BoundingBox3D(10, 0, 0, 0.6, 0.6, 1.7, 0, "pedestrian"),
+    ]
+    shifted = [
+        BoundingBox3D(0.8, 0, 0, 4, 2, 2, 0, "car", 0.9),
+        BoundingBox3D(10.2, 0, 0, 0.6, 0.6, 1.7, 0, "pedestrian", 0.9),
+    ]
+    rows = evaluate(
+        [(shifted, truth)],
+        ["car", "pedestrian"],
+        [0.5, 0.7],
+        class_thresholds={"pedestrian": [0.25, 0.5]},
+    )
+    applied = {(row["class"], row["iou_level"]): row["iou"] for row in rows}
+    assert applied == {
+        ("car", 0): 0.5,
+        ("car", 1): 0.7,
+        ("pedestrian", 0): 0.25,
+        ("pedestrian", 1): 0.5,
+    }
+    pedestrian = {
+        row["iou_level"]: row["ap_3d"] for row in rows if row["class"] == "pedestrian"
+    }
+    assert pedestrian[0] == pytest.approx(1)
+
+
+def test_nms_matches_reference_greedy_algorithm():
+    import random
+
+    rng = random.Random(4)
+    boxes = [
+        BoundingBox3D(
+            rng.uniform(-6, 6),
+            rng.uniform(-6, 6),
+            0,
+            rng.uniform(1, 5),
+            rng.uniform(0.5, 2),
+            1.5,
+            rng.uniform(-3, 3),
+            rng.choice(["car", "pedestrian"]),
+            rng.random(),
+        )
+        for _ in range(120)
+    ]
+    for threshold in (0.05, 0.2, 0.5):
+        reference = []
+        for box in sorted(boxes, key=lambda b: b.score, reverse=True):
+            if all(
+                box.label != b.label or iou3d(box, b) <= threshold for b in reference
+            ):
+                reference.append(box)
+        assert pipeline_module.nms(boxes, threshold, 1000) == reference
+        assert pipeline_module.nms(boxes, threshold, 7) == reference[:7]
+
+
+def test_intensity_channel_and_scale_guard(fixture_config):
+    d = fixture_config["dataset"] | {"intensity_max": 255.0}
+    points = np.array([[0.5, 0.5, 0.0, 510.0], [0.5, 0.5, 0.0, 51.0]], np.float32)
+    assert rasterize(points, d)[2].max() == pytest.approx(0.6)
+    pipeline_module.validate_intensity_scale([np.linspace(0, 250, 100)], d)
+    with pytest.raises(ValueError, match="intensity_max"):
+        pipeline_module.validate_intensity_scale([np.linspace(0, 1, 100)], d)
+    with pytest.raises(ValueError, match="intensity_max"):
+        pipeline_module.validate_intensity_scale([np.linspace(0, 4000, 100)], d)
+
+
+def test_retry_does_not_repeat_overwrite(tmp_path):
+    record = tmp_path / "calls.txt"
+    fake = tmp_path / "python"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "$*" >> "{record}"\n'
+        f'if [[ $(wc -l < "{record}") -eq 1 ]]; then exit 75; fi\n'
+        "exit 0\n"
+    )
+    fake.chmod(0o755)
+    env = os.environ.copy() | {
+        "ECCO_PYTHON": str(fake),
+        "ECCO_LOG_DIR": str(tmp_path / "logs"),
+        "ECCO_MAX_ATTEMPTS": "2",
+        "ECCO_RETRY_DELAY_SECONDS": "0",
+    }
+    result = subprocess.run(
+        ["bash", str(PROJECT / "run.sh"), "--config", "x.yaml", "--overwrite"],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    first, second = record.read_text().splitlines()
+    assert "--overwrite" in first
+    assert "--overwrite" not in second
+    assert "--config x.yaml" in second

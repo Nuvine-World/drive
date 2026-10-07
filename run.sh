@@ -70,10 +70,23 @@ done
 if [[ "$SMALL_RUN" == true ]]; then
   PIPELINE_ARGS+=(--smoke --overwrite --skip-prepare --require-data)
 fi
+# A retry resumes the interrupted attempt; repeating --overwrite would delete
+# every checkpoint written before the transient failure.
+RETRY_ARGS=()
+for argument in "${PIPELINE_ARGS[@]}"; do
+  if [[ "$argument" != "--overwrite" ]]; then
+    RETRY_ARGS+=("$argument")
+  fi
+done
 
 MAX_ATTEMPTS="${ECCO_MAX_ATTEMPTS:-3}"
 if [[ ! "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
   printf '%s\n' 'ECCO_MAX_ATTEMPTS must be a positive integer' >&2
+  exit 2
+fi
+RETRY_DELAY_SECONDS="${ECCO_RETRY_DELAY_SECONDS:-60}"
+if [[ ! "$RETRY_DELAY_SECONDS" =~ ^[0-9]+$ ]]; then
+  printf '%s\n' 'ECCO_RETRY_DELAY_SECONDS must be a nonnegative integer' >&2
   exit 2
 fi
 
@@ -96,12 +109,17 @@ if [[ $status -eq 0 ]]; then
   attempt=1
   while true; do
     printf '%s attempt=%s/%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$attempt" "$MAX_ATTEMPTS" | tee -a "$RUN_LOG"
-    "$PYTHON_BIN" main.py --stage all "${PIPELINE_ARGS[@]}" 2>&1 | tee -a "$RUN_LOG"
+    if [[ $attempt -eq 1 ]]; then
+      ATTEMPT_ARGS=("${PIPELINE_ARGS[@]}")
+    else
+      ATTEMPT_ARGS=("${RETRY_ARGS[@]}")
+    fi
+    "$PYTHON_BIN" main.py --stage all "${ATTEMPT_ARGS[@]}" 2>&1 | tee -a "$RUN_LOG"
     status=${PIPESTATUS[0]}
     if [[ $status -ne 75 || $attempt -ge $MAX_ATTEMPTS ]]; then
       break
     fi
-    delay=$((attempt * 60))
+    delay=$((attempt * RETRY_DELAY_SECONDS))
     printf '%s transient_failure=1 retry_in_seconds=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$delay" | tee -a "$RUN_LOG"
     sleep "$delay"
     attempt=$((attempt + 1))

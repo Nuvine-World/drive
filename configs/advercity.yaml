@@ -6,6 +6,8 @@ dataset:
     minimum_free_gb: 35
     cleanup_archives: true
     retain_frame_stride: 2
+    # Format-1 scenarios carry ego-only labels; keep false to require format 2.
+    allow_legacy_labels: false
   smoke:
     enabled: false
     splits:
@@ -29,6 +31,8 @@ dataset:
   bounds: [-100.0, -100.0, -5.0, 100.0, 100.0, 5.0]
   resolution: 1.0
   objects_per_cell: 2
+  # CARLA LiDAR intensity is already in [0, 1].
+  intensity_max: 1.0
   splits:
     train: [ui_cd_d, ui_srd_d, ui_hrd_d, ui_fd_d, ui_fhrd_d,
             unj_cd_d, unj_srd_d, unj_hrd_d, unj_fd_d, unj_fhrd_d,
@@ -57,6 +61,13 @@ training:
   batch_size: 8
   preprocessing_workers: 8
   mixed_precision: true
+  # Scene-wide flips, rotation, and scaling applied identically to every node.
+  augmentation:
+    enabled: true
+    flip_x: true
+    flip_y: true
+    rotation_degrees: 22.5
+    scale_range: [0.95, 1.05]
   modes: [early, intermediate, adaptive, single]
   node_counts: [1, 2, 3, 5]
   checkpointing:
@@ -84,6 +95,11 @@ evaluation:
   score_threshold: 0.15
   nms_iou: 0.2
   iou_thresholds: [0.5, 0.7]
+  # KITTI-style levels: small road users use 0.25/0.5 instead of 0.5/0.7.
+  class_iou_thresholds:
+    motorcycle: [0.25, 0.5]
+    bicycle: [0.25, 0.5]
+    pedestrian: [0.25, 0.5]
   max_detections: 150
 adaptive_fusion:
   training_budgets: [0.01, 0.05, 0.10, 0.25]

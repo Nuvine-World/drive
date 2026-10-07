@@ -63,7 +63,12 @@ export ECCO_PYTHON=/path/to/venv/bin/python
 ```
 
 The process resumes partial HTTP downloads and skips scenarios that already have
-a validated converted result. A system `7z` or `7zz` executable is used when
+a validated converted result. Each frame's labels merge the vehicle and walker
+lists of every agent (keyed by actor id), because an agent's own file need not
+list itself or objects outside its range. Scenarios converted before this
+change (`format: 1` in `scenario.yaml`) hold ego-only labels and stop the run;
+delete them to re-prepare (this re-downloads their archives), or set
+`dataset.acquisition.allow_legacy_labels: true` to use them as they are. A system `7z` or `7zz` executable is used when
 available; otherwise `py7zr` from `requirements.txt` is used. To inspect the
 official selection and transfer sizes without downloading archives:
 
@@ -99,8 +104,15 @@ export COINFRA_ROOT="/path/to/CoInfra"
 ```
 
 Edit [configs/coinfra.yaml](configs/coinfra.yaml) before a full experiment.
-Verify the dataset bounds, heading units, split sessions, and the source and
-values under `deployment_assumptions`.
+Verify the dataset bounds, heading units, split sessions, `intensity_max`, and
+the source and values under `deployment_assumptions`. Inspection records point
+intensity percentiles in `inspection.json` and stops if the p99 intensity does
+not fit `dataset.intensity_max` (above it, or below 1% of it).
+
+Training uses two sessions (2025_03_27_sunny and 2025_02_12_heavysnow);
+validation uses 2025_11_18_sunny; every weather condition keeps at least one
+held-out test session. Rainy and freezing-rain conditions are unseen in
+training, which matters when comparing results across weather.
 
 ## Small end-to-end check
 
@@ -146,8 +158,14 @@ session has enough common nodes for the largest requested evaluation count.
 
 Training resumes from `seed_N/latest.pt` after the last completed epoch. Recovery
 checkpoints include model, optimizer, metric history, and random states. The best
-checkpoint is selected using validation loss quality, mAP, and recall across all
-configured fusion strategies. Use `--overwrite` to restart configured seeds.
+checkpoint is selected using validation loss quality, mAP, and recall at the
+primary IoU level. Validation scores every frame twice: with all of its nodes
+under each configured fusion strategy, and with one deterministic single node.
+The two views carry equal weight, so checkpoints are not chosen for multi-node
+quality alone. Validation loss is averaged per sample over both views. Use
+`--overwrite` to restart configured seeds. `run.sh` retries exit code 75
+(transient failures) without `--overwrite`, so a retry resumes rather than
+discarding checkpoints; `ECCO_RETRY_DELAY_SECONDS` sets the base retry delay.
 
 Individual stages are available:
 
@@ -192,6 +210,11 @@ labels, frames, or excessive timestamp mismatch stops the run.
 
 The included model is a compact trainable BEV center detector, not a reproduction
 of the publisher's detector. It predicts car, truck, bus, bicycle, and pedestrian.
+Its encoder combines a stride-2 path with a dense stride-4 path (receptive field
+about 54 m at 0.4 m cells) and ends in a ReLU, so the transmitted stride-2
+feature map uses zero for "no evidence". Training applies the same random
+flips, rotation (±22.5°), and scaling (0.95–1.05) to every node's points and to
+the labels; `training.augmentation` configures it, and `--overfit` disables it.
 
 - **Early fusion:** combine globally aligned points before rasterization.
 - **Intermediate fusion:** encode each RSU BEV and max-fuse its feature map.
@@ -200,7 +223,9 @@ of the publisher's detector. It predicts car, truck, bus, bicycle, and pedestria
   highest-utility spatial cells from collaborator feature maps. A learned
   utility head is trained end-to-end with a straight-through top-k mask. One
   model is trained across several budgets and evaluated at 1%, 5%, 10%, and
-  25% collaborator-cell budgets.
+  25% collaborator-cell budgets. Cells that are not sent do not take part in
+  max fusion, so the reference features are unchanged wherever nothing
+  arrives.
 
 The same byte-budget sweep includes deterministic random-cell and feature-energy
 selectors. These are ablations of the learned utility head, not separately
@@ -216,7 +241,9 @@ should be tested with a reference-rotation ablation before a final submission.
 
 All strategies use the same weights and evaluation frames. Every single common
 RSU is evaluated; larger node combinations are sampled deterministically. The
-fixed global ground truth is unchanged between node subsets.
+fixed global ground truth is unchanged between node subsets. With one node,
+every strategy reduces to the same detector, so it runs once and its result is
+reported under each strategy label.
 
 ## Outputs
 
@@ -235,7 +262,8 @@ The configured output directory contains:
 - `node_scaling.csv` with changes between successive configured node counts;
 - `latency_communication.csv` with measured local timing and assumed latency;
 - `latency_trace.csv` with per-frame loading, preprocessing, inference/decoding,
-  serialization, and payload measurements;
+  serialization, and payload measurements, streamed per session from
+  `eval_parts/` so large sweeps do not accumulate in memory;
 - `latency_tail_summary.csv` with p50/p95/p99 and maximum latency, queue waiting,
   and deadline-miss rates under periodic and burst arrivals;
 - `accuracy_latency_tradeoffs.csv` joining accuracy and deployment costs;
@@ -244,7 +272,10 @@ The configured output directory contains:
 - `verification.json`, written only after required artifacts and metric invariants are checked.
 
 AP is confidence-ranked across a complete session/subset using candidates retained
-at `evaluation.ap_score_threshold`. Precision, recall, F1, and localization
+at `evaluation.ap_score_threshold`. `evaluation.iou_thresholds` defines IoU
+levels; `evaluation.class_iou_thresholds` replaces them per class (pedestrians
+and bicycles use 0.25/0.5, KITTI style). Rows record the applied `iou` and its
+`iou_level`, and summaries across classes group by `iou_level`. Precision, recall, F1, and localization
 diagnostics use the stricter deployed operating point in
 `evaluation.score_threshold` after class-wise NMS. This prevents the operating
 threshold from truncating the precision-recall curve. Localization errors are
@@ -255,7 +286,11 @@ returns a nonzero exit code if required results are missing or inconsistent.
 
 ## Latency experiment
 
-The latency trace separates measured local stages from network modeling. GPU
+The latency trace separates measured local stages from network modeling. Edge
+placement processes at the receiving node, so only collaborators transmit.
+Cloud placement uploads raw points from every participating node, the receiver
+included (`cloud_raw_bytes`). Late fusion transmits only local boxes at the
+operating score threshold; lower-scoring candidates stay local for AP ranking. GPU
 timing is synchronized around inference. The queue experiment replays the
 measured per-frame service trace through a FIFO server at the configured frame
 period and at 2x/4x burst arrival rates. For every placement, bandwidth, and

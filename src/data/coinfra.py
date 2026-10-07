@@ -2,6 +2,7 @@
 from pathlib import Path
 from functools import lru_cache
 import math
+import warnings
 import numpy as np
 import yaml
 from src.data.loader import BoundingBox3D
@@ -90,15 +91,17 @@ def discover(cfg):
     root = Path(d['root'])
     if not root.is_dir():
         raise FileNotFoundError(f'Extract CoInfra into {root} or set COINFRA_ROOT')
+    excluded = []
     for split, sessions in d['splits'].items():
         if smoke.get('enabled'):
             sessions = sessions[:smoke['sessions_per_split']]
         for session in sessions:
             scenario = root / session
             if not scenario.is_dir():
-                raise FileNotFoundError(f'Missing configured session: {scenario}')
-            weather = session.split('_', 3)[-1]
-            if weather not in d['weather']:
+                raise FileNotFoundError(f"Missing configured session: {scenario}")
+            weather = session.split("_", 3)[-1]
+            if weather not in d["weather"]:
+                excluded.append(f"{split}/{session}")
                 continue
             session_count = 0
             slice_dirs = sorted(scenario.glob('slice*'))
@@ -143,6 +146,11 @@ def discover(cfg):
                     session_count += 1
             if not session_count:
                 raise ValueError(f'No frames found in {session}')
+    if excluded:
+        warnings.warn(
+            f'dataset.weather excludes configured sessions: {", ".join(excluded)}',
+            RuntimeWarning,
+        )
     if not samples:
         raise ValueError('No samples matched the configuration')
     return samples
@@ -171,7 +179,11 @@ def rasterize(points, cfg):
     x, y, points = x[valid], y[valid], points[valid]
     np.add.at(bev[0], (y, x), 1)
     np.maximum.at(bev[1], (y, x), (points[:, 2]-b[2])/(b[5]-b[2]))
-    np.add.at(bev[2], (y, x), points[:, 3])
+    intensity = points[:, 3]
+    if cfg.get("intensity_max"):
+        # Bring sensor-specific intensity scales into [0, 1] like the other channels.
+        intensity = np.clip(intensity, 0, cfg["intensity_max"]) / cfg["intensity_max"]
+    np.add.at(bev[2], (y, x), intensity)
     bev[2] /= np.maximum(bev[0], 1)
     bev[0] = np.log1p(bev[0])
     return bev

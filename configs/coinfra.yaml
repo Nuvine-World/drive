@@ -25,13 +25,18 @@ dataset:
   bounds: [-100.0, -100.0, -5.0, 100.0, 100.0, 20.0]
   resolution: 0.4
   # Separate prediction slots preserve closely spaced same-class objects whose
-  # centers fall in the same official 0.4 m BEV cell.
+  # centers fall in the same 0.8 m prediction cell (0.4 m BEV, output stride 2).
   objects_per_cell: 2
+  # Full-scale point intensity, used to map the intensity channel to [0, 1].
+  # Inspection fails if the recorded p99 intensity does not fit this scale.
+  intensity_max: 255.0
+  # Two recording sessions train the detector (1,245 sunny + 2,183 heavy-snow
+  # frames). Every weather condition still has at least one held-out session.
   splits:
-    train: [2025_03_27_sunny]
+    train: [2025_03_27_sunny, 2025_02_12_heavysnow]
     val: [2025_11_18_sunny]
-    test: [2025_11_20_sunny, 2025_02_12_heavysnow, 2025_04_07_heavysnow,
-           2025_11_27_heavysnow, 2025_03_24_rainy, 2025_04_02_freezingrain]
+    test: [2025_11_20_sunny, 2025_04_07_heavysnow, 2025_11_27_heavysnow,
+           2025_03_24_rainy, 2025_04_02_freezingrain]
 training:
   seeds: [42, 43, 44]
   # Continue existing 30-epoch checkpoints, reduce LR on validation-score
@@ -57,6 +62,13 @@ training:
   batch_size: 8
   preprocessing_workers: 8
   mixed_precision: true
+  # Scene-wide flips, rotation, and scaling applied identically to every node.
+  augmentation:
+    enabled: true
+    flip_x: true
+    flip_y: true
+    rotation_degrees: 22.5
+    scale_range: [0.95, 1.05]
   modes: [early, intermediate, adaptive, single]
   node_counts: [1, 2, 4, 8]
   checkpointing:
@@ -88,6 +100,10 @@ evaluation:
   score_threshold: 0.15
   nms_iou: 0.2
   iou_thresholds: [0.5, 0.7]
+  # KITTI-style levels: small road users use 0.25/0.5 instead of 0.5/0.7.
+  class_iou_thresholds:
+    bicycle: [0.25, 0.5]
+    pedestrian: [0.25, 0.5]
   max_detections: 150
 adaptive_fusion:
   training_budgets: [0.01, 0.05, 0.10, 0.25]

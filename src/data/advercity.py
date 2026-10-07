@@ -6,6 +6,8 @@ import yaml
 from src.data.coinfra import first, in_bounds, vector
 from src.data.loader import BoundingBox3D
 
+# Format 2 merges labels from every agent's file; format 1 used only the ego's.
+LABEL_FORMAT = 2
 
 WEATHER = {
     'cd': 'clear', 'cn': 'clear_night', 'srd': 'soft_rain',
@@ -77,23 +79,37 @@ def discover(cfg):
     if not root.is_dir():
         raise FileNotFoundError(f'Prepared Adver-City directory not found: {root}')
     samples = []
-    smoke = d.get('smoke', {'enabled': False})
-    for split, scenarios in d['splits'].items():
-        if smoke.get('enabled'):
-            scenarios = scenarios[:smoke['sessions_per_split']]
+    excluded = []
+    smoke = d.get("smoke", {"enabled": False})
+    allow_legacy = d.get("acquisition", {}).get("allow_legacy_labels", False)
+    for split, scenarios in d["splits"].items():
+        if smoke.get("enabled"):
+            scenarios = scenarios[: smoke["sessions_per_split"]]
         for scenario in scenarios:
             weather = scenario_weather(scenario)
-            if weather not in d['weather']:
+            if weather not in d["weather"]:
+                excluded.append(f"{split}/{scenario}")
                 continue
             scenario_dir = root / scenario
             metadata = scenario_dir / 'scenario.yaml'
             if not metadata.is_file():
-                raise FileNotFoundError(f'Missing prepared scenario: {scenario_dir}')
-            frames = sorted((scenario_dir / 'frames').glob('*'))[::d['frame_stride']]
-            if d.get('max_frames_per_slice') is not None:
-                frames = frames[:d['max_frames_per_slice']]
-            if smoke.get('enabled'):
-                frames = frames[:smoke['frames_per_slice']]
+                raise FileNotFoundError(f"Missing prepared scenario: {scenario_dir}")
+            label_format = int(
+                (yaml.safe_load(metadata.read_text()) or {}).get("format", 1)
+            )
+            if label_format < LABEL_FORMAT and not allow_legacy:
+                raise ValueError(
+                    f"{scenario_dir} was prepared with format {label_format}, whose labels "
+                    "come only from the ego vehicle file, so the ego car and objects listed "
+                    "only by other agents are unlabeled. Delete the directory so prepare "
+                    "rebuilds it with labels merged from every agent (this re-downloads the "
+                    "archive), or set dataset.acquisition.allow_legacy_labels: true to use it."
+                )
+            frames = sorted((scenario_dir / "frames").glob("*"))[:: d["frame_stride"]]
+            if d.get("max_frames_per_slice") is not None:
+                frames = frames[: d["max_frames_per_slice"]]
+            if smoke.get("enabled"):
+                frames = frames[: smoke["frames_per_slice"]]
             count = 0
             for frame in frames:
                 gt = frame / 'gt.yaml'
@@ -113,6 +129,11 @@ def discover(cfg):
                 count += 1
             if not count:
                 raise ValueError(f'No frames found in {scenario_dir}')
+    if excluded:
+        warnings.warn(
+            f'dataset.weather excludes configured scenarios: {", ".join(excluded)}',
+            RuntimeWarning,
+        )
     return samples
 
 
