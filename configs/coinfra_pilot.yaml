@@ -39,11 +39,13 @@ dataset:
     test: [2025_11_20_sunny, 2025_04_07_heavysnow, 2025_11_27_heavysnow,
            2025_03_24_rainy, 2025_04_02_freezingrain]
 training:
-  # Fast generalization pilot: one seed and one fusion path.
-  seeds: [42]
-  epochs: 30
-  minimum_epochs: 20
-  early_stopping_patience: 8
+  # Mixed-node generalization pilot: one fusion path. Three seeds give a
+  # seed-to-seed spread; validation was still rising at epoch 100 of the
+  # previous run, so train up to 200 epochs and never stop before 100.
+  seeds: [42, 43, 44]
+  epochs: 200
+  minimum_epochs: 100
+  early_stopping_patience: 10
   early_stopping_min_delta: 0.0005
   learning_rate: 0.001
   scheduler:
@@ -54,8 +56,6 @@ training:
   weight_decay: 0.0001
   device: auto
   require_cuda: true
-  # Still compact, but large enough to test whether the 32-channel model was
-  # capacity-limited across recording sessions.
   hidden_channels: 64
   # Predict on a half-resolution grid after a strided, large-context encoder.
   output_stride: 2
@@ -72,7 +72,11 @@ training:
     rotation_degrees: 22.5
     scale_range: [0.95, 1.05]
   modes: [early]
-  node_counts: [8]
+  # A box is a training target only when the chosen nodes return at least
+  # this many points inside it; the global ROI also labels unseen objects.
+  min_target_points: 1
+  # Uniformly expose the shared detector to sparse and dense cooperative views.
+  node_counts: [1, 2, 4, 8]
   checkpointing:
     keep_best: 3
     # AP is the primary checkpoint criterion; recall breaks near ties.
@@ -94,11 +98,23 @@ evaluation:
   # the training batch even on a 24 GB card.
   batch_size: 8
   strategies: [early]
-  node_counts: [1, 8]
-  subsets_per_count: 1
+  # Measure the full node-scaling curve for the mixed-node pilot. Several
+  # subsets per count keep one RSU geometry from dominating the curve.
+  node_counts: [1, 2, 4, 8]
+  subsets_per_count: 5
   subset_seed: 17
   ap_score_threshold: 0.01
+  # Fallback operating threshold for classes absent from validation; every
+  # other class uses the F1-optimal threshold tuned on validation.
   score_threshold: 0.15
+  tune_score_thresholds: true
+  # Detection score = heat^(1-w) * predicted IoU^w.
+  iou_score_weight: 0.5
+  # The visible ground-truth scope scores boxes with at least this many points
+  # from the evaluated subset's own nodes and ignores the rest.
+  min_visible_points: 5
+  # Per-detection dumps for range and false-positive diagnostics.
+  save_detections: true
   nms_iou: 0.2
   iou_thresholds: [0.5, 0.7]
   # KITTI-style levels: small road users use 0.25/0.5 instead of 0.5/0.7.
