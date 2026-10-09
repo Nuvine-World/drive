@@ -7,7 +7,11 @@ from torch import nn
 from torch.nn import functional as F
 from src.data.loader import BoundingBox3D
 from src.data.coinfra import in_bounds
-from src.metrics.evaluation import nms
+from src.metrics.evaluation import nms, paired_iou3d
+
+# Per slot: x/y offset, z, log length/width/height, sin/cos yaw, IoU logit.
+BOX_CHANNELS = 8
+REGRESSION_CHANNELS = BOX_CHANNELS + 1
 
 
 class TargetCollisionError(ValueError):
@@ -71,10 +75,10 @@ class BEVEncoder(nn.Module):
     identity for max fusion and keeps empty space compressible.
     """
 
-    def __init__(self, hidden):
+    def __init__(self, hidden, in_channels=4):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(3, hidden, 3, stride=2, padding=1, bias=False),
+            nn.Conv2d(in_channels, hidden, 3, stride=2, padding=1, bias=False),
             nn.GroupNorm(1, hidden),
             nn.SiLU(inplace=True),
         )
@@ -109,19 +113,23 @@ class BEVEncoder(nn.Module):
 
 
 class BEVDetector(nn.Module):
-    def __init__(self, classes, hidden, objects_per_cell=1, output_stride=2):
+    def __init__(
+        self, classes, hidden, objects_per_cell=1, output_stride=2, in_channels=4
+    ):
         super().__init__()
         self.classes = classes
         self.objects_per_cell = objects_per_cell
         if output_stride != 2:
             raise ValueError("BEVDetector currently supports output_stride=2")
         self.output_stride = output_stride
-        self.encoder = BEVEncoder(hidden)
+        self.encoder = BEVEncoder(hidden, in_channels)
         # Through the stride-4 path: 135 input cells (54 m at 0.4 m/cell).
         self.receptive_field_cells = 135
         slots = len(classes) * objects_per_cell
         self.heatmap = nn.Conv2d(hidden, slots, 1)
-        self.regression = nn.Conv2d(hidden, 8 * slots, 1)
+        # The last channel of each slot predicts the 3D IoU of its own box and
+        # rescales the detection score, so well-localized boxes rank first.
+        self.regression = nn.Conv2d(hidden, REGRESSION_CHANNELS * slots, 1)
         # A learned, content-dependent utility map used by budget-conditioned
         # sparse fusion. One score is produced for every node and BEV cell.
         self.utility = nn.Sequential(
@@ -248,6 +256,11 @@ def output_shape(cfg, output_stride):
     )
 
 
+def grid_cell_size(cfg, output_stride):
+    """Metres per prediction-grid cell along x and y."""
+    return _grid_resolution(cfg, output_shape(cfg, output_stride))
+
+
 def target_cell(box, cfg, shape):
     """Return ``(class_index, ix, iy, x, y)`` on the prediction grid, or None."""
     h, w = shape
@@ -338,7 +351,30 @@ def targets(boxes, cfg, shape, sample_id=None):
     return heat, reg, mask
 
 
-def loss(outputs, target):
+def regression_boxes(values, cell_size):
+    """``[N, 8]`` regression rows as ``[x, y, z, l, w, h, yaw]`` within a cell.
+
+    Rows share their cell, so only offsets within it matter for IoU.
+    """
+    values = values.detach().double().cpu().numpy()
+    sizes = np.exp(np.clip(values[:, 3:6], -4, 5))
+    return np.column_stack(
+        (
+            values[:, 0] * cell_size[0],
+            values[:, 1] * cell_size[1],
+            values[:, 2],
+            sizes,
+            np.arctan2(values[:, 6], values[:, 7]),
+        )
+    )
+
+
+def loss(outputs, target, cell_size=(1.0, 1.0)):
+    """Class-balanced focal heatmap loss, L1 box regression, and IoU quality.
+
+    ``cell_size`` is the prediction-grid cell in metres along x and y; it
+    converts offset errors to metres for the IoU-quality target.
+    """
     logits, regression = outputs
     heat, reg, mask = [torch.as_tensor(v, device=logits.device) for v in target]
     if heat.ndim == 4:
@@ -367,16 +403,21 @@ def loss(outputs, target):
         torch.full_like(focal_by_class, 0.05),
     )
     focal = (focal_by_class * focal_weights).sum() / focal_weights.sum()
-    prediction = regression.float().reshape(batch, classes, slots, 8, height, width)
+    prediction = regression.float().reshape(
+        batch, classes, slots, REGRESSION_CHANNELS, height, width
+    )
     prediction = prediction.permute(0, 1, 2, 4, 5, 3)
+    boxes, quality = prediction[..., :BOX_CHANNELS], prediction[..., BOX_CHANNELS]
     expected = reg.permute(0, 1, 2, 4, 5, 3)
     regression_losses = []
     for class_index in range(classes):
         selected = mask[:, class_index]
         if selected.any():
+            # L1, as in CenterNet/CenterPoint: smooth L1 with beta=1 is
+            # quadratic for the sub-cell offsets and weakens the final refinement.
             regression_losses.append(
-                F.smooth_l1_loss(
-                    prediction[:, class_index][selected],
+                F.l1_loss(
+                    boxes[:, class_index][selected],
                     expected[:, class_index][selected],
                 )
             )
@@ -385,7 +426,19 @@ def loss(outputs, target):
         if regression_losses
         else prediction.sum() * 0
     )
-    return focal + regression_loss
+    if mask.any():
+        with torch.no_grad():
+            iou = paired_iou3d(
+                regression_boxes(boxes[mask], cell_size),
+                regression_boxes(expected[mask], cell_size),
+            )
+        quality_loss = F.binary_cross_entropy_with_logits(
+            quality[mask],
+            torch.as_tensor(iou, dtype=quality.dtype, device=quality.device),
+        )
+    else:
+        quality_loss = quality.sum() * 0
+    return focal + regression_loss + quality_loss
 
 
 def decode(outputs, cfg, score_threshold=None):
@@ -402,12 +455,23 @@ def decode(outputs, cfg, score_threshold=None):
         flat_heatmaps == maxima, flat_heatmaps, torch.zeros_like(flat_heatmaps)
     ).flatten()
     values, indices = scores.topk(min(settings["max_detections"], scores.numel()))
-    reg = regression[0].float().reshape(classes * slots, 8, h * w)
+    reg = regression[0].float().reshape(classes * slots, REGRESSION_CHANNELS, h * w)
     selected_channels = torch.div(indices, h * w, rounding_mode="floor")
     selected_cells = indices.remainder(h * w)
     selected_regression = (
         reg[selected_channels, :, selected_cells].detach().cpu().numpy()
     )
+    # IoU-rectified confidence: heat^(1-a) * predicted_iou^a.
+    weight = settings.get("iou_score_weight", 0.0)
+    if weight:
+        predicted_iou = torch.sigmoid(
+            torch.from_numpy(selected_regression[:, BOX_CHANNELS])
+        ).numpy()
+        rectified = (
+            values.detach().cpu().numpy() ** (1 - weight) * predicted_iou**weight
+        )
+    else:
+        rectified = values.detach().cpu().numpy()
     threshold = (
         settings.get("ap_score_threshold", settings["score_threshold"])
         if score_threshold is None
@@ -415,15 +479,17 @@ def decode(outputs, cfg, score_threshold=None):
     )
     boxes = []
     for score, index, v in zip(
-        values.detach().cpu().tolist(),
+        rectified.tolist(),
         indices.detach().cpu().tolist(),
         selected_regression,
     ):
-        if score < threshold:
+        # Written as a negated >= so a non-finite score is also dropped.
+        if not score >= threshold:
             continue
         channel, cell = divmod(index, h * w)
         c, slot = divmod(channel, slots)
         iy, ix = divmod(cell, w)
+        v = v[:BOX_CHANNELS]
         if not np.isfinite(v).all():
             continue
         rx, ry = _grid_resolution(d, (h, w))

@@ -104,10 +104,15 @@ export COINFRA_ROOT="/path/to/CoInfra"
 ```
 
 Edit [configs/coinfra.yaml](configs/coinfra.yaml) before a full experiment.
-Verify the dataset bounds, heading units, split sessions, `intensity_max`, and
-the source and values under `deployment_assumptions`. Inspection records point
-intensity percentiles in `inspection.json` and stops if the p99 intensity does
-not fit `dataset.intensity_max` (above it, or below 1% of it).
+Verify the dataset bounds, heading units, split sessions, `use_intensity`/
+`intensity_max`, and the source and values under `deployment_assumptions`.
+Inspection records point intensity percentiles in `inspection.json`. When
+`dataset.use_intensity` is true it stops if intensity is constant (CoInfra's is,
+so its configs set `use_intensity: false`) or if the p99 intensity does not fit
+`dataset.intensity_max` (above it, or below 1% of it). It also warns about
+classes that have test but no validation ground truth; such classes are unseen
+by checkpoint selection and threshold tuning (CoInfra validation has no
+bicycles).
 
 Training uses two sessions (2025_03_27_sunny and 2025_02_12_heavysnow);
 validation uses 2025_11_18_sunny; every weather condition keeps at least one
@@ -202,8 +207,9 @@ COINFRA_ROOT/
 ```
 
 Each cloud is transformed from its node frame to the shared global frame,
-cropped to one fixed region, and rasterized as point density, maximum height,
-and mean intensity. Ground-truth boxes use the same region. Missing calibration,
+cropped to one fixed region, and rasterized as log point density and the
+maximum, minimum, and mean height per cell, plus mean intensity when
+`dataset.use_intensity` is true. Ground-truth boxes use the same region. Missing calibration,
 labels, frames, or excessive timestamp mismatch stops the run.
 
 ## Model and fusion
@@ -215,6 +221,11 @@ about 54 m at 0.4 m cells) and ends in a ReLU, so the transmitted stride-2
 feature map uses zero for "no evidence". Training applies the same random
 flips, rotation (±22.5°), and scaling (0.95–1.05) to every node's points and to
 the labels; `training.augmentation` configures it, and `--overfit` disables it.
+A labeled box is a training target only when the sampled nodes return at least
+`training.min_target_points` points inside it, so the detector is not taught to
+predict objects it cannot see. Box regression uses an L1 loss, and each slot
+also predicts the 3D IoU of its own box; detection scores are
+`heat^(1-a) * IoU^a` with `a = evaluation.iou_score_weight`.
 
 - **Early fusion:** combine globally aligned points before rasterization.
 - **Intermediate fusion:** encode each RSU BEV and max-fuse its feature map.
@@ -240,8 +251,13 @@ with zlib level 1. This reference-node assumption must be stated in papers and
 should be tested with a reference-rotation ablation before a final submission.
 
 All strategies use the same weights and evaluation frames. Every single common
-RSU is evaluated; larger node combinations are sampled deterministically. The
-fixed global ground truth is unchanged between node subsets. With one node,
+RSU is evaluated; larger node combinations are sampled deterministically
+(`evaluation.subsets_per_count` per count). Every subset is scored on two
+ground-truth scopes (`gt_scope`): `full` keeps the fixed global ground truth for
+every subset (system coverage), and `visible` scores only boxes with at least
+`evaluation.min_visible_points` points from the subset's own nodes and ignores
+the rest (predictions on ignored boxes are neither true nor false positives).
+The difference separates fusion quality from added coverage. With one node,
 every strategy reduces to the same detector, so it runs once and its result is
 reported under each strategy label.
 
@@ -258,14 +274,25 @@ The configured output directory contains:
 - `accuracy_summary.csv` with per-class accuracy and localization summaries;
 - `metrics_overview.csv` with macro/micro AP, precision, recall, F1, counts, and localization quality;
 - `cooperation_gains.csv` with paired multi-RSU gains over mean/best single RSUs;
-- `weather_cooperation_summary.csv` with weather-stratified paired gains;
+- `weather_cooperation_summary.csv` with weather-stratified paired gains,
+  including the worst paired session against the best member node;
+- `seed_N/operating_thresholds.json` with per-class operating thresholds tuned
+  on validation (`evaluation.tune_score_thresholds`);
+- with `evaluation.save_detections`, per-detection dumps in
+  `eval_parts/seed_N/*.detections.csv.gz`, `range_breakdown.csv` (precision and
+  recall by distance to the nearest participating node), and
+  `false_positive_map.png`;
 - `node_scaling.csv` with changes between successive configured node counts;
-- `latency_communication.csv` with measured local timing and assumed latency;
+- `latency_communication.csv` with measured local timing, the link rate each
+  configuration needs at the frame rate, and end-to-end latency from measured
+  compute (`end_to_end_ms_measured`) and from assumed constants;
 - `latency_trace.csv` with per-frame loading, preprocessing, inference/decoding,
   serialization, and payload measurements, streamed per session from
   `eval_parts/` so large sweeps do not accumulate in memory;
 - `latency_tail_summary.csv` with p50/p95/p99 and maximum latency, queue waiting,
-  and deadline-miss rates under periodic and burst arrivals;
+  and deadline-miss rates under periodic and burst arrivals; `queue_stable` is
+  false when mean service time reaches the frame period, where the queue grows
+  without bound and tail values only reflect the trace length;
 - `accuracy_latency_tradeoffs.csv` joining accuracy and deployment costs;
 - `accuracy_by_nodes.png`, `cooperation_gain_by_weather.png`,
   `latency_by_bandwidth.png`, and `report.md`;
@@ -276,8 +303,9 @@ at `evaluation.ap_score_threshold`. `evaluation.iou_thresholds` defines IoU
 levels; `evaluation.class_iou_thresholds` replaces them per class (pedestrians
 and bicycles use 0.25/0.5, KITTI style). Rows record the applied `iou` and its
 `iou_level`, and summaries across classes group by `iou_level`. Precision, recall, F1, and localization
-diagnostics use the stricter deployed operating point in
-`evaluation.score_threshold` after class-wise NMS. This prevents the operating
+diagnostics use per-class operating thresholds that maximize F1 on validation
+(classes absent from validation keep `evaluation.score_threshold`), applied
+after class-wise NMS. This prevents the operating
 threshold from truncating the precision-recall curve. Localization errors are
 computed only for matched true positives. Undefined classes and match metrics are
 left blank rather than treated as zero. Summary statistics are descriptive, not

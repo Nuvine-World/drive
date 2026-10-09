@@ -27,9 +27,10 @@ dataset:
   # Separate prediction slots preserve closely spaced same-class objects whose
   # centers fall in the same 0.8 m prediction cell (0.4 m BEV, output stride 2).
   objects_per_cell: 2
-  # Full-scale point intensity, used to map the intensity channel to [0, 1].
-  # Inspection fails if the recorded p99 intensity does not fit this scale.
-  intensity_max: 255.0
+  # CoInfra point intensity is constant (p1 = p99 = 1.0 in every inspected
+  # slice), so the BEV uses density and maximum/minimum/mean height only.
+  # Inspection fails if intensity is enabled but carries no information.
+  use_intensity: false
   # Two recording sessions train the detector (1,245 sunny + 2,183 heavy-snow
   # frames). Every weather condition still has at least one held-out session.
   splits:
@@ -39,10 +40,10 @@ dataset:
            2025_03_24_rainy, 2025_04_02_freezingrain]
 training:
   seeds: [42, 43, 44]
-  # Continue existing 30-epoch checkpoints, reduce LR on validation-score
-  # plateaus, and stop only after the minimum training horizon.
-  epochs: 100
-  minimum_epochs: 30
+  # Reduce LR on validation-score plateaus; train up to 200 epochs and never
+  # stop before 100 (validation was still rising at epoch 100 of the pilot).
+  epochs: 200
+  minimum_epochs: 100
   early_stopping_patience: 12
   early_stopping_min_delta: 0.0005
   learning_rate: 0.001
@@ -70,6 +71,9 @@ training:
     rotation_degrees: 22.5
     scale_range: [0.95, 1.05]
   modes: [early, intermediate, adaptive, single]
+  # A box is a training target only when the chosen nodes return at least
+  # this many points inside it; the global ROI also labels unseen objects.
+  min_target_points: 1
   node_counts: [1, 2, 4, 8]
   checkpointing:
     keep_best: 3
@@ -97,7 +101,17 @@ evaluation:
   # Retain low-confidence candidates for a complete AP curve; precision/recall
   # use the separate deployed operating threshold below.
   ap_score_threshold: 0.01
+  # Fallback operating threshold for classes absent from validation; every
+  # other class uses the F1-optimal threshold tuned on validation.
   score_threshold: 0.15
+  tune_score_thresholds: true
+  # Detection score = heat^(1-w) * predicted IoU^w.
+  iou_score_weight: 0.5
+  # The visible ground-truth scope scores boxes with at least this many points
+  # from the evaluated subset's own nodes and ignores the rest.
+  min_visible_points: 5
+  # Per-detection dumps for range and false-positive diagnostics.
+  save_detections: false
   nms_iou: 0.2
   iou_thresholds: [0.5, 0.7]
   # KITTI-style levels: small road users use 0.25/0.5 instead of 0.5/0.7.

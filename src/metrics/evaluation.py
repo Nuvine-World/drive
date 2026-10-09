@@ -68,6 +68,18 @@ def iou3d(a, b):
     return float(iou3d_matrix([a], [b])[0, 0])
 
 
+def paired_iou3d(a, b):
+    """Rotated 3D IoU of row ``k`` of ``a`` with row ``k`` of ``b``.
+
+    Both are ``[N, 7]`` arrays of ``[x, y, z, l, w, h, yaw]``.
+    """
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    if not len(a):
+        return np.zeros(0)
+    index = np.arange(len(a))
+    return _pair_iou(a, b, _footprints(a), _footprints(b), index, index)
+
+
 def nms(boxes, threshold, limit):
     """Greedy class-wise NMS: a box survives unless a kept, higher-scoring box
     of the same class overlaps it by more than ``threshold``."""
@@ -104,90 +116,188 @@ def angle_error(a, b):
     return math.degrees(abs((a - b + math.pi / 2) % math.pi - math.pi / 2))
 
 
+def _operating_threshold(operating_score_threshold, label):
+    if isinstance(operating_score_threshold, dict):
+        return operating_score_threshold.get(label)
+    return operating_score_threshold
+
+
+def _class_candidates(frames, label):
+    """Ranked predictions of one class and their overlaps with its truths.
+
+    A frame is ``(predictions, truths)`` or ``(predictions, truths, ignored)``;
+    ignored truths are real objects that are not scored.
+    """
+    truths = [[b for b in frame[1] if b.label == label] for frame in frames]
+    ignored = [
+        [b for b in (frame[2] if len(frame) > 2 else ()) if b.label == label]
+        for frame in frames
+    ]
+    predictions = sorted(
+        [
+            (p.score, i, p)
+            for i, frame in enumerate(frames)
+            for p in frame[0]
+            if p.label == label
+        ],
+        key=lambda v: v[0],
+        reverse=True,
+    )
+    ranks_by_frame = defaultdict(list)
+    for rank, (_, frame_index, _) in enumerate(predictions):
+        ranks_by_frame[frame_index].append(rank)
+    overlaps, ignored_overlaps = {}, {}
+    for frame_index, ranks in ranks_by_frame.items():
+        boxes = [predictions[rank][2] for rank in ranks]
+        overlaps.update(zip(ranks, iou3d_matrix(boxes, truths[frame_index])))
+        if ignored[frame_index]:
+            best = iou3d_matrix(boxes, ignored[frame_index]).max(axis=1)
+            ignored_overlaps.update(zip(ranks, best.tolist()))
+    return truths, ignored, predictions, overlaps, ignored_overlaps
+
+
+def _match(frame_count, predictions, overlaps, ignored_overlaps, threshold):
+    """Standard ranked matching: each prediction tries its best truth first.
+
+    Returns one ``(status, overlap, truth_index)`` per prediction, where
+    status is ``tp``, ``fp``, or ``ignored``.
+    """
+    matched = [set() for _ in range(frame_count)]
+    outcomes = []
+    for rank, (_, i, _) in enumerate(predictions):
+        row = overlaps[rank]
+        if len(row):
+            # On exact ties prefer the last GT, as max() over (iou, j) did.
+            j = len(row) - 1 - int(np.argmax(row[::-1]))
+            overlap = float(row[j])
+        else:
+            overlap, j = 0.0, -1
+        if j >= 0 and j not in matched[i] and overlap >= threshold:
+            matched[i].add(j)
+            outcomes.append(("tp", overlap, j))
+        elif ignored_overlaps.get(rank, 0.0) >= threshold:
+            # Detecting an unscored object is neither a true nor a false
+            # positive, as with KITTI DontCare regions and COCO crowd boxes.
+            outcomes.append(("ignored", float(ignored_overlaps[rank]), -1))
+        else:
+            # A duplicate whose best GT is already claimed is a false positive.
+            outcomes.append(("fp", overlap, j))
+    return outcomes
+
+
 def evaluate(
     frames,
     classes,
     thresholds,
     operating_score_threshold=None,
     class_thresholds=None,
+    records=None,
 ):
     """Dataset-level detection metrics; never average per-frame AP.
 
     AP ranks every retained low-threshold prediction. Precision, recall, F1, and
     localization diagnostics use ``operating_score_threshold`` when provided,
-    so threshold calibration cannot truncate the AP curve.
+    so threshold calibration cannot truncate the AP curve. The operating
+    threshold may be one number or a ``{class: threshold}`` mapping.
 
     ``thresholds`` are the nominal IoU levels. ``class_thresholds`` may replace
     them for a class with a list of the same length (for example, looser
     levels for pedestrians). Each row records the applied ``iou`` and its
     ``iou_level`` index.
+
+    Frames may carry a third element of ignored truths. Predictions matching
+    only an ignored truth are dropped from AP and from the operating counts.
+    When ``records`` is a list, it receives the outcome of every
+    operating-point prediction and every truth at the first IoU level.
     """
     class_thresholds = class_thresholds or {}
     results = []
     for label in classes:
         levels = class_thresholds.get(label, thresholds)
-        truths = [[b for b in gt if b.label == label] for _, gt in frames]
+        operating_threshold = _operating_threshold(operating_score_threshold, label)
+        truths, ignored, predictions, overlaps, ignored_overlaps = _class_candidates(
+            frames, label
+        )
         count = sum(map(len, truths))
-        predictions = sorted([(p.score, i, p) for i, (pred, _) in enumerate(frames)
-                              for p in pred if p.label == label], key=lambda v: v[0], reverse=True)
-        ranks_by_frame = defaultdict(list)
-        for rank, (_, frame_index, _) in enumerate(predictions):
-            ranks_by_frame[frame_index].append(rank)
-        overlaps = {}
-        for frame_index, ranks in ranks_by_frame.items():
-            matrix = iou3d_matrix(
-                [predictions[rank][2] for rank in ranks], truths[frame_index]
-            )
-            overlaps.update(zip(ranks, matrix))
         for level, threshold in enumerate(levels):
-            matched = [set() for _ in frames]
+            outcomes = _match(
+                len(frames), predictions, overlaps, ignored_overlaps, threshold
+            )
             tp = []
+            true_positives = prediction_count = ignored_predictions = 0
+            found = set()
             matched_ious, center_errors, yaw_errors, size_ious = [], [], [], []
-            for rank, (score, i, pred) in enumerate(predictions):
-                # Standard ranked detection matching: select the best GT first;
-                # a duplicate whose best GT is already claimed is a false positive.
-                row = overlaps[rank]
-                if len(row):
-                    # On exact ties prefer the last GT, as max() over (iou, j) did.
-                    j = len(row) - 1 - int(np.argmax(row[::-1]))
-                    overlap = float(row[j])
-                else:
-                    overlap, j = 0.0, -1
-                success = j >= 0 and j not in matched[i] and overlap >= threshold
-                tp.append(int(success))
+            for (score, i, pred), (status, overlap, j) in zip(predictions, outcomes):
                 at_operating_point = (
-                    operating_score_threshold is None
-                    or score >= operating_score_threshold
+                    operating_threshold is None or score >= operating_threshold
                 )
-                if success:
-                    matched[i].add(j)
-                    if at_operating_point:
-                        gt = truths[i][j]
-                        matched_ious.append(overlap)
-                        center_errors.append(
-                            math.dist((pred.x, pred.y, pred.z), (gt.x, gt.y, gt.z))
+                if records is not None and level == 0 and at_operating_point:
+                    records.append(
+                        {
+                            "frame": i,
+                            "record": "prediction",
+                            "class": label,
+                            "status": status,
+                            "score": score,
+                            "iou": overlap,
+                            "box": pred,
+                        }
+                    )
+                if status == "ignored":
+                    ignored_predictions += int(at_operating_point)
+                    continue
+                tp.append(int(status == "tp"))
+                if not at_operating_point:
+                    continue
+                prediction_count += 1
+                if status != "tp":
+                    continue
+                true_positives += 1
+                found.add((i, j))
+                gt = truths[i][j]
+                matched_ious.append(overlap)
+                center_errors.append(
+                    math.dist((pred.x, pred.y, pred.z), (gt.x, gt.y, gt.z))
+                )
+                yaw_errors.append(angle_error(pred.yaw, gt.yaw))
+                intersection = (
+                    min(pred.length, gt.length)
+                    * min(pred.width, gt.width)
+                    * min(pred.height, gt.height)
+                )
+                union = (
+                    pred.length * pred.width * pred.height
+                    + gt.length * gt.width * gt.height
+                    - intersection
+                )
+                size_ious.append(intersection / union if union > 0 else 0.0)
+            if records is not None and level == 0:
+                for i, frame_truths in enumerate(truths):
+                    for j, gt in enumerate(frame_truths):
+                        records.append(
+                            {
+                                "frame": i,
+                                "record": "ground_truth",
+                                "class": label,
+                                "status": "matched" if (i, j) in found else "missed",
+                                "score": None,
+                                "iou": None,
+                                "box": gt,
+                            }
                         )
-                        yaw_errors.append(angle_error(pred.yaw, gt.yaw))
-                        intersection = (
-                            min(pred.length, gt.length)
-                            * min(pred.width, gt.width)
-                            * min(pred.height, gt.height)
+                    for gt in ignored[i]:
+                        records.append(
+                            {
+                                "frame": i,
+                                "record": "ground_truth",
+                                "class": label,
+                                "status": "ignored",
+                                "score": None,
+                                "iou": None,
+                                "box": gt,
+                            }
                         )
-                        union = (
-                            pred.length * pred.width * pred.height
-                            + gt.length * gt.width * gt.height
-                            - intersection
-                        )
-                        size_ious.append(intersection / union if union > 0 else 0.0)
             ap, recall = None, None
-            operating = [
-                value
-                for value, (score, _, _) in zip(tp, predictions)
-                if operating_score_threshold is None
-                or score >= operating_score_threshold
-            ]
-            true_positives = sum(operating)
-            prediction_count = len(operating)
             false_positives = prediction_count - true_positives
             false_negatives = count - true_positives
             precision = (
@@ -221,6 +331,7 @@ def evaluate(
                     "class": label,
                     "iou_level": level,
                     "iou": threshold,
+                    "operating_score_threshold": operating_threshold,
                     "ap_3d": ap,
                     "precision": precision,
                     "recall": recall,
@@ -240,8 +351,52 @@ def evaluate(
                     "mean_size_iou": float(np.mean(size_ious)) if size_ious else None,
                     "ground_truth": count,
                     "predictions": prediction_count,
-                    "ranked_predictions": len(predictions),
+                    "ranked_predictions": len(tp),
+                    "ignored_ground_truth": sum(map(len, ignored)),
+                    "ignored_predictions": ignored_predictions,
                     "frames": len(frames),
                 }
             )
     return results
+
+
+def f1_optimal_thresholds(
+    frames, classes, thresholds, class_thresholds=None, fallback=None, minimum=0.0
+):
+    """Per-class score threshold that maximizes F1 at the first IoU level.
+
+    The matching of each ranked prediction does not depend on the cut-off, so
+    F1 at every distinct score follows from one ranked pass. Ties prefer the
+    higher threshold. Classes without ground truth or true positives keep
+    ``fallback``.
+    """
+    class_thresholds = class_thresholds or {}
+    chosen = {}
+    for label in classes:
+        threshold = class_thresholds.get(label, thresholds)[0]
+        truths, _, predictions, overlaps, ignored_overlaps = _class_candidates(
+            frames, label
+        )
+        count = sum(map(len, truths))
+        outcomes = _match(
+            len(frames), predictions, overlaps, ignored_overlaps, threshold
+        )
+        kept = [
+            (score, status == "tp")
+            for (score, _, _), (status, _, _) in zip(predictions, outcomes)
+            if status != "ignored"
+        ]
+        if not count or not kept:
+            chosen[label] = fallback
+            continue
+        scores = np.array([score for score, _ in kept])
+        hits = np.cumsum([hit for _, hit in kept])
+        # A cut-off falls only after the last of equal scores.
+        last = np.r_[scores[1:] != scores[:-1], True]
+        f1 = 2 * hits / (np.arange(1, len(kept) + 1) + count)
+        f1 = np.where(last & (scores >= minimum), f1, -1.0)
+        if f1.max() <= 0:
+            chosen[label] = fallback
+            continue
+        chosen[label] = float(scores[int(np.argmax(f1))])
+    return chosen

@@ -157,6 +157,9 @@ def load_config(path):
         or d["intensity_max"] <= 0
     ):
         raise ValueError("dataset.intensity_max must be null or a positive number")
+    d.setdefault("use_intensity", True)
+    if not isinstance(d["use_intensity"], bool):
+        raise ValueError("dataset.use_intensity must be boolean")
     if d["yaw_unit"] not in ("degrees", "radians"):
         raise ValueError("yaw_unit must be degrees or radians")
     if d["frame_stride"] < 1 or d.get("max_timestamp_delta_s", 0) < 0:
@@ -195,6 +198,14 @@ def load_config(path):
     if t["output_stride"] != 2:
         raise ValueError("training.output_stride must currently be 2")
     t.setdefault("minimum_epochs", t["epochs"])
+    # Boxes with fewer points from the chosen nodes are not training targets.
+    t.setdefault("min_target_points", 1)
+    if (
+        not isinstance(t["min_target_points"], int)
+        or isinstance(t["min_target_points"], bool)
+        or t["min_target_points"] < 0
+    ):
+        raise ValueError("training.min_target_points must be a nonnegative integer")
     t.setdefault("early_stopping_patience", 0)
     t.setdefault("early_stopping_min_delta", 0.0)
     scheduler = t.setdefault("scheduler", {})
@@ -374,6 +385,25 @@ def load_config(path):
             "IoU in (0, 1] per evaluation.iou_thresholds level"
         )
     e.setdefault("ap_score_threshold", e["score_threshold"])
+    e.setdefault("min_visible_points", 5)
+    e.setdefault("iou_score_weight", 0.5)
+    e.setdefault("tune_score_thresholds", True)
+    e.setdefault("save_detections", False)
+    if (
+        not isinstance(e["min_visible_points"], int)
+        or isinstance(e["min_visible_points"], bool)
+        or e["min_visible_points"] < 1
+    ):
+        raise ValueError("evaluation.min_visible_points must be a positive integer")
+    if (
+        not isinstance(e["iou_score_weight"], (int, float))
+        or isinstance(e["iou_score_weight"], bool)
+        or not 0 <= e["iou_score_weight"] <= 1
+    ):
+        raise ValueError("evaluation.iou_score_weight must be in [0, 1]")
+    for key in ("tune_score_thresholds", "save_detections"):
+        if not isinstance(e[key], bool):
+            raise ValueError(f"evaluation.{key} must be boolean")
     if (
         not 0 <= e["ap_score_threshold"] <= e["score_threshold"] <= 1
         or not 0 < e["nms_iou"] <= 1

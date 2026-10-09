@@ -9,7 +9,9 @@ from pathlib import Path
 import random
 import time
 import zlib
+import gzip
 import platform
+import warnings
 import shutil
 import os
 from collections import deque
@@ -18,21 +20,25 @@ from datetime import datetime, timezone
 from collections import defaultdict
 import numpy as np
 import torch
-from src.data.api import annotations, discover, load_cloud, rasterize
+from src.data.api import annotations, bev_channels, discover, load_cloud, rasterize
 from src.data.augmentation import augment_scene, sample_parameters
+from src.data.visibility import box_point_counts, node_origin
 from src.detection.bev import (
     BEVDetector,
     TargetCollisionError,
     decode,
+    grid_cell_size,
     loss,
     output_shape,
     target_cell,
     targets,
 )
-from src.metrics.evaluation import evaluate, nms
+from src.metrics.evaluation import evaluate, f1_optimal_thresholds, nms
 
-EVALUATION_VERSION = 4
-MODEL_VERSION = 5
+EVALUATION_VERSION = 5
+MODEL_VERSION = 6
+GT_SCOPES = ("full", "visible")
+RANGE_BINS_M = (30.0, 60.0)
 
 
 def write_json(path, value):
@@ -108,9 +114,14 @@ def validate_examples(model, examples, cfg, device, retries):
     try:
         early = device_tensor(np.stack([item[0] for item in examples]), device)
         per_node = device_tensor(np.stack([item[1] for item in examples]), device)
-        target = tuple(
-            device_tensor(np.stack([item[3][i] for item in examples]), device)
-            for i in range(3)
+        early_target, single_target = (
+            tuple(
+                device_tensor(
+                    np.stack([item[position][i] for item in examples]), device
+                )
+                for i in range(3)
+            )
+            for position in (3, 6)
         )
         with torch.no_grad(), torch.autocast(
             device_type=device.type,
@@ -146,32 +157,49 @@ def validate_examples(model, examples, cfg, device, retries):
             )
         # Per-sample losses keep validation loss independent of batch size,
         # batch composition, and OOM splitting.
+        # Each view is scored against the boxes its own nodes can support.
         losses = []
+        cells = cell_size(cfg)
         for index in range(batch_size):
-            sample_target = tuple(value[index : index + 1] for value in target)
+
+            def sample_target(target):
+                return tuple(value[index : index + 1] for value in target)
+
             losses.append(
                 0.5
                 * (
-                    float(loss(batch_outputs(early_outputs, index), sample_target))
-                    + float(loss(batch_outputs(single, index), sample_target))
+                    float(
+                        loss(
+                            batch_outputs(early_outputs, index),
+                            sample_target(early_target),
+                            cells,
+                        )
+                    )
+                    + float(
+                        loss(
+                            batch_outputs(single, index),
+                            sample_target(single_target),
+                            cells,
+                        )
+                    )
                 )
             )
         frames = {strategy: [] for strategy in validation_views(cfg)}
         for index, item in enumerate(examples):
             frames["single"].append(
-                (decode(batch_outputs(single, index), cfg), item[2])
+                (decode(batch_outputs(single, index), cfg), *item[5])
             )
             if "early" in frames:
                 frames["early"].append(
-                    (decode(batch_outputs(early_outputs, index), cfg), item[2])
+                    (decode(batch_outputs(early_outputs, index), cfg), *item[2])
                 )
             if intermediate is not None:
                 frames["intermediate"].append(
-                    (decode(batch_outputs(intermediate, index), cfg), item[2])
+                    (decode(batch_outputs(intermediate, index), cfg), *item[2])
                 )
             if adaptive is not None:
                 frames["adaptive"].append(
-                    (decode(batch_outputs(adaptive, index), cfg), item[2])
+                    (decode(batch_outputs(adaptive, index), cfg), *item[2])
                 )
             if late is not None:
                 offset = index * nodes
@@ -186,7 +214,7 @@ def validate_examples(model, examples, cfg, device, retries):
                             cfg["evaluation"]["nms_iou"],
                             cfg["evaluation"]["late_max_detections"],
                         ),
-                        item[2],
+                        *item[2],
                     )
                 )
         return losses, frames
@@ -227,7 +255,9 @@ def _mean(values):
     return float(np.mean(values)) if values else 0.0
 
 
-def _validation_metrics(model, samples, cfg, device, batch_size):
+def validation_frames(model, samples, cfg, device, batch_size):
+    """Per-sample validation losses and ``{view: [(predictions, visible,
+    ignored)]}`` for every validation view."""
     losses = []
     frames = {view: [] for view in validation_views(cfg)}
     grouped = defaultdict(list)
@@ -253,6 +283,13 @@ def _validation_metrics(model, samples, cfg, device, batch_size):
             losses.extend(batch_losses)
             for view in frames:
                 frames[view].extend(batch_frames[view])
+    return losses, frames
+
+
+def _validation_metrics(model, samples, cfg, device, batch_size):
+    losses, frames = validation_frames(model, samples, cfg, device, batch_size)
+    # Each view is scored on the boxes its nodes support (visible scope), the
+    # quantity the visibility-filtered training targets optimize.
     # Selection metrics use the primary IoU level only. Averaging in the
     # strict level (AP@0.7 is near zero early in training) would halve the
     # number without adding signal. Every level is still logged.
@@ -412,6 +449,7 @@ def signature(cfg):
         "resolution",
         "objects_per_cell",
         "intensity_max",
+        "use_intensity",
     )
     training_keys = (
         "hidden_channels",
@@ -423,6 +461,7 @@ def signature(cfg):
         "modes",
         "node_counts",
         "augmentation",
+        "min_target_points",
     )
     return {
         "model_version": MODEL_VERSION,
@@ -590,20 +629,31 @@ def preprocess(cfg):
         {"dataset_fingerprint": fingerprint(cfg), "samples": samples},
     )
     write_json(output / "resolved_config.json", cfg)
-    write_json(
-        output / "environment.json",
-        {
-            "python": platform.python_version(),
-            "platform": platform.platform(),
-            "torch": torch.__version__,
-            "torch_cuda": torch.version.cuda,
-            "numpy": np.__version__,
-        },
-    )
+    write_json(output / "environment.json", environment())
     write_json(output / "inventory.json", dict(counts))
     write_json(output / "split_isolation.json", isolation)
     print(json.dumps(dict(counts), indent=2))
     return samples
+
+
+def environment():
+    """Software and hardware that produced the results, for latency context."""
+    cuda = torch.cuda.is_available()
+    return {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "processor": platform.processor() or platform.machine(),
+        "cpu_count": os.cpu_count(),
+        "torch": torch.__version__,
+        "torch_cuda": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version() if cuda else None,
+        "gpus": (
+            [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+            if cuda
+            else []
+        ),
+        "numpy": np.__version__,
+    }
 
 
 def indexed(cfg):
@@ -648,6 +698,18 @@ def inspect(cfg):
         annotation_counts[sample["id"]] = len(boxes)
         for box in boxes:
             class_inventory[sample["split"]][box.label] += 1
+    unvalidated = [
+        label
+        for label in cfg["dataset"]["classes"]
+        if class_inventory["val"][label] == 0 and class_inventory["test"][label] > 0
+    ]
+    if unvalidated:
+        warnings.warn(
+            "The validation split has no ground truth for "
+            f"{', '.join(unvalidated)}; checkpoint selection and operating-threshold "
+            "tuning cannot see these classes, so they keep evaluation.score_threshold",
+            RuntimeWarning,
+        )
     slots = cfg["dataset"].get("objects_per_cell", 1)
     if crowded is not None and crowded[0] > slots:
         raise ValueError(
@@ -722,12 +784,19 @@ def validate_target_centers(boxes, cfg, sample_id, shape):
 
 
 def validate_intensity_scale(samples, cfg):
-    """Fail when dataset.intensity_max is grossly wrong for the recorded data."""
-    maximum = cfg.get("intensity_max")
-    if not maximum or not samples:
+    """Fail when the intensity channel is uninformative or grossly mis-scaled."""
+    if not cfg.get("use_intensity", True) or not samples:
         return
     values = np.concatenate(samples)
-    p99 = float(np.quantile(values, 0.99))
+    p1, p99 = (float(value) for value in np.quantile(values, [0.01, 0.99]))
+    if p99 - p1 <= 1e-6 * max(1.0, abs(p99)):
+        raise ValueError(
+            f"Point intensity is constant (p1={p1:g}, p99={p99:g}), so the intensity "
+            "BEV channel carries no information; set dataset.use_intensity: false"
+        )
+    maximum = cfg.get("intensity_max")
+    if not maximum:
+        return
     if p99 > maximum or p99 < 0.01 * maximum:
         raise ValueError(
             f"Point intensity p99={p99:g} (p50={float(np.quantile(values, 0.5)):g}) "
@@ -776,10 +845,37 @@ def training_plan(order, cfg, rng, batch_size=None):
     return batches
 
 
+def support_counts(clouds, boxes, cfg):
+    """Points from all of ``clouds`` inside each box."""
+    bounds = cfg["dataset"]["bounds"]
+    counts = np.zeros(len(boxes), dtype=np.int64)
+    for cloud in clouds:
+        counts += box_point_counts(cloud, boxes, bounds)
+    return counts
+
+
+def supported_boxes(boxes, counts, minimum):
+    return [box for box, count in zip(boxes, counts) if count >= minimum]
+
+
+def visibility_scope(boxes, counts, cfg):
+    """Split boxes into scored (visible) and ignored truths for these nodes."""
+    minimum = cfg["evaluation"]["min_visible_points"]
+    visible = [box for box, count in zip(boxes, counts) if count >= minimum]
+    ignored = [box for box, count in zip(boxes, counts) if count < minimum]
+    return visible, ignored
+
+
 def prepare_training_example(plan, cfg):
     sample, mode, nodes, augmentation = plan
     clouds = inputs(sample, nodes, cfg)
     boxes = annotations(sample["gt"], cfg["dataset"])
+    minimum = cfg["training"]["min_target_points"]
+    if minimum:
+        # The global ROI labels objects no chosen node can see. Supervising
+        # those would teach the detector to hallucinate from priors, so a
+        # box is a target only with enough points from the chosen nodes.
+        boxes = supported_boxes(boxes, support_counts(clouds, boxes, cfg), minimum)
     shape = output_shape(cfg["dataset"], cfg["training"]["output_stride"])
     if augmentation is not None:
         moved_clouds, moved_boxes = augment_scene(
@@ -867,7 +963,7 @@ def train_examples(
             dtype=torch.float16,
             enabled=mixed_precision(cfg, device),
         ):
-            value = loss(model(bev, mode), target)
+            value = loss(model(bev, mode), target, cell_size(cfg))
         if not torch.isfinite(value):
             raise ValueError("Nonfinite training loss")
         scaler.scale(value).backward()
@@ -943,17 +1039,48 @@ def train_examples(
     )
 
 
+def cell_size(cfg):
+    return grid_cell_size(cfg["dataset"], cfg["training"]["output_stride"])
+
+
 def prepare_validation_example(sample, cfg):
+    """Inputs, scored/ignored truths, and targets for the all-node and
+    single-node validation views.
+
+    Returns ``(early, per_node, all_node_truths, all_node_target,
+    single_node, single_node_truths, single_node_target)``. Each truths entry
+    is a ``(visible, ignored)`` pair for the nodes of that view.
+    """
     nodes = sorted(sample["nodes"])
     clouds = inputs(sample, nodes, cfg)
     early = array_inputs(clouds, cfg, "early")[0]
     per_node = array_inputs(clouds, cfg, "intermediate")
     gt = annotations(sample["gt"], cfg["dataset"])
+    bounds = cfg["dataset"]["bounds"]
+    counts = np.stack([box_point_counts(cloud, gt, bounds) for cloud in clouds])
     shape = output_shape(cfg["dataset"], cfg["training"]["output_stride"])
-    target = targets(gt, cfg["dataset"], shape, sample_id=sample["id"])
+    minimum = cfg["training"]["min_target_points"]
     # The single-node view rotates deterministically through every node.
     single_node = stable_random_seed("validation-single", sample["id"]) % len(nodes)
-    return early, per_node, gt, target, single_node
+    views = []
+    for view_counts in (counts.sum(axis=0), counts[single_node]):
+        target = targets(
+            supported_boxes(gt, view_counts, minimum),
+            cfg["dataset"],
+            shape,
+            sample_id=sample["id"],
+        )
+        views.append((visibility_scope(gt, view_counts, cfg), target))
+    (early_truths, early_target), (single_truths, single_target) = views
+    return (
+        early,
+        per_node,
+        early_truths,
+        early_target,
+        single_node,
+        single_truths,
+        single_target,
+    )
 
 
 def submit_validation_batch(executor, samples, cfg):
@@ -993,6 +1120,7 @@ def make_model(cfg,device):
         cfg["training"]["hidden_channels"],
         cfg["dataset"].get("objects_per_cell", 1),
         cfg["training"]["output_stride"],
+        bev_channels(cfg["dataset"]),
     ).to(device)
 
 
@@ -1584,20 +1712,28 @@ def network_rows(cfg, base, cloud_bytes, representation_bytes):
     node, the receiver included, to upload its raw points (``cloud_bytes``).
     """
     net = cfg["deployment_assumptions"]
+    frame_period_ms = cfg["latency_experiment"]["frame_period_ms"]
     base_strategy = base["strategy"].split("@", 1)[0]
     if base_strategy.startswith("adaptive"):
         base_strategy = "adaptive"
+    measured_keys = ("preprocessing_ms_mean", "inference_decode_ms_mean")
     rows = []
     for placement in ("edge", "cloud"):
         transmitted = representation_bytes if placement == "edge" else cloud_bytes
+        serialization_key = (
+            "serialization_ms_mean"
+            if placement == "edge"
+            else "cloud_serialization_ms_mean"
+        )
+        measured = (
+            sum(base[key] for key in (*measured_keys, serialization_key))
+            if all(key in base for key in (*measured_keys, serialization_key))
+            else None
+        )
         for bandwidth in net["bandwidths_mbps"]:
             transmit_ms = transmitted * 8 / (bandwidth * 1e6) * 1000
-            total = (
-                net["sensing_ms"]
-                + net[placement + "_rtt_ms"]
-                + net["processing_ms"][placement][base_strategy]
-                + transmit_ms
-            )
+            fixed = net["sensing_ms"] + net[placement + "_rtt_ms"]
+            total = fixed + net["processing_ms"][placement][base_strategy] + transmit_ms
             rows.append(
                 base
                 | {
@@ -1605,8 +1741,16 @@ def network_rows(cfg, base, cloud_bytes, representation_bytes):
                     "bandwidth_mbps": bandwidth,
                     "assumption_source": net["source"],
                     "payload_bytes": transmitted,
+                    # Link rate needed to deliver every frame within one period.
+                    "required_bandwidth_mbps": transmitted * 8 / frame_period_ms / 1000,
                     "transmission_ms_model": transmit_ms,
                     "end_to_end_ms_model": total,
+                    # Replaces the assumed processing constant with the measured
+                    # preprocessing, inference+decode, and serialization times.
+                    "end_to_end_ms_measured": (
+                        None if measured is None else fixed + measured + transmit_ms
+                    ),
+                    "link_keeps_up": transmit_ms < frame_period_ms,
                 }
             )
     return rows
@@ -1718,6 +1862,10 @@ def latency_tail_rows(cfg, grouped):
                                 ),
                                 "utilization": float(np.mean(service))
                                 / experiment["frame_period_ms"],
+                                # At utilization >= 1 the queue grows without
+                                # bound; tail values then reflect trace length.
+                                "queue_stable": float(np.mean(service))
+                                < experiment["frame_period_ms"],
                                 "deadline_ms": deadline,
                                 **result,
                             }
@@ -1781,10 +1929,85 @@ def evaluation_runs(nodes, strategies):
     return [(label, [label]) for label in labels]
 
 
-def evaluate_session(model, cfg, device, seed, session, frames, warmed, trace_writer):
-    """Evaluate one test session; stream traces and return metrics, costs, tails."""
+DETECTION_FIELDS = (
+    *TRACE_KEYS[:3],
+    "sample",
+    *TRACE_KEYS[3:],
+    "record",
+    "class",
+    "status",
+    "score",
+    "iou",
+    "x",
+    "y",
+    "z",
+    "length",
+    "width",
+    "height",
+    "yaw",
+    "support_points",
+    "nearest_node_m",
+)
+
+
+def nearest_node_distance(box, origins):
+    if not origins or any(origin is None for origin in origins):
+        return None
+    return float(min(math.hypot(box.x - o[0], box.y - o[1]) for o in origins))
+
+
+def detection_rows(records, base, entries):
+    """Rows for the per-detection dump from ``evaluate(records=...)`` output."""
+    for record in records:
+        _, gt, counts, sample_id, origins = entries[record["frame"]]
+        box = record["box"]
+        support = None
+        if record["record"] == "ground_truth":
+            support = next(
+                (int(count) for truth, count in zip(gt, counts) if truth is box), None
+            )
+        yield base | {
+            "sample": sample_id,
+            "record": record["record"],
+            "class": record["class"],
+            "status": record["status"],
+            "score": record["score"],
+            "iou": record["iou"],
+            "x": box.x,
+            "y": box.y,
+            "z": box.z,
+            "length": box.length,
+            "width": box.width,
+            "height": box.height,
+            "yaw": box.yaw,
+            "support_points": support,
+            "nearest_node_m": nearest_node_distance(box, origins),
+        }
+
+
+def evaluate_session(
+    model,
+    cfg,
+    device,
+    seed,
+    session,
+    frames,
+    warmed,
+    trace_writer,
+    score_thresholds=None,
+    detection_writer=None,
+):
+    """Evaluate one test session; stream traces and return metrics, costs, tails.
+
+    Every subset is scored on two ground-truth scopes: ``full`` (all boxes in
+    the fixed region, the system view) and ``visible`` (boxes with at least
+    ``evaluation.min_visible_points`` points from the subset's nodes; the rest
+    are ignored), which separates fusion quality from added coverage.
+    """
     strategies = evaluation_strategies(cfg)
     bounds = cfg["dataset"]["bounds"]
+    if score_thresholds is None:
+        score_thresholds = cfg["evaluation"]["score_threshold"]
     common = set.intersection(*(set(f["nodes"]) for f in frames))
     groups = choose_groups(common, cfg["evaluation"])
     buckets, costs, service = defaultdict(list), defaultdict(list), defaultdict(list)
@@ -1801,7 +2024,7 @@ def evaluate_session(model, cfg, device, seed, session, frames, warmed, trace_wr
         ]
         load_ms = (time.perf_counter() - load_start) * 1000 / len(frame_chunk)
         prepared = []
-        for gt, cloud_by_node in loaded:
+        for sample, (gt, cloud_by_node) in zip(frame_chunk, loaded):
             raw, raw_ms, bev, bev_ms = {}, {}, {}, {}
             for node, cloud in cloud_by_node.items():
                 started = time.perf_counter()
@@ -1810,7 +2033,17 @@ def evaluate_session(model, cfg, device, seed, session, frames, warmed, trace_wr
                 started = time.perf_counter()
                 bev[node] = rasterize(cloud, cfg["dataset"])
                 bev_ms[node] = (time.perf_counter() - started) * 1000
-            prepared.append((gt, cloud_by_node, raw, raw_ms, bev, bev_ms))
+            # Untimed: point support of every box per node, for the visible scope.
+            support = {
+                node: box_point_counts(cloud, gt, bounds)
+                for node, cloud in cloud_by_node.items()
+            }
+            origins = {
+                node: node_origin(sample["nodes"][node]) for node in cloud_by_node
+            }
+            prepared.append(
+                (gt, cloud_by_node, raw, raw_ms, bev, bev_ms, support, origins)
+            )
         for nodes in groups:
             cloud_batches = [[item[1][n] for n in nodes] for item in prepared]
             # Edge early fusion: collaborators send raw points to the receiver.
@@ -1868,8 +2101,12 @@ def evaluate_session(model, cfg, device, seed, session, frames, warmed, trace_wr
                     preds, elapsed, representation, preprocessing, serialization = (
                         result
                     )
+                    group_support = sum(item[6][n] for n in nodes)
+                    group_origins = [item[7][n] for n in nodes]
                     for label in labels:
-                        buckets[(nodes, label)].append((preds, item[0]))
+                        buckets[(nodes, label)].append(
+                            (preds, item[0], group_support, sample["id"], group_origins)
+                        )
                         costs[(nodes, label)].append(
                             (
                                 elapsed,
@@ -1877,6 +2114,7 @@ def evaluate_session(model, cfg, device, seed, session, frames, warmed, trace_wr
                                 representation,
                                 preprocessing,
                                 serialization,
+                                upload_ms,
                             )
                         )
                         key = (
@@ -1923,16 +2161,28 @@ def evaluate_session(model, cfg, device, seed, session, frames, warmed, trace_wr
             "node_count": len(nodes),
             "strategy": strategy,
         }
-        metrics.extend(
-            base | row
-            for row in evaluate(
-                values,
-                cfg["dataset"]["classes"],
-                cfg["evaluation"]["iou_thresholds"],
-                cfg["evaluation"]["score_threshold"],
-                cfg["evaluation"]["class_iou_thresholds"],
+        records = [] if detection_writer is not None else None
+        scoped = {
+            "full": [(preds, gt) for preds, gt, *_ in values],
+            "visible": [
+                (preds, *visibility_scope(gt, support, cfg))
+                for preds, gt, support, *_ in values
+            ],
+        }
+        for scope in GT_SCOPES:
+            metrics.extend(
+                base | {"gt_scope": scope} | row
+                for row in evaluate(
+                    scoped[scope],
+                    cfg["dataset"]["classes"],
+                    cfg["evaluation"]["iou_thresholds"],
+                    score_thresholds,
+                    cfg["evaluation"]["class_iou_thresholds"],
+                    records=records if scope == "full" else None,
+                )
             )
-        )
+        if records:
+            detection_writer.writerows(detection_rows(records, base, values))
         measured = np.array(costs[(nodes, strategy)])
         cost_base = base | {
             "frames": len(values),
@@ -1940,6 +2190,7 @@ def evaluate_session(model, cfg, device, seed, session, frames, warmed, trace_wr
             "inference_decode_ms_p95": float(np.quantile(measured[:, 0], 0.95)),
             "preprocessing_ms_mean": float(measured[:, 3].mean()),
             "serialization_ms_mean": float(measured[:, 4].mean()),
+            "cloud_serialization_ms_mean": float(measured[:, 5].mean()),
         }
         cost_rows.extend(
             network_rows(
@@ -1957,8 +2208,54 @@ def evaluate_session(model, cfg, device, seed, session, frames, warmed, trace_wr
     return metrics, cost_rows, latency_tail_rows(cfg, service)
 
 
+def operating_thresholds(model, cfg, device, validation, seed_directory, signature):
+    """Per-class operating score thresholds, tuned on validation when enabled.
+
+    Thresholds maximize F1 at the primary IoU level over every validation view
+    (visible scope). Classes absent from validation keep
+    ``evaluation.score_threshold``. Results are cached per evaluation signature.
+    """
+    settings = cfg["evaluation"]
+    if not settings["tune_score_thresholds"]:
+        return settings["score_threshold"]
+    path = seed_directory / "operating_thresholds.json"
+    if path.exists():
+        try:
+            cached = json.loads(path.read_text())
+        except (OSError, ValueError):
+            cached = {}
+        if cached.get("signature") == signature:
+            return cached["thresholds"]
+    _, frames = validation_frames(
+        model, validation, cfg, device, settings["batch_size"]
+    )
+    pooled = [frame for view in frames.values() for frame in view]
+    thresholds = f1_optimal_thresholds(
+        pooled,
+        cfg["dataset"]["classes"],
+        settings["iou_thresholds"],
+        settings["class_iou_thresholds"],
+        fallback=settings["score_threshold"],
+        minimum=settings["ap_score_threshold"],
+    )
+    write_json(
+        path,
+        {
+            "signature": signature,
+            "criterion": "maximum F1 at the primary IoU level on validation (visible scope)",
+            "fallback": settings["score_threshold"],
+            "thresholds": thresholds,
+        },
+    )
+    print(f"Operating thresholds for {seed_directory.name}: {thresholds}", flush=True)
+    return thresholds
+
+
 def run_evaluation(cfg):
-    samples = [s for s in indexed(cfg) if s['split']=='test']
+    indexed_samples = indexed(cfg)
+    samples = [s for s in indexed_samples if s["split"] == "test"]
+    validation = [s for s in indexed_samples if s["split"] == "val"]
+    save_detections = cfg["evaluation"]["save_detections"]
     sessions = defaultdict(list)
     for sample in samples:
         sessions[sample['session']].append(sample)
@@ -1978,13 +2275,22 @@ def run_evaluation(cfg):
         model = make_model(cfg, device)
         model.load_state_dict(state["model"])
         model.eval()
+        thresholds = operating_thresholds(
+            model, cfg, device, validation, checkpoint.parent, evaluation_signature
+        )
         warmed = set()
         for session, frames in sessions.items():
             part_directory = output / "eval_parts" / f"seed_{seed}"
             part_path = part_directory / f"{session}.json"
             trace_path = part_directory / f"{session}.traces.csv"
             tail_path = part_directory / f"{session}.latency_tail.csv"
-            if part_path.exists() and trace_path.exists() and tail_path.exists():
+            detection_path = part_directory / f"{session}.detections.csv.gz"
+            if (
+                part_path.exists()
+                and trace_path.exists()
+                and tail_path.exists()
+                and (detection_path.exists() or not save_detections)
+            ):
                 try:
                     part = json.loads(part_path.read_text())
                 except (OSError, ValueError) as error:
@@ -2006,15 +2312,39 @@ def run_evaluation(cfg):
             # Traces are streamed to disk: a full sweep produces millions of rows.
             part_directory.mkdir(parents=True, exist_ok=True)
             temporary = trace_path.with_name(f".{trace_path.name}.{os.getpid()}.tmp")
-            with temporary.open("w", newline="") as stream:
+            detection_temporary = detection_path.with_name(
+                f".{detection_path.name}.{os.getpid()}.tmp"
+            )
+            with temporary.open("w", newline="") as stream, (
+                gzip.open(detection_temporary, "wt", newline="", compresslevel=6)
+                if save_detections
+                else open(os.devnull, "w")
+            ) as detection_stream:
                 writer = csv.DictWriter(stream, fieldnames=TRACE_FIELDS)
                 writer.writeheader()
+                detection_writer = None
+                if save_detections:
+                    detection_writer = csv.DictWriter(
+                        detection_stream, fieldnames=DETECTION_FIELDS
+                    )
+                    detection_writer.writeheader()
                 metrics, costs, tails = evaluate_session(
-                    model, cfg, device, seed, session, frames, warmed, writer
+                    model,
+                    cfg,
+                    device,
+                    seed,
+                    session,
+                    frames,
+                    warmed,
+                    writer,
+                    thresholds,
+                    detection_writer,
                 )
                 stream.flush()
                 os.fsync(stream.fileno())
             temporary.replace(trace_path)
+            if save_detections:
+                detection_temporary.replace(detection_path)
             write_csv(tail_path, tails)
             # The JSON part is written last; it marks the session as complete.
             write_json(
@@ -2038,10 +2368,264 @@ def run_evaluation(cfg):
     return all_metrics
 
 
+def range_bin(distance):
+    if distance in ("", None):
+        return "unknown"
+    distance = float(distance)
+    edges = (0.0, *RANGE_BINS_M, float("inf"))
+    for low, high in zip(edges, edges[1:]):
+        if distance < high:
+            return f"{low:g}-{high:g}m" if math.isfinite(high) else f">={low:g}m"
+    return "unknown"
+
+
+def detection_diagnostics(cfg, output):
+    """Range breakdown and false-positive map from per-detection dumps.
+
+    Uses the full-ROI scope at the first IoU level. Distance is from the box
+    centre to the nearest participating node.
+    """
+    parts = sorted(output.glob("eval_parts/seed_*/*.detections.csv.gz"))
+    if not parts:
+        return []
+    counts = defaultdict(lambda: defaultdict(int))
+    bounds = cfg["dataset"]["bounds"]
+    edges_x = np.linspace(bounds[0], bounds[3], 101)
+    edges_y = np.linspace(bounds[1], bounds[4], 101)
+    false_positives = defaultdict(lambda: np.zeros((100, 100)))
+    for part in parts:
+        with gzip.open(part, "rt", newline="") as stream:
+            for row in csv.DictReader(stream):
+                key = (
+                    row["weather"],
+                    int(row["node_count"]),
+                    row["strategy"],
+                    row["class"],
+                    range_bin(row["nearest_node_m"]),
+                )
+                counts[key][f'{row["record"]}:{row["status"]}'] += 1
+                if row["record"] == "prediction" and row["status"] == "fp":
+                    ix = np.searchsorted(edges_x, float(row["x"]), side="right") - 1
+                    iy = np.searchsorted(edges_y, float(row["y"]), side="right") - 1
+                    if 0 <= ix < 100 and 0 <= iy < 100:
+                        false_positives[int(row["node_count"])][iy, ix] += 1
+    rows = []
+    for key, values in sorted(counts.items()):
+        tp = values["prediction:tp"]
+        fp = values["prediction:fp"]
+        matched = values["ground_truth:matched"]
+        missed = values["ground_truth:missed"]
+        rows.append(
+            dict(zip(("weather", "node_count", "strategy", "class", "range"), key))
+            | {
+                "true_positives": tp,
+                "false_positives": fp,
+                "ignored_predictions": values["prediction:ignored"],
+                "matched_ground_truth": matched,
+                "ground_truth": matched + missed,
+                "precision": tp / (tp + fp) if tp + fp else None,
+                "recall": matched / (matched + missed) if matched + missed else None,
+            }
+        )
+    write_csv(output / "range_breakdown.csv", rows)
+    if cfg["output"]["plots"] and false_positives:
+        try:
+            import matplotlib
+        except ImportError:
+            return rows
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        node_counts = sorted(false_positives)
+        figure, axes = plt.subplots(
+            1, len(node_counts), figsize=(4.5 * len(node_counts), 4.5), squeeze=False
+        )
+        for axis, count in zip(axes[0], node_counts):
+            image = axis.imshow(
+                np.log1p(false_positives[count]),
+                origin="lower",
+                extent=(bounds[0], bounds[3], bounds[1], bounds[4]),
+                cmap="magma",
+            )
+            axis.set(
+                title=f"False positives, {count} node(s)",
+                xlabel="x (m)",
+                ylabel="y (m)",
+            )
+            figure.colorbar(image, ax=axis, label="log(1 + count)")
+        figure.tight_layout()
+        figure.savefig(output / "false_positive_map.png", dpi=140)
+        plt.close(figure)
+    return rows
+
+
+def report_context_sections(cfg, output):
+    """Validation coverage, operating thresholds, and sensor point counts."""
+    lines = []
+    inventory_path = output / "class_inventory.json"
+    if inventory_path.exists():
+        inventory = json.loads(inventory_path.read_text())
+        missing = [
+            label
+            for label in cfg["dataset"]["classes"]
+            if inventory.get("val", {}).get(label, 0) == 0
+            and inventory.get("test", {}).get(label, 0) > 0
+        ]
+        lines.extend(["## Validation coverage", ""])
+        lines.append(
+            "Classes with test but no validation ground truth (unseen by checkpoint "
+            "selection and threshold tuning): " + (", ".join(missing) or "none") + "."
+        )
+        lines.append("")
+    threshold_rows = []
+    for seed in cfg["training"]["seeds"]:
+        path = output / f"seed_{seed}" / "operating_thresholds.json"
+        if path.exists():
+            threshold_rows.append((seed, json.loads(path.read_text())["thresholds"]))
+    if threshold_rows:
+        classes = cfg["dataset"]["classes"]
+        lines.extend(
+            [
+                "## Operating thresholds",
+                "",
+                "| Seed | " + " | ".join(classes) + " |",
+                "|---:|" + "---:|" * len(classes),
+            ]
+        )
+        for seed, values in threshold_rows:
+            lines.append(
+                f"| {seed} | "
+                + " | ".join(
+                    f"{values.get(label, float('nan')):.3f}" for label in classes
+                )
+                + " |"
+            )
+        lines.append("")
+    inspection_path = output / "inspection.json"
+    if inspection_path.exists():
+        per_session = defaultdict(lambda: defaultdict(list))
+        for entry in json.loads(inspection_path.read_text()):
+            session = entry["sample"].split("/", 1)[0]
+            for node, count in entry["points_in_bounds"].items():
+                per_session[session][node].append(count)
+        nodes = sorted(
+            {node for values in per_session.values() for node in values},
+            key=lambda value: (len(value), value),
+        )
+        if nodes:
+            lines.extend(
+                [
+                    "## Sensor point counts",
+                    "",
+                    "Mean in-bounds points per node (thousands) over inspected slices; "
+                    "a drop flags a degraded or obstructed sensor.",
+                    "",
+                    "| Session | " + " | ".join(nodes) + " |",
+                    "|---|" + "---:|" * len(nodes),
+                ]
+            )
+            for session, values in sorted(per_session.items()):
+                lines.append(
+                    f"| {session} | "
+                    + " | ".join(
+                        (
+                            f"{np.mean(values[node]) / 1000:.1f}"
+                            if values.get(node)
+                            else "n/a"
+                        )
+                        for node in nodes
+                    )
+                    + " |"
+                )
+            lines.append("")
+    return lines
+
+
+def latency_feasibility_section(cfg, costs):
+    """Required link rate and measured end-to-end latency per configuration."""
+    groups = defaultdict(list)
+    for row in costs:
+        strategy = row["strategy"].split("@", 1)[0].split("_", 1)[0]
+        groups[(strategy, int(row["node_count"]), row["placement"])].append(row)
+    if not groups:
+        return []
+    bandwidths = sorted({float(row["bandwidth_mbps"]) for row in costs})
+    lines = [
+        "",
+        "## Latency feasibility",
+        "",
+        f'Required link rate delivers each frame within one {cfg["latency_experiment"]["frame_period_ms"]:g} ms period; '
+        "configurations above the link rate are infeasible (their queue grows without bound). "
+        "See latency_tail_summary.csv (`queue_stable`) for deadline-miss rates.",
+        "",
+        "| Fusion | Nodes | Placement | Payload (kB) | Required (Mbps) | "
+        + " | ".join(f"E2E @ {b:g} Mbps (ms)" for b in bandwidths)
+        + " |",
+        "|---|---:|---|---:|---:|" + "---:|" * len(bandwidths),
+    ]
+
+    def value(row, key):
+        return float(row[key]) if row.get(key) not in ("", None) else float("nan")
+
+    period_ms = cfg["latency_experiment"]["frame_period_ms"]
+    for (strategy, count, placement), rows in sorted(groups.items()):
+        payload_bytes = np.mean([value(row, "payload_bytes") for row in rows])
+        payload_kb = payload_bytes / 1000
+        required = payload_bytes * 8 / period_ms / 1000
+        cells = []
+        for bandwidth in bandwidths:
+            selected = [r for r in rows if float(r["bandwidth_mbps"]) == bandwidth]
+            latency = np.mean([value(r, "end_to_end_ms_measured") for r in selected])
+            text = f"{latency:.0f}" if math.isfinite(latency) else "n/a"
+            cells.append(text if required < bandwidth else f"infeasible ({text})")
+        lines.append(
+            f"| {strategy} | {count} | {placement} | {payload_kb:.1f} | {required:.1f} | "
+            + " | ".join(cells)
+            + " |"
+        )
+    return lines
+
+
+def range_section(ranges):
+    pooled = defaultdict(lambda: defaultdict(int))
+    for row in ranges:
+        key = (row["node_count"], row["strategy"], row["range"])
+        for name in (
+            "true_positives",
+            "false_positives",
+            "matched_ground_truth",
+            "ground_truth",
+        ):
+            pooled[key][name] += int(row[name])
+    lines = [
+        "",
+        "## Accuracy by range (full scope, IoU level 0, all classes)",
+        "",
+        "Range is from the box centre to the nearest participating node. "
+        "Per-class rows are in range_breakdown.csv.",
+        "",
+        "| Nodes | Fusion | Range | Precision | Recall | False positives | Ground truth |",
+        "|---:|---|---|---:|---:|---:|---:|",
+    ]
+    for (count, strategy, distance), values in sorted(pooled.items()):
+        tp, fp = values["true_positives"], values["false_positives"]
+        matched, gt = values["matched_ground_truth"], values["ground_truth"]
+        precision = f"{tp / (tp + fp):.3f}" if tp + fp else "n/a"
+        recall = f"{matched / gt:.3f}" if gt else "n/a"
+        lines.append(
+            f"| {count} | {strategy} | {distance} | {precision} | {recall} | {fp} | {gt} |"
+        )
+    return lines
+
+
 def report(cfg):
     output = Path(cfg['output']['root'])
     with (output/'accuracy.csv').open() as stream:
         accuracy = list(csv.DictReader(stream))
+    for row in accuracy:
+        # Results from before ground-truth scopes were scored on the full ROI.
+        if not row.get("gt_scope"):
+            row["gt_scope"] = "full"
     with (output/'latency_communication.csv').open() as stream:
         costs = list(csv.DictReader(stream))
 
@@ -2051,7 +2635,15 @@ def report(cfg):
     metric_names = ('ap_3d','precision','recall','f1','mean_matched_iou_3d',
                     'mean_center_error_m','mean_yaw_error_deg','mean_size_iou')
     # Thresholds may differ by class, so groups across classes use the IoU level.
-    dimensions = ("weather", "node_count", "strategy", "class", "iou_level", "iou")
+    dimensions = (
+        "gt_scope",
+        "weather",
+        "node_count",
+        "strategy",
+        "class",
+        "iou_level",
+        "iou",
+    )
     aggregates = defaultdict(list)
     for row in accuracy:
         if number(row, 'ap_3d') is not None:
@@ -2074,7 +2666,7 @@ def report(cfg):
     write_csv(output/'accuracy_summary.csv',summary)
 
     overview_groups = defaultdict(list)
-    overview_dimensions = ("weather", "node_count", "strategy", "iou_level")
+    overview_dimensions = ("gt_scope", "weather", "node_count", "strategy", "iou_level")
     for row in accuracy:
         if number(row, 'ap_3d') is not None:
             overview_groups[tuple(row[k] for k in overview_dimensions)].append(row)
@@ -2127,6 +2719,7 @@ def report(cfg):
     write_csv(output / "metrics_overview.csv", overview)
 
     comparison_dimensions = (
+        "gt_scope",
         "seed",
         "session",
         "weather",
@@ -2188,13 +2781,28 @@ def report(cfg):
     for key, values in sorted(weather_groups.items()):
         ap = [v['ap_gain_over_mean_single'] for v in values]
         recall = [v['recall_gain_over_mean_single'] for v in values]
-        weather_summary.append(dict(zip(dimensions,key)) | {
-            'mean_ap_gain':float(np.mean(ap)), 'std_ap_gain':float(np.std(ap)),
-            'ap_positive_rate':float(np.mean(np.asarray(ap)>0)),
-            'mean_recall_gain':float(np.mean(recall)), 'std_recall_gain':float(np.std(recall)),
-            'recall_positive_rate':float(np.mean(np.asarray(recall)>0)),
-            'paired_observations':len(values)})
-    write_csv(output/'weather_cooperation_summary.csv',weather_summary)
+        best = [v["ap_gain_over_best_single"] for v in values]
+        worst = min(values, key=lambda v: v["ap_gain_over_best_single"])
+        weather_summary.append(
+            dict(zip(dimensions, key))
+            | {
+                "mean_ap_gain": float(np.mean(ap)),
+                "std_ap_gain": float(np.std(ap)),
+                "ap_positive_rate": float(np.mean(np.asarray(ap) > 0)),
+                "mean_recall_gain": float(np.mean(recall)),
+                "std_recall_gain": float(np.std(recall)),
+                "recall_positive_rate": float(np.mean(np.asarray(recall) > 0)),
+                # Against the best participating node, and the worst paired case,
+                # so a session where cooperation hurts is not averaged away.
+                "mean_ap_gain_over_best": float(np.mean(best)),
+                "min_ap_gain_over_best": float(worst["ap_gain_over_best_single"]),
+                "min_ap_gain_session": worst["session"],
+                "min_ap_gain_nodes": worst["nodes"],
+                "negative_over_best": int(np.sum(np.asarray(best) < 0)),
+                "paired_observations": len(values),
+            }
+        )
+    write_csv(output / "weather_cooperation_summary.csv", weather_summary)
 
     paired = defaultdict(lambda: defaultdict(list))
     for row in accuracy:
@@ -2232,6 +2840,7 @@ def report(cfg):
             tradeoffs.append(
                 {k: row[k] for k in run_keys}
                 | {
+                    "gt_scope": row["gt_scope"],
                     "class": row["class"],
                     "iou_level": row["iou_level"],
                     "iou": row["iou"],
@@ -2248,6 +2857,8 @@ def report(cfg):
                     "serialization_ms_mean": cost["serialization_ms_mean"],
                     "transmission_ms_assumed": cost["transmission_ms_model"],
                     "end_to_end_ms_assumed": cost["end_to_end_ms_model"],
+                    "end_to_end_ms_measured": cost.get("end_to_end_ms_measured"),
+                    "required_bandwidth_mbps": cost.get("required_bandwidth_mbps"),
                 }
             )
     write_csv(output / "accuracy_latency_tradeoffs.csv", tradeoffs)
@@ -2266,6 +2877,7 @@ def report(cfg):
             key = tuple(
                 row[k]
                 for k in (
+                    "gt_scope",
                     "weather",
                     "node_count",
                     "class",
@@ -2279,9 +2891,10 @@ def report(cfg):
             )
     adaptive_rate = []
     for key, values in sorted(adaptive_groups.items()):
-        weather, node_count, label, level, iou, strategy, selector = key
+        scope, weather, node_count, label, level, iou, strategy, selector = key
         adaptive_rate.append(
             {
+                "gt_scope": scope,
                 "weather": weather,
                 "node_count": node_count,
                 "class": label,
@@ -2298,7 +2911,15 @@ def report(cfg):
         )
     write_csv(output / "adaptive_rate_accuracy.csv", adaptive_rate)
 
-    auc_dimensions = ("weather", "node_count", "class", "iou_level", "iou", "selector")
+    auc_dimensions = (
+        "gt_scope",
+        "weather",
+        "node_count",
+        "class",
+        "iou_level",
+        "iou",
+        "selector",
+    )
     auc_groups = defaultdict(list)
     for row in adaptive_rate:
         key = tuple(row[k] for k in auc_dimensions)
@@ -2323,6 +2944,7 @@ def report(cfg):
         )
     write_csv(output / "adaptive_rate_accuracy_auc.csv", adaptive_auc)
 
+    ranges = detection_diagnostics(cfg, output)
     if cfg['output']['plots'] and summary:
         try:
             import matplotlib
@@ -2346,17 +2968,28 @@ def report(cfg):
                         if row["strategy"] == adaptive_primary
                         else row["strategy"]
                     )
-                    grouped[label].append(
+                    grouped[(label, row["gt_scope"])].append(
                         (int(row["node_count"]), float(row["mean_ap"]))
                     )
             figure, axis = plt.subplots(figsize=(10, 6))
-            for strategy, values in sorted(grouped.items()):
+            counts_seen = set()
+            for (strategy, scope), values in sorted(grouped.items()):
                 by_count = defaultdict(list)
                 for count, value in values:
                     by_count[count].append(value)
                 x = sorted(by_count)
+                counts_seen.update(x)
                 y = [float(np.mean(by_count[count])) for count in x]
-                axis.plot(x, y, marker="o", label=strategy)
+                axis.plot(
+                    x,
+                    y,
+                    marker="o",
+                    linestyle="-" if scope == "full" else "--",
+                    label=f"{strategy} ({scope} GT)",
+                )
+            # Node counts double, so a log2 axis spaces them evenly.
+            axis.set_xscale("log", base=2)
+            axis.set_xticks(sorted(counts_seen), [str(c) for c in sorted(counts_seen)])
             axis.set(
                 xlabel="node count",
                 ylabel="macro mean AP",
@@ -2371,19 +3004,49 @@ def report(cfg):
             figure.tight_layout()
             figure.savefig(output/'accuracy_by_nodes.png', dpi=160)
             plt.close(figure)
-            if weather_summary:
-                figure, axis = plt.subplots(figsize=(10, 6))
-                grouped = defaultdict(list)
-                for row in weather_summary:
-                    grouped[(row['weather'], row['strategy'])].append(float(row['mean_ap_gain']))
-                labels, values = [], []
-                for key, group in sorted(grouped.items()):
-                    labels.append('/'.join(key))
-                    values.append(float(np.mean(group)))
-                axis.bar(labels, values)
-                axis.axhline(0, color='black', linewidth=.8)
-                axis.set(ylabel='mean paired AP gain', title='Cooperation gain by weather and fusion')
-                axis.tick_params(axis='x', rotation=45)
+            primary_gains = [
+                row for row in weather_summary if int(row["iou_level"]) == 0
+            ]
+            if primary_gains:
+                scopes = sorted({row["gt_scope"] for row in primary_gains})
+                figure, axes = plt.subplots(
+                    1, len(scopes), figsize=(7 * len(scopes), 5), squeeze=False
+                )
+                for axis, scope in zip(axes[0], scopes):
+                    grouped = defaultdict(list)
+                    for row in primary_gains:
+                        if row["gt_scope"] == scope:
+                            grouped[
+                                (
+                                    row["weather"],
+                                    row["strategy"],
+                                    int(row["node_count"]),
+                                )
+                            ].append(float(row["mean_ap_gain_over_best"]))
+                    labels = sorted({key[:2] for key in grouped})
+                    counts = sorted({key[2] for key in grouped})
+                    width = 0.8 / max(1, len(counts))
+                    for offset, count in enumerate(counts):
+                        axis.bar(
+                            np.arange(len(labels)) + offset * width,
+                            [
+                                float(np.mean(grouped.get(label + (count,), [np.nan])))
+                                for label in labels
+                            ],
+                            width,
+                            label=f"{count} nodes",
+                        )
+                    axis.set_xticks(
+                        np.arange(len(labels)) + width * (len(counts) - 1) / 2,
+                        ["/".join(label) for label in labels],
+                        rotation=45,
+                    )
+                    axis.axhline(0, color="black", linewidth=0.8)
+                    axis.set(
+                        ylabel="mean AP gain over best member node",
+                        title=f"Cooperation gain, IoU level 0 ({scope} GT)",
+                    )
+                    axis.legend(fontsize=8)
                 figure.tight_layout()
                 figure.savefig(output/'cooperation_gain_by_weather.png', dpi=160)
                 plt.close(figure)
@@ -2392,9 +3055,10 @@ def report(cfg):
             latency_groups = defaultdict(list)
             for row in costs:
                 strategy = row["strategy"].split("@", 1)[0].split("_", 1)[0]
+                measured = row.get("end_to_end_ms_measured")
                 latency_groups[
                     (row["placement"], strategy, float(row["bandwidth_mbps"]))
-                ].append(float(row["end_to_end_ms_model"]))
+                ].append(float(measured if measured else row["end_to_end_ms_model"]))
             for placement, strategy in sorted(
                 {(key[0], key[1]) for key in latency_groups}
             ):
@@ -2412,9 +3076,10 @@ def report(cfg):
                     )
             axis.set(
                 xlabel="assumed bandwidth (Mbps)",
-                ylabel="mean assumed end-to-end latency (ms)",
-                title="Analytical latency by placement and bandwidth",
+                ylabel="mean end-to-end latency (ms)",
+                title="End-to-end latency: measured compute, assumed sensing/RTT/link",
                 xscale="log",
+                yscale="log",
             )
             axis.legend()
             axis.grid(alpha=.25)
@@ -2453,10 +3118,23 @@ def report(cfg):
             else []
         ),
         "Accuracy: rotated 3D, globally confidence-ranked AP within each session/subset/seed, using candidates retained at the configured AP score threshold.",
-        "Precision, recall, F1, and localization diagnostics use the configured operating score threshold after class-wise NMS.",
+        (
+            "Precision, recall, F1, and localization diagnostics use per-class operating score thresholds tuned for maximum F1 on validation (see Operating thresholds), after class-wise NMS."
+            if cfg["evaluation"]["tune_score_thresholds"]
+            else "Precision, recall, F1, and localization diagnostics use the configured operating score threshold after class-wise NMS."
+        ),
+        (
+            "Detection scores are IoU-rectified: heat^(1-a) * predicted IoU^a with "
+            f'a={cfg["evaluation"]["iou_score_weight"]:g}.'
+        ),
+        (
+            "Ground-truth scopes: `full` scores every box in the fixed global ROI (system coverage); "
+            f'`visible` scores boxes with at least {cfg["evaluation"]["min_visible_points"]} points from the '
+            "subset's own nodes and ignores the rest, isolating fusion quality from added coverage."
+        ),
         "Matched-object diagnostics include 3D IoU, center error, yaw error, and dimension IoU.",
         "All aggregates are descriptive means, not confidence intervals or causal weather estimates.",
-        "Single-node rows cover every common real node. The fixed global ROI/GT is unchanged across counts.",
+        "Single-node rows cover every common real node. The fixed global ROI/GT is unchanged across counts in the full scope.",
         "Measured inference+decode uses batched node encoding and includes decode/NMS; excludes loading/rasterization/serialization.",
         "With one node every strategy reduces to the same detector; it is computed once and reported under each strategy label.",
         (
@@ -2474,7 +3152,7 @@ def report(cfg):
             )
             + "."
         ),
-        "End-to-end latency is an analytical estimate using configured literature-derived assumptions.",
+        "End-to-end latency adds measured preprocessing, inference+decode, and serialization to assumed sensing, RTT, and link rate (`end_to_end_ms_measured`); `end_to_end_ms_model` keeps the assumed processing constants.",
         "Early fusion sends float32 raw points; dense intermediate features and adaptive sparse messages use the configured value width (sparse messages add index width); late fusion sends float32 boxes at the operating score threshold. All payloads use zlib level 1.",
         (
             "Adaptive fusion rotates every participating node as the dense local reference and budgets collaborator cells only."
@@ -2484,28 +3162,87 @@ def report(cfg):
         "Cloud placement uploads raw cropped points from every participating node, receiver included; edge sends collaborator raw points/features/local predictions according to strategy.",
         f'Assumption source: {cfg["deployment_assumptions"]["source"]}.',
         weather_limit,
-        "cooperation_gains.csv uses paired comparisons within session/seed/class/strategy/IoU.",
+        "cooperation_gains.csv uses paired comparisons within scope/session/seed/class/strategy/IoU.",
         "",
-        "## Cooperation gain by weather",
-        "",
-        "| Weather | Nodes | Fusion | Class | IoU | AP gain | Recall gain | AP positive rate |",
-        "|---|---:|---|---|---:|---:|---:|---:|",
     ]
+    lines.extend(report_context_sections(cfg, output))
+    lines.extend(
+        [
+            "## Cooperation gain by weather (IoU level 0)",
+            "",
+            "Gain over mean and over best member node; the worst paired case keeps a "
+            "session where cooperation hurts visible.",
+            "",
+            "| Scope | Weather | Nodes | Fusion | Class | IoU | AP gain (mean) | AP gain (best) "
+            "| Worst AP gain (best) | Worst session | Recall gain | AP positive rate |",
+            "|---|---|---:|---|---|---:|---:|---:|---:|---|---:|---:|",
+        ]
+    )
     for row in weather_summary:
-        lines.append(f'| {row["weather"]} | {row["node_count"]} | {row["strategy"]} | '
-                     f'{row["class"]} | {row["iou"]} | {row["mean_ap_gain"]:.4f} | '
-                     f'{row["mean_recall_gain"]:.4f} | {row["ap_positive_rate"]:.2f} |')
-    lines.extend(['', '## Absolute accuracy', '',
-                  '| Weather | Nodes | Fusion | Class | IoU | Mean AP | Precision | Recall | F1 | Center error (m) |',
-                  '|---|---:|---|---|---:|---:|---:|---:|---:|---:|'])
+        if int(row["iou_level"]) != 0:
+            continue
+        lines.append(
+            f'| {row["gt_scope"]} | {row["weather"]} | {row["node_count"]} | '
+            f'{row["strategy"]} | {row["class"]} | {row["iou"]} | '
+            f'{row["mean_ap_gain"]:.4f} | {row["mean_ap_gain_over_best"]:.4f} | '
+            f'{row["min_ap_gain_over_best"]:.4f} | {row["min_ap_gain_session"]} | '
+            f'{row["mean_recall_gain"]:.4f} | {row["ap_positive_rate"]:.2f} |'
+        )
+    harmful = sorted(
+        (row for row in gains if row["ap_gain_over_best_single"] < -0.02),
+        key=lambda row: row["ap_gain_over_best_single"],
+    )
+    lines.extend(
+        [
+            "",
+            "## Cases where cooperation reduced AP",
+            "",
+            "Paired subsets whose AP is more than 0.02 below their best member node "
+            f"({len(harmful)} cases; at most 40 shown, worst first).",
+            "",
+        ]
+    )
+    if harmful:
+        lines.extend(
+            [
+                "| Scope | Session | Nodes | Fusion | Class | IoU | Subset AP | Best member AP | Gain |",
+                "|---|---|---|---|---|---:|---:|---:|---:|",
+            ]
+        )
+        for row in harmful[:40]:
+            lines.append(
+                f'| {row["gt_scope"]} | {row["session"]} | {row["nodes"]} | '
+                f'{row["strategy"]} | {row["class"]} | {row["iou"]} | '
+                f'{row["multi_node_ap_mean"]:.4f} | {row["single_node_ap_best"]:.4f} | '
+                f'{row["ap_gain_over_best_single"]:.4f} |'
+            )
+    else:
+        lines.append("None.")
+    lines.extend(latency_feasibility_section(cfg, costs))
+    if ranges:
+        lines.extend(range_section(ranges))
+    lines.extend(
+        [
+            "",
+            "## Absolute accuracy",
+            "",
+            "| Scope | Weather | Nodes | Fusion | Class | IoU | Mean AP | Precision | Recall | F1 | Center error (m) |",
+            "|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
     for row in summary:
-        center = ('n/a' if row['mean_center_error_m'] is None else
-                  f'{row["mean_center_error_m"]:.3f}')
-        lines.append(f'| {row["weather"]} | {row["node_count"]} | {row["strategy"]} | '
-                     f'{row["class"]} | {row["iou"]} | {row["mean_ap"]:.4f} | '
-                     f'{row["mean_precision"]:.4f} | {row["mean_recall"]:.4f} | '
-                     f'{row["mean_f1"]:.4f} | {center} |')
-    (output/'report.md').write_text('\n'.join(lines)+'\n')
+        center = (
+            "n/a"
+            if row["mean_center_error_m"] is None
+            else f'{row["mean_center_error_m"]:.3f}'
+        )
+        lines.append(
+            f'| {row["gt_scope"]} | {row["weather"]} | {row["node_count"]} | {row["strategy"]} | '
+            f'{row["class"]} | {row["iou"]} | {row["mean_ap"]:.4f} | '
+            f'{row["mean_precision"]:.4f} | {row["mean_recall"]:.4f} | '
+            f'{row["mean_f1"]:.4f} | {center} |'
+        )
+    (output / "report.md").write_text("\n".join(lines) + "\n")
     print(f'Report: {output / "report.md"}')
 
 
@@ -2547,8 +3284,21 @@ def verify_results(cfg):
         checks[f'artifact:{name}'] = path.is_file()
         if not checks[f'artifact:{name}']:
             errors.append(f'missing artifact: {name}')
-    for seed in cfg['training']['seeds']:
-        for name in ('best.pt','latest.pt','complete.json',f'training_metrics_seed_{seed}.csv'):
+    if cfg["evaluation"]["save_detections"]:
+        path = output / "range_breakdown.csv"
+        checks["artifact:range_breakdown.csv"] = path.is_file()
+        if not path.is_file():
+            errors.append("missing artifact: range_breakdown.csv")
+    for seed in cfg["training"]["seeds"]:
+        names = [
+            "best.pt",
+            "latest.pt",
+            "complete.json",
+            f"training_metrics_seed_{seed}.csv",
+        ]
+        if cfg["evaluation"]["tune_score_thresholds"]:
+            names.append("operating_thresholds.json")
+        for name in names:
             path = output/f'seed_{seed}'/name
             checks[f'seed_{seed}:{name}'] = path.is_file() and path.stat().st_size > 0
             if not checks[f'seed_{seed}:{name}']:
@@ -2560,7 +3310,20 @@ def verify_results(cfg):
     checks['accuracy_rows_present'] = bool(metric_rows)
     if not metric_rows:
         errors.append('accuracy.csv contains no metric rows')
-    bounded = ('ap_3d','precision','recall','f1','mean_matched_iou_3d','mean_size_iou')
+    scopes = {row.get("gt_scope") for row in metric_rows}
+    checks["gt_scopes_present"] = not metric_rows or scopes == set(GT_SCOPES)
+    if not checks["gt_scopes_present"]:
+        errors.append(
+            f"accuracy.csv ground-truth scopes {sorted(map(str, scopes))} != {list(GT_SCOPES)}"
+        )
+    bounded = (
+        "ap_3d",
+        "precision",
+        "recall",
+        "f1",
+        "mean_matched_iou_3d",
+        "mean_size_iou",
+    )
     for line, row in enumerate(metric_rows, start=2):
         for name in bounded:
             value = row.get(name)

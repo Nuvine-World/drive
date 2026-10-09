@@ -1,4 +1,4 @@
-from src.data.coinfra import rasterize
+from src.data.coinfra import bev_channels, rasterize
 
 
 def backend(cfg):

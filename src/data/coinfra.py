@@ -168,22 +168,42 @@ def load_cloud(node, bounds):
     return np.column_stack((xyz[mask], intensity[mask])).astype(np.float32)
 
 
+def bev_channels(cfg):
+    """Density, maximum, minimum, and mean height, plus intensity when used."""
+    return 5 if cfg.get("use_intensity", True) else 4
+
+
 def rasterize(points, cfg):
     b, r = cfg['bounds'], cfg['resolution']
     w, h = int(np.ceil((b[3]-b[0])/r)), int(np.ceil((b[4]-b[1])/r))
-    bev = np.zeros((3, h, w), dtype=np.float32)
+    bev = np.zeros((bev_channels(cfg), h, w), dtype=np.float32)
     if not len(points):
         return bev
     x, y = ((points[:, 0]-b[0])/r).astype(int), ((points[:, 1]-b[1])/r).astype(int)
     valid = (x>=0) & (x<w) & (y>=0) & (y<h)
     x, y, points = x[valid], y[valid], points[valid]
-    np.add.at(bev[0], (y, x), 1)
-    np.maximum.at(bev[1], (y, x), (points[:, 2]-b[2])/(b[5]-b[2]))
-    intensity = points[:, 3]
-    if cfg.get("intensity_max"):
-        # Bring sensor-specific intensity scales into [0, 1] like the other channels.
-        intensity = np.clip(intensity, 0, cfg["intensity_max"]) / cfg["intensity_max"]
-    np.add.at(bev[2], (y, x), intensity)
-    bev[2] /= np.maximum(bev[0], 1)
-    bev[0] = np.log1p(bev[0])
+    cells = y * w + x
+    count = np.bincount(cells, minlength=h * w).reshape(h, w).astype(np.float32)
+    occupied = count > 0
+    divisor = np.maximum(count, 1)
+    height = ((points[:, 2] - b[2]) / (b[5] - b[2])).astype(np.float32)
+    np.maximum.at(bev[1], (y, x), height)
+    # The minimum and the spread between minimum and maximum height describe
+    # vertical structure (ground plus object top) independent of terrain level.
+    minimum = np.ones((h, w), np.float32)
+    np.minimum.at(minimum, (y, x), height)
+    bev[2] = np.where(occupied, minimum, 0)
+    bev[3] = np.bincount(cells, weights=height, minlength=h * w).reshape(h, w) / divisor
+    if cfg.get("use_intensity", True):
+        intensity = points[:, 3]
+        if cfg.get("intensity_max"):
+            # Bring sensor-specific intensity scales into [0, 1] like the other channels.
+            intensity = (
+                np.clip(intensity, 0, cfg["intensity_max"]) / cfg["intensity_max"]
+            )
+        bev[4] = (
+            np.bincount(cells, weights=intensity, minlength=h * w).reshape(h, w)
+            / divisor
+        )
+    bev[0] = np.log1p(count)
     return bev

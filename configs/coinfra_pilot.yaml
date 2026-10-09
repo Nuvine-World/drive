@@ -27,9 +27,10 @@ dataset:
   # Separate prediction slots preserve closely spaced same-class objects whose
   # centers fall in the same 0.8 m prediction cell (0.4 m BEV, output stride 2).
   objects_per_cell: 2
-  # Full-scale point intensity, used to map the intensity channel to [0, 1].
-  # Inspection fails if the recorded p99 intensity does not fit this scale.
-  intensity_max: 255.0
+  # CoInfra point intensity is constant (p1 = p99 = 1.0 in every inspected
+  # slice), so the BEV uses density and maximum/minimum/mean height only.
+  # Inspection fails if intensity is enabled but carries no information.
+  use_intensity: false
   # Two recording sessions train the detector (1,245 sunny + 2,183 heavy-snow
   # frames). Every weather condition still has at least one held-out session.
   splits:
