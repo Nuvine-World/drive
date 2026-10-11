@@ -427,15 +427,25 @@ def loss(outputs, target, cell_size=(1.0, 1.0)):
         else prediction.sum() * 0
     )
     if mask.any():
-        with torch.no_grad():
-            iou = paired_iou3d(
-                regression_boxes(boxes[mask], cell_size),
-                regression_boxes(expected[mask], cell_size),
+        selected_boxes = boxes[mask]
+        selected_expected = expected[mask]
+        if (
+            torch.isfinite(selected_boxes).all()
+            and torch.isfinite(selected_expected).all()
+        ):
+            with torch.no_grad():
+                iou = paired_iou3d(
+                    regression_boxes(selected_boxes, cell_size),
+                    regression_boxes(selected_expected, cell_size),
+                )
+            quality_loss = F.binary_cross_entropy_with_logits(
+                quality[mask],
+                torch.as_tensor(iou, dtype=quality.dtype, device=quality.device),
             )
-        quality_loss = F.binary_cross_entropy_with_logits(
-            quality[mask],
-            torch.as_tensor(iou, dtype=quality.dtype, device=quality.device),
-        )
+        else:
+            # Preserve a nonfinite result so the training loop can retry an
+            # AMP-overflowed batch in fp32 without passing NaNs into GEOS.
+            quality_loss = selected_boxes.sum() * 0 + selected_expected.sum() * 0
     else:
         quality_loss = quality.sum() * 0
     return focal + regression_loss + quality_loss

@@ -544,6 +544,26 @@ def test_batched_detector_and_class_balanced_loss_are_finite(fixture_config):
     torch.testing.assert_close(batched[1], torch.cat([value[1] for value in separate]))
 
 
+def test_loss_returns_nonfinite_before_geometry_for_nan_box(
+    fixture_config, monkeypatch
+):
+    classes = len(fixture_config["dataset"]["classes"])
+    slots = fixture_config["dataset"]["objects_per_cell"]
+    box = BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")
+    target = targets([box], fixture_config["dataset"], (8, 8))
+    logits = torch.zeros((1, classes * slots, 8, 8))
+    regression = torch.zeros((1, REGRESSION_CHANNELS * classes * slots, 8, 8))
+    regression[:, 0] = float("nan")
+    monkeypatch.setattr(
+        "src.detection.bev.paired_iou3d",
+        lambda *args: pytest.fail("nonfinite boxes must not reach geometry"),
+    )
+
+    value = loss((logits, regression), target)
+
+    assert not torch.isfinite(value)
+
+
 def test_encoder_receptive_field_spans_typical_car(fixture_config):
     model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
     # Longer than a bus at the 0.4 m CoInfra resolution.
