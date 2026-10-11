@@ -3292,12 +3292,13 @@ def comparison_section(cfg, output):
         "does not test; compare with configs/coinfra_random_split.yaml"
     )
     iou = cfg["evaluation"]["comparison"]
+    group_text = ", ".join(f"{k} = {'+'.join(v)}" for k, v in iou["groups"].items())
     lines = [
         "",
         "## Comparison with the CoInfra benchmark metric",
         "",
         f"AP@{iou['iou_threshold']:g} with {iou['iou_type'].upper()} IoU over merged "
-        f"classes ({', '.join(f'{k} = {'+'.join(v)}' for k, v in iou['groups'].items())}), "
+        f"classes ({group_text}), "
         f"mean over sessions and seeds. These results use {protocol}. Published "
         "LiDAR rows are from arXiv 2507.02245v3, Table 5.",
         "",
