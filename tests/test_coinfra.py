@@ -876,6 +876,83 @@ def test_optimizer_step_oom_resets_scaler_before_retry(monkeypatch, fixture_conf
     assert scaler.calls == 2
 
 
+def test_nonfinite_amp_loss_retries_batch_in_fp32(monkeypatch, fixture_config, capsys):
+    autocast_states = []
+    active = SimpleNamespace(enabled=False)
+
+    class Autocast:
+        def __init__(self, *, enabled, **kwargs):
+            self.enabled = enabled
+
+        def __enter__(self):
+            active.enabled = self.enabled
+            autocast_states.append(self.enabled)
+
+        def __exit__(self, *args):
+            active.enabled = False
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, bev, mode):
+            value = self.weight * (float("inf") if active.enabled else 1.0)
+            return value[None], value[None]
+
+    class Scaler:
+        def scale(self, value):
+            return value
+
+        def unscale_(self, optimizer):
+            pass
+
+        def step(self, optimizer):
+            optimizer.step()
+
+        def update(self):
+            pass
+
+    model = Model()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    examples = {
+        "bev": np.zeros((1, 1), np.float32),
+        "target": tuple(np.zeros((1, 1), np.float32) for _ in range(3)),
+    }
+    fixture_config["training"]["mixed_precision"] = True
+    monkeypatch.setattr(torch, "autocast", Autocast)
+    monkeypatch.setattr(
+        pipeline_module, "device_tensor", lambda value, device: torch.as_tensor(value)
+    )
+    monkeypatch.setattr(
+        pipeline_module, "loss", lambda outputs, target, size: outputs[0].sum()
+    )
+
+    losses = pipeline_module.train_examples(
+        model,
+        optimizer,
+        Scaler(),
+        examples,
+        "adaptive",
+        fixture_config,
+        SimpleNamespace(type="cuda"),
+        "seed=43 epoch=10",
+        {"training": 1},
+        retries=0,
+    )
+
+    assert losses == [1.0]
+    assert autocast_states == [True, False]
+    assert "AMP nonfinite loss recovered in fp32" in capsys.readouterr().out
+
+
+def test_nonfinite_tensor_summary_reports_counts():
+    summary = pipeline_module.nonfinite_tensor_summary(
+        [("finite", torch.zeros(2)), ("output[0]", torch.tensor([1.0, float("nan")]))]
+    )
+    assert summary == "output[0]=1/2"
+
+
 def test_decode_accepts_mixed_precision_outputs(fixture_config):
     classes = len(fixture_config["dataset"]["classes"])
     slots = fixture_config["dataset"]["objects_per_cell"]

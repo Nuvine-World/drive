@@ -932,6 +932,16 @@ def release_cuda_memory(device):
         torch.cuda.empty_cache()
 
 
+def nonfinite_tensor_summary(tensors):
+    """Compact diagnostics for tensors implicated in a nonfinite loss."""
+    bad = []
+    for name, value in tensors:
+        invalid = ~torch.isfinite(value)
+        if invalid.any():
+            bad.append(f"{name}={int(invalid.sum())}/{value.numel()}")
+    return ",".join(bad) or "none"
+
+
 def train_examples(
     model,
     optimizer,
@@ -958,14 +968,43 @@ def train_examples(
         bev = device_tensor(examples["bev"], device)
         target = tuple(device_tensor(value, device) for value in examples["target"])
         optimizer.zero_grad(set_to_none=True)
+        amp_enabled = mixed_precision(cfg, device)
         with torch.autocast(
             device_type=device.type,
             dtype=torch.float16,
-            enabled=mixed_precision(cfg, device),
+            enabled=amp_enabled,
         ):
-            value = loss(model(bev, mode), target, cell_size(cfg))
+            outputs = model(bev, mode)
+            value = loss(outputs, target, cell_size(cfg))
+        if not torch.isfinite(value) and amp_enabled:
+            # A clean checkpoint can still encounter an input/order-dependent
+            # fp16 activation overflow. Retry only that batch in fp32, without
+            # changing the checkpoint signature or disabling AMP globally.
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(
+                device_type=device.type, dtype=torch.float16, enabled=False
+            ):
+                outputs = model(bev, mode)
+                value = loss(outputs, target, cell_size(cfg))
+            if torch.isfinite(value):
+                print(
+                    f"[{utc_now()}] AMP nonfinite loss recovered in fp32 "
+                    f"({context}, mode={mode})",
+                    flush=True,
+                )
         if not torch.isfinite(value):
-            raise ValueError("Nonfinite training loss")
+            tensors = [("bev", bev)]
+            tensors.extend(
+                (f"target[{index}]", item) for index, item in enumerate(target)
+            )
+            tensors.extend(
+                (f"output[{index}]", item) for index, item in enumerate(outputs)
+            )
+            raise ValueError(
+                "Nonfinite training loss "
+                f"({context}, mode={mode}, amp={amp_enabled}, "
+                f"nonfinite={nonfinite_tensor_summary(tensors)})"
+            )
         scaler.scale(value).backward()
         scaler.unscale_(optimizer)
         scaler_needs_update = True
