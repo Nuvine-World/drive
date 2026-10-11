@@ -52,6 +52,8 @@ RUN_LOG_DIR="$PROJECT_DIR/logs"
 RUN_LOG_DIR="${ECCO_LOG_DIR:-$RUN_LOG_DIR}"
 mkdir -p "$RUN_LOG_DIR"
 export PYTHONUNBUFFERED=1
+# Reduce CUDA memory fragmentation from variable node counts per batch.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$RUN_LOG_DIR/matplotlib_cache}"
 mkdir -p "$MPLCONFIGDIR"
 RUN_TIMESTAMP="$(date -u '+%Y%m%dT%H%M%SZ')_$$"

@@ -76,9 +76,10 @@ training:
   # attention (DRIVE), mean (the CoInfra baseline), or max (F-Cooper).
   fusion: attention
   output_stride: 2
-  # RTX 4090/3090 server profile. CUDA OOM recovery will split a training
-  # batch automatically if an unusually large multi-node sample does not fit.
-  batch_size: 8
+  # 24 GB GPU profile (RTX 4090/3090). An 8-node sample holds about 1.9 GB
+  # of bf16 activations on the 500x500 grid, so batch 8 does not fit; CUDA OOM
+  # recovery still splits a batch if an unusual sample does not fit.
+  batch_size: 4
   preprocessing_workers: 8
   mixed_precision: true
   # bf16 where the GPU supports it (fp32 exponent range, no overflow).

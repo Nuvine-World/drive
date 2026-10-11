@@ -472,7 +472,10 @@ def test_overfit_profile_is_isolated_and_intentionally_reuses_training_data():
     assert cfg["dataset"]["splits"]["train"] == cfg["dataset"]["splits"]["val"]
     assert cfg["dataset"]["smoke"]["frames_per_slice"] == 32
     assert cfg["training"]["seeds"] == [42]
-    assert cfg["training"]["epochs"] == 500
+    # 2000 optimizer steps over 32 frames at the configured batch size.
+    assert cfg["training"]["epochs"] == math.ceil(
+        2000 / math.ceil(32 / cfg["training"]["batch_size"])
+    )
     assert cfg["training"]["modes"] == ["early"]
     assert cfg["training"]["node_counts"] == [8]
     assert cfg["evaluation"]["strategies"] == ["early"]
