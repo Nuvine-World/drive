@@ -56,11 +56,24 @@ training:
   weight_decay: 0.0001
   device: auto
   require_cuda: true
-  hidden_channels: 32
+  # DRIVE detector: a shared node encoder (what each node transmits), fusion
+  # before a three-scale backbone, and CenterPoint heads at output stride 2.
+  node_channels: 64
+  backbone_channels: 128
+  node_blocks: 1
+  backbone_blocks: [2, 2, 2]
+  fusion: attention
   output_stride: 2
   batch_size: 8
   preprocessing_workers: 8
   mixed_precision: true
+  amp_dtype: auto
+  repeat_factor_threshold: 0.3
+  # Adver-City clouds are stored in the moving ego frame, so an earlier frame
+  # is not a valid delayed message without re-registration: no stale training.
+  stale:
+    probability: 0.0
+    max_age_frames: 3
   # Scene-wide flips, rotation, and scaling applied identically to every node.
   augmentation:
     enabled: true
@@ -72,7 +85,7 @@ training:
   node_counts: [1, 2, 3, 5]
   checkpointing:
     keep_best: 3
-    weights: {val_loss_quality: 0.34, val_map: 0.33, val_recall: 0.33}
+    weights: {val_loss_quality: 0.0, val_map: 0.8, val_recall: 0.2}
   recovery:
     resume: true
     save_every_epochs: 1
@@ -104,7 +117,7 @@ evaluation:
 adaptive_fusion:
   training_budgets: [0.01, 0.05, 0.10, 0.25]
   evaluation_budgets: [0.01, 0.05, 0.10, 0.25]
-  ablations: [random, energy]
+  ablations: [random, energy, confidence]
   index_bytes: 4
   value_bytes: 2
 latency_experiment:
@@ -113,6 +126,9 @@ latency_experiment:
   # Must exceed sensing plus the largest configured RTT (140 ms).
   deadlines_ms: [150.0, 250.0]
   burst_multipliers: [1, 2, 4]
+# The deadline experiment replays static-infrastructure links (CoInfra).
+deadline_experiment:
+  enabled: false
 deployment_assumptions:
   source: "controlled analytical assumptions; replace with cited or measured server values"
   bandwidths_mbps: [10, 100, 1000]

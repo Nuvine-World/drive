@@ -14,7 +14,10 @@ dataset:
     seeds: 1
   weather: [sunny, rainy, heavysnow, freezingrain]
   nodes: []
+  # Evaluation frames are 0.5 s apart; training uses every second frame
+  # (0.2 s) for 2.5x the training data.
   frame_stride: 5
+  train_frame_stride: 2
   max_frames_per_slice: null
   max_timestamp_delta_s: 0.15
   annotation_file: global_roi.yaml
@@ -31,13 +34,20 @@ dataset:
   # slice), so the BEV uses density and maximum/minimum/mean height only.
   # Inspection fails if intensity is enabled but carries no information.
   use_intensity: false
-  # Two recording sessions train the detector (1,245 sunny + 2,183 heavy-snow
-  # frames). Every weather condition still has at least one held-out session.
+  # Point counts by height above each cell's lowest return (0.5 m slices; the
+  # last slice holds everything above 2 m).
+  height_slices: 5
+  height_slice_m: 0.5
+  # Session-held-out protocol: no recording session crosses a split. Two
+  # sessions train the detector; validation adds 2025_04_07_heavysnow so it
+  # contains bicycles (113) and adverse weather; every weather condition keeps
+  # at least one held-out test session. configs/coinfra_random_split.yaml
+  # reproduces CoInfra's published random-frame protocol instead.
   splits:
     train: [2025_03_27_sunny, 2025_02_12_heavysnow]
-    val: [2025_11_18_sunny]
-    test: [2025_11_20_sunny, 2025_04_07_heavysnow, 2025_11_27_heavysnow,
-           2025_03_24_rainy, 2025_04_02_freezingrain]
+    val: [2025_11_18_sunny, 2025_04_07_heavysnow]
+    test: [2025_11_20_sunny, 2025_11_27_heavysnow, 2025_03_24_rainy,
+           2025_04_02_freezingrain]
 training:
   seeds: [42, 43, 44]
   # Reduce LR on validation-score plateaus; train up to 200 epochs and never
@@ -55,14 +65,30 @@ training:
   weight_decay: 0.0001
   device: auto
   require_cuda: true
-  hidden_channels: 32
-  # Predict on a half-resolution grid after a strided, large-context encoder.
+  # DRIVE detector: a shared node encoder (what each node transmits), fusion
+  # before a three-scale backbone, and CenterPoint heads at output stride 2.
+  node_channels: 64
+  backbone_channels: 128
+  node_blocks: 1
+  backbone_blocks: [2, 2, 2]
+  # attention (DRIVE), mean (the CoInfra baseline), or max (F-Cooper).
+  fusion: attention
   output_stride: 2
   # RTX 4090/3090 server profile. CUDA OOM recovery will split a training
   # batch automatically if an unusually large multi-node sample does not fit.
   batch_size: 8
   preprocessing_workers: 8
   mixed_precision: true
+  # bf16 where the GPU supports it (fp32 exponent range, no overflow).
+  amp_dtype: auto
+  # Repeat frames with rare classes (bus, bicycle, truck): LVIS repeat factors.
+  repeat_factor_threshold: 0.3
+  # A collaborator in an intermediate or adaptive sample is replaced by one of
+  # its own frames up to 3 training frames (0.6 s) old with this probability,
+  # so the fusion learns to weigh delayed messages by their age.
+  stale:
+    probability: 0.25
+    max_age_frames: 3
   # Scene-wide flips, rotation, and scaling applied identically to every node.
   augmentation:
     enabled: true
@@ -77,7 +103,8 @@ training:
   node_counts: [1, 2, 4, 8]
   checkpointing:
     keep_best: 3
-    weights: {val_loss_quality: 0.34, val_map: 0.33, val_recall: 0.33}
+    # AP drives selection; recall breaks near ties.
+    weights: {val_loss_quality: 0.0, val_map: 0.8, val_recall: 0.2}
   recovery:
     resume: true
     save_every_epochs: 1
@@ -119,10 +146,17 @@ evaluation:
     bicycle: [0.25, 0.5]
     pedestrian: [0.25, 0.5]
   max_detections: 150
+  # The CoInfra benchmark's metric: AP@0.5 BEV IoU over merged classes.
+  comparison:
+    iou_type: bev
+    iou_threshold: 0.5
+    groups: {Bus: [bus], LV: [car, truck], VRU: [pedestrian, bicycle]}
 adaptive_fusion:
   training_budgets: [0.01, 0.05, 0.10, 0.25]
   evaluation_budgets: [0.01, 0.05, 0.10, 0.25]
-  ablations: [random, energy]
+  # confidence ranks cells by each collaborator's own detection confidence
+  # (Where2comm-style).
+  ablations: [random, energy, confidence]
   index_bytes: 4
   value_bytes: 2
 latency_experiment:
@@ -131,6 +165,30 @@ latency_experiment:
   # Must exceed sensing plus the largest configured RTT (140 ms).
   deadlines_ms: [150.0, 250.0]
   burst_multipliers: [1, 2, 4]
+# Deadline-constrained cooperation on consecutive 10 Hz test frames: per-frame
+# budget control over a time-varying uplink, with late messages used stale.
+deadline_experiment:
+  enabled: true
+  # 20 s sequences: the miss-rate guarantee is a long-run average.
+  frames_per_slice: 200
+  slices_per_session: 2
+  # End-to-end from capture; the transmission window is the deadline minus
+  # sensing, half the edge RTT, and receiver processing.
+  deadlines_ms: [200.0, 250.0]
+  # DRIVE keeps the long-run fraction of late messages near this target; each
+  # tradeoff V is one point of the utility-versus-miss-rate curve.
+  target_miss_rate: 0.05
+  tradeoffs: [0.5, 2.0, 10.0]
+  # Never send a message predicted to be late with higher probability.
+  max_miss_probability: 0.5
+  max_age_frames: 3
+  # Throughput EWMA over one-frame-old link capacity reports.
+  estimator_alpha: 0.5
+  controllers: [fixed, dense, greedy, drive, oracle, early, late]
+  traces:
+    - {name: uplink_5g, type: gilbert_elliott, good_mbps: 40.0, bad_mbps: 5.0,
+       p_good_to_bad: 0.05, p_bad_to_good: 0.25, jitter: 0.2}
+    - {name: constant_20mbps, type: constant, mbps: 20.0}
 deployment_assumptions:
   source: "literature assumption; citation required"
   bandwidths_mbps: [10, 100, 1000]

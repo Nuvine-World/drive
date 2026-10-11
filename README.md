@@ -178,8 +178,16 @@ Individual stages are available:
 ./run.sh --config configs/coinfra.yaml --stage preprocess
 ./run.sh --config configs/coinfra.yaml --stage train
 ./run.sh --config configs/coinfra.yaml --stage evaluate
+./run.sh --config configs/coinfra.yaml --stage deadline
 ./run.sh --config configs/coinfra.yaml --stage report
 ```
+
+`configs/coinfra.yaml` holds out whole recording sessions.
+`configs/coinfra_random_split.yaml` reproduces the CoInfra paper's protocol,
+which splits frames at random, so its numbers can be compared with the
+published table. The `deadline` stage replays consecutive 10 Hz test frames
+through per-frame communication controllers over modeled uplinks (see
+`docs/decisions/2026-10-11-drive-detector.md`).
 
 ## Dataset download
 
@@ -294,6 +302,11 @@ The configured output directory contains:
   false when mean service time reaches the frame period, where the queue grows
   without bound and tail values only reflect the trace length;
 - `accuracy_latency_tradeoffs.csv` joining accuracy and deployment costs;
+- `coinfra_comparison.csv` with AP@0.5 BEV over CoInfra's merged classes
+  (Bus, LV, VRU), the metric of the published benchmark;
+- `deadline_results.csv` with mAP, bytes, late-message rate, and the fraction
+  of fresh, stale, and missing collaborator messages for each controller, link
+  trace, and deadline;
 - `accuracy_by_nodes.png`, `cooperation_gain_by_weather.png`,
   `latency_by_bandwidth.png`, and `report.md`;
 - `verification.json`, written only after required artifacts and metric invariants are checked.

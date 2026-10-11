@@ -56,7 +56,13 @@ training:
   weight_decay: 0.0001
   device: auto
   require_cuda: true
-  hidden_channels: 64
+  # DRIVE detector: a shared node encoder (what each node transmits), fusion
+  # before a three-scale backbone, and CenterPoint heads at output stride 2.
+  node_channels: 64
+  backbone_channels: 128
+  node_blocks: 1
+  backbone_blocks: [2, 2, 2]
+  fusion: attention
   # Predict on a half-resolution grid after a strided, large-context encoder.
   output_stride: 2
   # RTX 4090/3090 server profile. CUDA OOM recovery will split a training
