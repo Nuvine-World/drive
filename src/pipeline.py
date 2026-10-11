@@ -104,120 +104,120 @@ def plot_training(path, rows):
     plt.close(figure)
 
 
-def validate_examples(model, examples, cfg, device, retries):
-    """Validate one prepared batch, splitting only that batch after CUDA OOM.
+def validate_batch(model, examples, cfg, device):
+    """Score one prepared batch under every validation view.
 
     Every frame is scored twice: with all of its nodes (each configured fusion
     strategy) and with one deterministic single node, so checkpoint selection
     sees both sides of the cooperation comparison.
     """
-    try:
-        early = device_tensor(np.stack([item[0] for item in examples]), device)
-        per_node = device_tensor(np.stack([item[1] for item in examples]), device)
-        early_target, single_target = (
-            tuple(
-                device_tensor(
-                    np.stack([item[position][i] for item in examples]), device
-                )
-                for i in range(3)
-            )
-            for position in (3, 6)
+    early = device_tensor(np.stack([item[0] for item in examples]), device)
+    per_node = device_tensor(np.stack([item[1] for item in examples]), device)
+    early_target, single_target = (
+        tuple(
+            device_tensor(np.stack([item[position][i] for item in examples]), device)
+            for i in range(3)
         )
-        with torch.no_grad(), torch.autocast(
-            device_type=device.type,
-            dtype=torch.float16,
-            enabled=mixed_precision(cfg, device),
-        ):
-            early_outputs = model(early)
-            batch_size, nodes, channels, height, width = per_node.shape
-            encoded = model.encoder(
-                per_node.reshape(batch_size * nodes, channels, height, width)
-            )
-            features = encoded.reshape(batch_size, nodes, *encoded.shape[1:])
-            single_nodes = torch.as_tensor(
-                [item[4] for item in examples], device=features.device
-            )
-            single = model.heads(
-                features[torch.arange(batch_size, device=features.device), single_nodes]
-            )
-            intermediate = (
-                model.heads(features.amax(dim=1))
-                if "intermediate" in cfg["evaluation"]["strategies"]
-                else None
-            )
-            adaptive = None
-            if "adaptive" in cfg["evaluation"]["strategies"]:
-                validation_budget = cfg["adaptive_fusion"]["evaluation_budgets"][0]
-                fused, _ = model.adaptive_features(features, validation_budget)
-                adaptive = model.heads(fused)
-            late = (
-                model.heads(features.reshape(batch_size * nodes, *features.shape[2:]))
-                if "late" in cfg["evaluation"]["strategies"]
-                else None
-            )
-        # Per-sample losses keep validation loss independent of batch size,
-        # batch composition, and OOM splitting.
-        # Each view is scored against the boxes its own nodes can support.
-        losses = []
-        cells = cell_size(cfg)
-        for index in range(batch_size):
+        for position in (3, 6)
+    )
+    with torch.no_grad(), torch.autocast(
+        device_type=device.type,
+        dtype=torch.float16,
+        enabled=mixed_precision(cfg, device),
+    ):
+        early_outputs = model(early)
+        batch_size, nodes, channels, height, width = per_node.shape
+        encoded = model.encoder(
+            per_node.reshape(batch_size * nodes, channels, height, width)
+        )
+        features = encoded.reshape(batch_size, nodes, *encoded.shape[1:])
+        single_nodes = torch.as_tensor(
+            [item[4] for item in examples], device=features.device
+        )
+        single = model.heads(
+            features[torch.arange(batch_size, device=features.device), single_nodes]
+        )
+        intermediate = (
+            model.heads(features.amax(dim=1))
+            if "intermediate" in cfg["evaluation"]["strategies"]
+            else None
+        )
+        adaptive = None
+        if "adaptive" in cfg["evaluation"]["strategies"]:
+            validation_budget = cfg["adaptive_fusion"]["evaluation_budgets"][0]
+            fused, _ = model.adaptive_features(features, validation_budget)
+            adaptive = model.heads(fused)
+        late = (
+            model.heads(features.reshape(batch_size * nodes, *features.shape[2:]))
+            if "late" in cfg["evaluation"]["strategies"]
+            else None
+        )
+    # Per-sample losses keep validation loss independent of batch size,
+    # batch composition, and OOM splitting.
+    # Each view is scored against the boxes its own nodes can support.
+    losses = []
+    cells = cell_size(cfg)
+    for index in range(batch_size):
 
-            def sample_target(target):
-                return tuple(value[index : index + 1] for value in target)
+        def sample_target(target):
+            return tuple(value[index : index + 1] for value in target)
 
-            losses.append(
-                0.5
-                * (
-                    float(
-                        loss(
-                            batch_outputs(early_outputs, index),
-                            sample_target(early_target),
-                            cells,
-                        )
+        losses.append(
+            0.5
+            * (
+                float(
+                    loss(
+                        batch_outputs(early_outputs, index),
+                        sample_target(early_target),
+                        cells,
                     )
-                    + float(
-                        loss(
-                            batch_outputs(single, index),
-                            sample_target(single_target),
-                            cells,
-                        )
+                )
+                + float(
+                    loss(
+                        batch_outputs(single, index),
+                        sample_target(single_target),
+                        cells,
                     )
                 )
             )
-        frames = {strategy: [] for strategy in validation_views(cfg)}
-        for index, item in enumerate(examples):
-            frames["single"].append(
-                (decode(batch_outputs(single, index), cfg), *item[5])
+        )
+    frames = {strategy: [] for strategy in validation_views(cfg)}
+    for index, item in enumerate(examples):
+        frames["single"].append((decode(batch_outputs(single, index), cfg), *item[5]))
+        if "early" in frames:
+            frames["early"].append(
+                (decode(batch_outputs(early_outputs, index), cfg), *item[2])
             )
-            if "early" in frames:
-                frames["early"].append(
-                    (decode(batch_outputs(early_outputs, index), cfg), *item[2])
+        if intermediate is not None:
+            frames["intermediate"].append(
+                (decode(batch_outputs(intermediate, index), cfg), *item[2])
+            )
+        if adaptive is not None:
+            frames["adaptive"].append(
+                (decode(batch_outputs(adaptive, index), cfg), *item[2])
+            )
+        if late is not None:
+            offset = index * nodes
+            local = [
+                decode(batch_outputs(late, offset + node), cfg) for node in range(nodes)
+            ]
+            frames["late"].append(
+                (
+                    nms(
+                        [box for group in local for box in group],
+                        cfg["evaluation"]["nms_iou"],
+                        cfg["evaluation"]["late_max_detections"],
+                    ),
+                    *item[2],
                 )
-            if intermediate is not None:
-                frames["intermediate"].append(
-                    (decode(batch_outputs(intermediate, index), cfg), *item[2])
-                )
-            if adaptive is not None:
-                frames["adaptive"].append(
-                    (decode(batch_outputs(adaptive, index), cfg), *item[2])
-                )
-            if late is not None:
-                offset = index * nodes
-                local = [
-                    decode(batch_outputs(late, offset + node), cfg)
-                    for node in range(nodes)
-                ]
-                frames["late"].append(
-                    (
-                        nms(
-                            [box for group in local for box in group],
-                            cfg["evaluation"]["nms_iou"],
-                            cfg["evaluation"]["late_max_detections"],
-                        ),
-                        *item[2],
-                    )
-                )
-        return losses, frames
+            )
+    return losses, frames
+
+
+def validate_examples(model, examples, cfg, device, retries):
+    """Validate one prepared batch, splitting only that batch after CUDA OOM."""
+    try:
+        return validate_batch(model, examples, cfg, device)
     except (torch.OutOfMemoryError, RuntimeError) as error:
         if not cuda_oom(error, device):
             raise
@@ -396,14 +396,11 @@ def wait_for_resources(cfg, device, reason='resource check'):
     output.mkdir(parents=True, exist_ok=True)
     while True:
         disk_free = shutil.disk_usage(output).free
-        gpu_free = None
+        gpu_free = gpu_held = None
         if device.type == 'cuda':
             physical_free, _ = torch.cuda.mem_get_info(device)
-            reclaimable = max(
-                0,
-                torch.cuda.memory_reserved(device)
-                - torch.cuda.memory_allocated(device),
-            )
+            gpu_held = torch.cuda.memory_allocated(device)
+            reclaimable = max(0, torch.cuda.memory_reserved(device) - gpu_held)
             gpu_free = physical_free + reclaimable
         disk_ok = disk_free >= disk_required
         gpu_ok = gpu_free is None or gpu_free >= gpu_required
@@ -413,7 +410,12 @@ def wait_for_resources(cfg, device, reason='resource check'):
         timeout = settings['timeout_minutes'] * 60
         details = f'disk_free={disk_free/1e9:.2f}GB'
         if gpu_free is not None:
-            details += f' gpu_free={gpu_free/1e9:.2f}GB'
+            # Waiting frees only memory other processes hold; a large value
+            # here means this process itself is holding tensors.
+            details += (
+                f" gpu_free={gpu_free/1e9:.2f}GB"
+                f" gpu_held_by_this_process={gpu_held/1e9:.2f}GB"
+            )
         if timeout and elapsed >= timeout:
             raise TimeoutError(f'Resource wait timed out ({reason}): {details}')
         print(f'[{utc_now()}] WAITING ({reason}): {details}; retrying in '
@@ -942,6 +944,64 @@ def nonfinite_tensor_summary(tensors):
     return ",".join(bad) or "none"
 
 
+def train_step(model, optimizer, scaler, examples, mode, cfg, device, context):
+    """One optimizer step on a stacked batch.
+
+    The batch tensors and autograd graph live only in this frame, so a CUDA OOM
+    raised here frees them with its traceback before the caller retries.
+    """
+    bev = device_tensor(examples["bev"], device)
+    target = tuple(device_tensor(value, device) for value in examples["target"])
+    optimizer.zero_grad(set_to_none=True)
+    amp_enabled = mixed_precision(cfg, device)
+    with torch.autocast(
+        device_type=device.type,
+        dtype=torch.float16,
+        enabled=amp_enabled,
+    ):
+        outputs = model(bev, mode)
+        value = loss(outputs, target, cell_size(cfg))
+    if not torch.isfinite(value) and amp_enabled:
+        # A clean checkpoint can still encounter an input/order-dependent
+        # fp16 activation overflow. Retry only that batch in fp32, without
+        # changing the checkpoint signature or disabling AMP globally.
+        # Drop the fp16 graph first; keeping it alive through the fp32 pass
+        # needs memory for both graphs at once.
+        outputs = value = None
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(
+            device_type=device.type, dtype=torch.float16, enabled=False
+        ):
+            outputs = model(bev, mode)
+            value = loss(outputs, target, cell_size(cfg))
+        if torch.isfinite(value):
+            print(
+                f"[{utc_now()}] AMP nonfinite loss recovered in fp32 "
+                f"({context}, mode={mode})",
+                flush=True,
+            )
+    if not torch.isfinite(value):
+        tensors = [("bev", bev)]
+        tensors.extend((f"target[{index}]", item) for index, item in enumerate(target))
+        tensors.extend((f"output[{index}]", item) for index, item in enumerate(outputs))
+        raise ValueError(
+            "Nonfinite training loss "
+            f"({context}, mode={mode}, amp={amp_enabled}, "
+            f"nonfinite={nonfinite_tensor_summary(tensors)})"
+        )
+    scaler.scale(value).backward()
+    scaler.unscale_(optimizer)
+    try:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
+        scaler.step(optimizer)
+    finally:
+        # GradScaler records a per-optimizer STEPPED state before invoking the
+        # optimizer. Clear that state so an OOM inside optimizer.step does not
+        # make the smaller retry fail with "step() has already been called".
+        scaler.update()
+    return [float(value.detach())] * len(examples["bev"])
+
+
 def train_examples(
     model,
     optimizer,
@@ -963,66 +1023,17 @@ def train_examples(
                 for index in range(3)
             ),
         }
-    scaler_needs_update = False
     try:
-        bev = device_tensor(examples["bev"], device)
-        target = tuple(device_tensor(value, device) for value in examples["target"])
-        optimizer.zero_grad(set_to_none=True)
-        amp_enabled = mixed_precision(cfg, device)
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch.float16,
-            enabled=amp_enabled,
-        ):
-            outputs = model(bev, mode)
-            value = loss(outputs, target, cell_size(cfg))
-        if not torch.isfinite(value) and amp_enabled:
-            # A clean checkpoint can still encounter an input/order-dependent
-            # fp16 activation overflow. Retry only that batch in fp32, without
-            # changing the checkpoint signature or disabling AMP globally.
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(
-                device_type=device.type, dtype=torch.float16, enabled=False
-            ):
-                outputs = model(bev, mode)
-                value = loss(outputs, target, cell_size(cfg))
-            if torch.isfinite(value):
-                print(
-                    f"[{utc_now()}] AMP nonfinite loss recovered in fp32 "
-                    f"({context}, mode={mode})",
-                    flush=True,
-                )
-        if not torch.isfinite(value):
-            tensors = [("bev", bev)]
-            tensors.extend(
-                (f"target[{index}]", item) for index, item in enumerate(target)
-            )
-            tensors.extend(
-                (f"output[{index}]", item) for index, item in enumerate(outputs)
-            )
-            raise ValueError(
-                "Nonfinite training loss "
-                f"({context}, mode={mode}, amp={amp_enabled}, "
-                f"nonfinite={nonfinite_tensor_summary(tensors)})"
-            )
-        scaler.scale(value).backward()
-        scaler.unscale_(optimizer)
-        scaler_needs_update = True
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
-        scaler.step(optimizer)
-        scaler.update()
-        scaler_needs_update = False
-        return [float(value.detach())] * len(examples["bev"])
+        return train_step(
+            model, optimizer, scaler, examples, mode, cfg, device, context
+        )
     except (torch.OutOfMemoryError, RuntimeError) as error:
         if not cuda_oom(error, device):
             raise
         oom_message = str(error)
+    # The failed attempt's tensors and graph left scope with the traceback, so
+    # each parent frame of the split recursion holds only CPU arrays.
     optimizer.zero_grad(set_to_none=True)
-    if scaler_needs_update:
-        # GradScaler records a per-optimizer STEPPED state before invoking the
-        # optimizer. Clear that state so an OOM inside optimizer.step does not
-        # make the smaller retry fail with "step() has already been called".
-        scaler.update()
     gc.collect()
     release_cuda_memory(device)
     example_count = len(examples["bev"])
@@ -1525,6 +1536,141 @@ def stable_random_seed(*parts):
     return int.from_bytes(digest[:8], "little") % (2**63 - 1)
 
 
+def run_inference(
+    model,
+    cloud_batches,
+    cfg,
+    device,
+    strategy,
+    raw_payloads,
+    random_seeds,
+    prepared_bevs,
+    preprocessing_overheads_ms,
+):
+    """One inference attempt; infer_batch owns CUDA OOM recovery."""
+    base_strategy, _, budget_text = strategy.partition("@")
+    preprocessing_start = time.perf_counter()
+    arrays = (
+        prepared_bevs
+        if prepared_bevs is not None
+        else [array_inputs(clouds, cfg, strategy) for clouds in cloud_batches]
+    )
+    if base_strategy == "early":
+        arrays = [value[0] for value in arrays]
+    bev = device_tensor(np.stack(arrays), device)
+    sync(device)
+    preprocessing_ms = (
+        (time.perf_counter() - preprocessing_start) * 1000 / len(cloud_batches)
+    )
+    if preprocessing_overheads_ms is not None:
+        preprocessing_ms += float(np.mean(preprocessing_overheads_ms))
+    start = time.perf_counter()
+    serialization_ms = 0.0
+    with torch.no_grad(), torch.autocast(
+        device_type=device.type,
+        dtype=torch.float16,
+        enabled=mixed_precision(cfg, device),
+    ):
+        if base_strategy == "early":
+            outputs = model.heads(model.encoder(bev))
+            predictions = [
+                decode(batch_outputs(outputs, i), cfg)
+                for i in range(len(cloud_batches))
+            ]
+            representations = (
+                raw_payloads
+                if raw_payloads is not None
+                else [sum(payload(p) for p in clouds[1:]) for clouds in cloud_batches]
+            )
+        else:
+            batch, nodes, channels, height, width = bev.shape
+            encoded = model.encoder(bev.reshape(batch * nodes, channels, height, width))
+            features = encoded.reshape(batch, nodes, *encoded.shape[1:])
+            if base_strategy == "intermediate":
+                outputs = model.heads(features.amax(dim=1))
+                predictions = [
+                    decode(batch_outputs(outputs, i), cfg) for i in range(batch)
+                ]
+                serialization_start = time.perf_counter()
+                representations = [
+                    sum(
+                        feature_payload(feature, cfg)
+                        for feature in item[1:].detach().cpu().numpy()
+                    )
+                    for item in features
+                ]
+                serialization_ms = (
+                    (time.perf_counter() - serialization_start)
+                    * 1000
+                    / len(cloud_batches)
+                )
+            elif base_strategy.startswith("adaptive"):
+                budget = float(
+                    budget_text or cfg["adaptive_fusion"]["evaluation_budgets"][0]
+                )
+                selector = adaptive_selector(strategy)
+                generators = None
+                if selector == "random" and random_seeds is not None:
+                    generators = []
+                    for random_seed in random_seeds:
+                        generator = torch.Generator(device=device)
+                        generator.manual_seed(random_seed)
+                        generators.append(generator)
+                fused, selected = model.adaptive_features(
+                    features, budget, selector, generators=generators
+                )
+                outputs = model.heads(fused)
+                predictions = [
+                    decode(batch_outputs(outputs, i), cfg) for i in range(batch)
+                ]
+                serialization_start = time.perf_counter()
+                representations = [
+                    adaptive_payload(features[item], selected[item], cfg)
+                    for item in range(batch)
+                ]
+                serialization_ms = (
+                    (time.perf_counter() - serialization_start)
+                    * 1000
+                    / len(cloud_batches)
+                )
+            else:
+                outputs = model.heads(
+                    features.reshape(batch * nodes, *features.shape[2:])
+                )
+                predictions, representations = [], []
+                serialization_seconds = 0.0
+                for item in range(batch):
+                    local = [
+                        decode(batch_outputs(outputs, item * nodes + node), cfg)
+                        for node in range(nodes)
+                    ]
+                    predictions.append(
+                        nms(
+                            [box for group in local for box in group],
+                            cfg["evaluation"]["nms_iou"],
+                            cfg["evaluation"]["late_max_detections"],
+                        )
+                    )
+                    serialization_start = time.perf_counter()
+                    representations.append(
+                        sum(late_payload(group, cfg) for group in local[1:])
+                    )
+                    serialization_seconds += time.perf_counter() - serialization_start
+                serialization_ms = serialization_seconds * 1000 / len(cloud_batches)
+    sync(device)
+    combined_ms = (time.perf_counter() - start) * 1000 / len(cloud_batches)
+    inference_ms = max(0.0, combined_ms - serialization_ms)
+    return list(
+        zip(
+            predictions,
+            [inference_ms] * len(predictions),
+            representations,
+            [preprocessing_ms] * len(predictions),
+            [serialization_ms] * len(predictions),
+        )
+    )
+
+
 def infer_batch(
     model,
     cloud_batches,
@@ -1540,133 +1686,17 @@ def infer_batch(
     """Batched inference with transparent CUDA OOM batch reduction."""
     if retries is None:
         retries = cfg["training"]["recovery"]["cuda_oom_retries"]
-    base_strategy, _, budget_text = strategy.partition("@")
     try:
-        preprocessing_start = time.perf_counter()
-        arrays = (
-            prepared_bevs
-            if prepared_bevs is not None
-            else [array_inputs(clouds, cfg, strategy) for clouds in cloud_batches]
-        )
-        if base_strategy == "early":
-            arrays = [value[0] for value in arrays]
-        bev = device_tensor(np.stack(arrays), device)
-        sync(device)
-        preprocessing_ms = (
-            (time.perf_counter() - preprocessing_start) * 1000 / len(cloud_batches)
-        )
-        if preprocessing_overheads_ms is not None:
-            preprocessing_ms += float(np.mean(preprocessing_overheads_ms))
-        start = time.perf_counter()
-        serialization_ms = 0.0
-        with torch.no_grad(), torch.autocast(
-            device_type=device.type,
-            dtype=torch.float16,
-            enabled=mixed_precision(cfg, device),
-        ):
-            if base_strategy == "early":
-                outputs = model.heads(model.encoder(bev))
-                predictions = [
-                    decode(batch_outputs(outputs, i), cfg)
-                    for i in range(len(cloud_batches))
-                ]
-                representations = (
-                    raw_payloads
-                    if raw_payloads is not None
-                    else [
-                        sum(payload(p) for p in clouds[1:]) for clouds in cloud_batches
-                    ]
-                )
-            else:
-                batch, nodes, channels, height, width = bev.shape
-                encoded = model.encoder(
-                    bev.reshape(batch * nodes, channels, height, width)
-                )
-                features = encoded.reshape(batch, nodes, *encoded.shape[1:])
-                if base_strategy == "intermediate":
-                    outputs = model.heads(features.amax(dim=1))
-                    predictions = [
-                        decode(batch_outputs(outputs, i), cfg) for i in range(batch)
-                    ]
-                    serialization_start = time.perf_counter()
-                    representations = [
-                        sum(
-                            feature_payload(feature, cfg)
-                            for feature in item[1:].detach().cpu().numpy()
-                        )
-                        for item in features
-                    ]
-                    serialization_ms = (
-                        (time.perf_counter() - serialization_start)
-                        * 1000
-                        / len(cloud_batches)
-                    )
-                elif base_strategy.startswith("adaptive"):
-                    budget = float(
-                        budget_text or cfg["adaptive_fusion"]["evaluation_budgets"][0]
-                    )
-                    selector = adaptive_selector(strategy)
-                    generators = None
-                    if selector == "random" and random_seeds is not None:
-                        generators = []
-                        for random_seed in random_seeds:
-                            generator = torch.Generator(device=device)
-                            generator.manual_seed(random_seed)
-                            generators.append(generator)
-                    fused, selected = model.adaptive_features(
-                        features, budget, selector, generators=generators
-                    )
-                    outputs = model.heads(fused)
-                    predictions = [
-                        decode(batch_outputs(outputs, i), cfg) for i in range(batch)
-                    ]
-                    serialization_start = time.perf_counter()
-                    representations = [
-                        adaptive_payload(features[item], selected[item], cfg)
-                        for item in range(batch)
-                    ]
-                    serialization_ms = (
-                        (time.perf_counter() - serialization_start)
-                        * 1000
-                        / len(cloud_batches)
-                    )
-                else:
-                    outputs = model.heads(
-                        features.reshape(batch * nodes, *features.shape[2:])
-                    )
-                    predictions, representations = [], []
-                    serialization_seconds = 0.0
-                    for item in range(batch):
-                        local = [
-                            decode(batch_outputs(outputs, item * nodes + node), cfg)
-                            for node in range(nodes)
-                        ]
-                        predictions.append(
-                            nms(
-                                [box for group in local for box in group],
-                                cfg["evaluation"]["nms_iou"],
-                                cfg["evaluation"]["late_max_detections"],
-                            )
-                        )
-                        serialization_start = time.perf_counter()
-                        representations.append(
-                            sum(late_payload(group, cfg) for group in local[1:])
-                        )
-                        serialization_seconds += (
-                            time.perf_counter() - serialization_start
-                        )
-                    serialization_ms = serialization_seconds * 1000 / len(cloud_batches)
-        sync(device)
-        combined_ms = (time.perf_counter() - start) * 1000 / len(cloud_batches)
-        inference_ms = max(0.0, combined_ms - serialization_ms)
-        return list(
-            zip(
-                predictions,
-                [inference_ms] * len(predictions),
-                representations,
-                [preprocessing_ms] * len(predictions),
-                [serialization_ms] * len(predictions),
-            )
+        return run_inference(
+            model,
+            cloud_batches,
+            cfg,
+            device,
+            strategy,
+            raw_payloads,
+            random_seeds,
+            prepared_bevs,
+            preprocessing_overheads_ms,
         )
     except (torch.OutOfMemoryError, RuntimeError) as error:
         if not cuda_oom(error, device):

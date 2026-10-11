@@ -5,6 +5,7 @@ import math
 import os
 import subprocess
 import sys
+import weakref
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -964,6 +965,176 @@ def test_nonfinite_amp_loss_retries_batch_in_fp32(monkeypatch, fixture_config, c
     assert losses == [1.0]
     assert autocast_states == [True, False]
     assert "AMP nonfinite loss recovered in fp32" in capsys.readouterr().out
+
+
+def test_fp32_retry_releases_amp_graph_first(monkeypatch, fixture_config):
+    active = SimpleNamespace(enabled=False)
+    amp_tensors = []
+
+    class Autocast:
+        def __init__(self, *, enabled, **kwargs):
+            self.enabled = enabled
+
+        def __enter__(self):
+            active.enabled = self.enabled
+
+        def __exit__(self, *args):
+            active.enabled = False
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, bev, mode):
+            if not active.enabled:
+                # Holding the fp16 graph through the fp32 pass doubles peak memory.
+                assert all(reference() is None for reference in amp_tensors)
+            value = self.weight * (float("inf") if active.enabled else 1.0)
+            output = value[None]
+            if active.enabled:
+                amp_tensors.append(weakref.ref(output))
+            return output, output
+
+    def tracked_loss(outputs, target, size):
+        value = outputs[0].sum()
+        if active.enabled:
+            amp_tensors.append(weakref.ref(value))
+        return value
+
+    class Scaler:
+        def scale(self, value):
+            return value
+
+        def unscale_(self, optimizer):
+            pass
+
+        def step(self, optimizer):
+            optimizer.step()
+
+        def update(self):
+            pass
+
+    model = Model()
+    fixture_config["training"]["mixed_precision"] = True
+    monkeypatch.setattr(torch, "autocast", Autocast)
+    monkeypatch.setattr(
+        pipeline_module, "device_tensor", lambda value, device: torch.as_tensor(value)
+    )
+    monkeypatch.setattr(pipeline_module, "loss", tracked_loss)
+    losses = pipeline_module.train_examples(
+        model,
+        torch.optim.SGD(model.parameters(), lr=0.1),
+        Scaler(),
+        {
+            "bev": np.zeros((1, 1), np.float32),
+            "target": tuple(np.zeros((1, 1), np.float32) for _ in range(3)),
+        },
+        "intermediate",
+        fixture_config,
+        SimpleNamespace(type="cuda"),
+        "test",
+        {"training": 1},
+        retries=0,
+    )
+    assert losses == [1.0]
+    assert len(amp_tensors) == 2
+
+
+def test_training_oom_split_releases_failed_batch(monkeypatch, fixture_config):
+    failed = []
+
+    def tracked_tensor(value, device):
+        tensor = torch.as_tensor(value)
+        if len(value) > 1:
+            failed.append(weakref.ref(tensor))
+        return tensor
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, bev, mode):
+            if len(bev) > 1:
+                raise torch.OutOfMemoryError("out of memory")
+            # Parent frames must not keep the failed batch alive on the GPU.
+            assert failed and all(reference() is None for reference in failed)
+            value = self.weight * bev.sum()
+            return value[None], value[None]
+
+    class Scaler:
+        def scale(self, value):
+            return value
+
+        def unscale_(self, optimizer):
+            pass
+
+        def step(self, optimizer):
+            optimizer.step()
+
+        def update(self):
+            pass
+
+    model = Model()
+    fixture_config["training"]["mixed_precision"] = False
+    monkeypatch.setattr(pipeline_module, "device_tensor", tracked_tensor)
+    monkeypatch.setattr(pipeline_module, "release_cuda_memory", lambda device: None)
+    monkeypatch.setattr(
+        pipeline_module, "loss", lambda outputs, target, size: outputs[0].sum()
+    )
+    runtime_batches = {"training": 4}
+    losses = pipeline_module.train_examples(
+        model,
+        torch.optim.SGD(model.parameters(), lr=0.1),
+        Scaler(),
+        {
+            "bev": np.ones((4, 1), np.float32),
+            "target": tuple(np.zeros((4, 1), np.float32) for _ in range(3)),
+        },
+        "early",
+        fixture_config,
+        SimpleNamespace(type="cuda"),
+        "test",
+        runtime_batches,
+        retries=0,
+    )
+    assert len(losses) == 4
+    assert runtime_batches["training"] == 1
+
+
+def test_validation_oom_split_releases_failed_batch(monkeypatch, fixture_config):
+    model = BEVDetector(
+        fixture_config["dataset"]["classes"],
+        4,
+        fixture_config["dataset"]["objects_per_cell"],
+    )
+    gt = [BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")]
+    target = targets(gt, fixture_config["dataset"], (8, 8))
+    early = np.zeros((4, 16, 16), np.float32)
+    per_node = np.zeros((2, 4, 16, 16), np.float32)
+    examples = [(early, per_node, (gt, []), target, 1, (gt, []), target)] * 2
+    original = pipeline_module.device_tensor
+    failed = []
+
+    def oom_after_first_tensor(array, device):
+        tensor = original(array, torch.device("cpu"))
+        if len(array) > 1:
+            failed.append(weakref.ref(tensor))
+            if len(failed) == 2:
+                raise torch.OutOfMemoryError("out of memory")
+        else:
+            assert all(reference() is None for reference in failed)
+        return tensor
+
+    monkeypatch.setattr(pipeline_module, "device_tensor", oom_after_first_tensor)
+    monkeypatch.setattr(pipeline_module, "release_cuda_memory", lambda device: None)
+    fixture_config["training"]["mixed_precision"] = False
+    losses, _ = pipeline_module.validate_examples(
+        model, examples, fixture_config, SimpleNamespace(type="cuda"), retries=0
+    )
+    assert len(losses) == 2
+    assert len(failed) == 2
 
 
 def test_nonfinite_tensor_summary_reports_counts():
