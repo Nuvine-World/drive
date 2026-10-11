@@ -1,4 +1,6 @@
 """ECCO preprocessing, training, inference, evaluation, and reporting pipeline."""
+
+import copy
 import csv
 import gc
 import hashlib
@@ -24,7 +26,7 @@ from src.data.api import annotations, bev_channels, discover, load_cloud, raster
 from src.data.augmentation import augment_scene, sample_parameters
 from src.data.visibility import box_point_counts, node_origin
 from src.detection.bev import (
-    BEVDetector,
+    DRIVEDetector,
     TargetCollisionError,
     decode,
     grid_cell_size,
@@ -33,12 +35,30 @@ from src.detection.bev import (
     target_cell,
     targets,
 )
-from src.metrics.evaluation import evaluate, f1_optimal_thresholds, nms
+from src.metrics.evaluation import evaluate, f1_optimal_thresholds, group_frames, nms
+from src.network.control import PastOnlyLinkEstimator, past_frame
+from src.network.deadline import (
+    Link,
+    Option,
+    OutcomeLog,
+    dense_bytes,
+    feature_controllers,
+    make_trace,
+    sparse_bytes,
+)
 
-EVALUATION_VERSION = 5
-MODEL_VERSION = 6
+EVALUATION_VERSION = 6
+MODEL_VERSION = 7
 GT_SCOPES = ("full", "visible")
+# CoInfra benchmark, LiDAR only, all weather, AP@0.5 (arXiv 2507.02245v3,
+# Table 5). Frames there are split 80/10/10 at random, not by session.
+COINFRA_PUBLISHED_AP = {
+    "GlobalLidar": {"Bus": 0.997, "LV": 0.977, "VRU": 0.615},
+    "LocalLidar": {"Bus": 0.803, "LV": 0.807, "VRU": 0.128},
+}
 RANGE_BINS_M = (30.0, 60.0)
+# Throughput prior before the first link-capacity report.
+DEADLINE_INITIAL_MBPS = 10.0
 
 
 def write_json(path, value):
@@ -120,36 +140,38 @@ def validate_batch(model, examples, cfg, device):
         )
         for position in (3, 6)
     )
-    with torch.no_grad(), torch.autocast(
-        device_type=device.type,
-        dtype=torch.float16,
-        enabled=mixed_precision(cfg, device),
-    ):
-        early_outputs = model(early)
-        batch_size, nodes, channels, height, width = per_node.shape
-        encoded = model.encoder(
-            per_node.reshape(batch_size * nodes, channels, height, width)
-        )
-        features = encoded.reshape(batch_size, nodes, *encoded.shape[1:])
+    strategies = cfg["evaluation"]["strategies"]
+    with torch.no_grad(), autocast(cfg, device):
+        early_outputs = model(early, "early")
+        batch_size, nodes = per_node.shape[:2]
+        features, density = model.encode(per_node)
+        rows = torch.arange(batch_size, device=features.device)
         single_nodes = torch.as_tensor(
             [item[4] for item in examples], device=features.device
         )
-        single = model.heads(
-            features[torch.arange(batch_size, device=features.device), single_nodes]
+        single = model.detect(
+            model.fuse(
+                features[rows, single_nodes][:, None],
+                density[rows, single_nodes][:, None],
+            )
         )
         intermediate = (
-            model.heads(features.amax(dim=1))
-            if "intermediate" in cfg["evaluation"]["strategies"]
+            model.detect(model.fuse(features, density))
+            if "intermediate" in strategies
             else None
         )
         adaptive = None
-        if "adaptive" in cfg["evaluation"]["strategies"]:
+        if "adaptive" in strategies:
             validation_budget = cfg["adaptive_fusion"]["evaluation_budgets"][0]
-            fused, _ = model.adaptive_features(features, validation_budget)
-            adaptive = model.heads(fused)
+            available, _ = model.select(features, density, validation_budget)
+            adaptive = model.detect(model.fuse(features, density, available))
         late = (
-            model.heads(features.reshape(batch_size * nodes, *features.shape[2:]))
-            if "late" in cfg["evaluation"]["strategies"]
+            model.detect(
+                model.fuse(
+                    features.flatten(0, 1)[:, None], density.flatten(0, 1)[:, None]
+                )
+            )
+            if "late" in strategies
             else None
         )
     # Per-sample losses keep validation loss independent of batch size,
@@ -312,8 +334,14 @@ def _validation_metrics(model, samples, cfg, device, batch_size):
                 ("recall", "recall"),
                 ("f1", "f1"),
             ):
+                # A class without ground truth has no AP or recall, but its
+                # false positives give precision 0; leave it out of every mean.
                 details[f"val_{metric}_{view}{suffix}"] = _mean(
-                    [r[key] for r in level_rows if r[key] is not None]
+                    [
+                        r[key]
+                        for r in level_rows
+                        if r[key] is not None and r["ground_truth"]
+                    ]
                 )
         for result in rows:
             if result["iou_level"] != 0:
@@ -452,18 +480,30 @@ def signature(cfg):
         "objects_per_cell",
         "intensity_max",
         "use_intensity",
+        "height_slices",
+        "height_slice_m",
+        "train_frame_stride",
+        "split_mode",
+        "random_split",
     )
     training_keys = (
-        "hidden_channels",
+        "node_channels",
+        "backbone_channels",
+        "node_blocks",
+        "backbone_blocks",
+        "fusion",
         "output_stride",
         "learning_rate",
         "weight_decay",
         "batch_size",
         "mixed_precision",
+        "amp_dtype",
         "modes",
         "node_counts",
         "augmentation",
         "min_target_points",
+        "repeat_factor_threshold",
+        "stale",
     )
     return {
         "model_version": MODEL_VERSION,
@@ -481,15 +521,20 @@ def signature(cfg):
     }
 
 
-def audit_split_isolation(samples):
-    """Fail closed when any recording or source artifact crosses a split."""
+def audit_split_isolation(samples, split_mode="sessions"):
+    """Fail closed when any recording or source artifact crosses a split.
+
+    Under ``random_frames`` (CoInfra's published protocol) sessions are shared
+    across splits by design; every frame and source file must still belong to
+    exactly one split.
+    """
     owners = {}
     sessions = {}
     for sample in samples:
         split = sample["split"]
         session = sample["session"]
         previous = sessions.setdefault(session, split)
-        if previous != split:
+        if previous != split and split_mode != "random_frames":
             raise ValueError(
                 f"Data leakage: session {session!r} occurs in {previous} and {split}"
             )
@@ -509,7 +554,13 @@ def audit_split_isolation(samples):
         "samples": len(samples),
         "sessions": len(sessions),
         "sources": len(owners),
-        "status": "passed",
+        "split_mode": split_mode,
+        "status": (
+            "passed (frame-level random split; sessions shared across splits "
+            "by design, as in the CoInfra benchmark)"
+            if split_mode == "random_frames"
+            else "passed"
+        ),
     }
 
 
@@ -573,6 +624,7 @@ def evaluation_fingerprint(cfg, checkpoint):
                 "latency_experiment": cfg["latency_experiment"],
                 "deployment_assumptions": cfg["deployment_assumptions"],
                 "mixed_precision": cfg["training"]["mixed_precision"],
+                "amp_dtype": cfg["training"]["amp_dtype"],
             },
             sort_keys=True,
         ).encode()
@@ -617,7 +669,7 @@ def preprocess(cfg):
             "status": "intentionally skipped for --overfit diagnostic",
         }
     else:
-        isolation = audit_split_isolation(samples)
+        isolation = audit_split_isolation(samples, cfg["dataset"]["split_mode"])
     validate_node_capacity(samples, cfg)
     counts = defaultdict(int)
     for sample in samples:
@@ -820,7 +872,74 @@ def device_tensor(array, device):
     return value.to(device, non_blocking=device.type == "cuda")
 
 
-def training_plan(order, cfg, rng, batch_size=None):
+def repeat_factors(cfg, training):
+    """Per-frame repeat factors for class-balanced sampling (LVIS).
+
+    ``r = max(1, max_c sqrt(t / f_c))`` over the classes ``c`` in the frame,
+    where ``f_c`` is the fraction of training frames containing ``c`` and
+    ``t`` is ``training.repeat_factor_threshold``. Frames with rare classes
+    are seen more often without reweighting the loss.
+    """
+    threshold = cfg["training"]["repeat_factor_threshold"]
+    if not threshold:
+        return {sample["id"]: 1.0 for sample in training}
+    path = Path(cfg["output"]["root"]) / "repeat_factors.json"
+    key = {"fingerprint": fingerprint(cfg), "threshold": threshold}
+    if path.exists():
+        cached = json.loads(path.read_text())
+        if cached.get("key") == key:
+            return cached["factors"]
+    present = {
+        sample["id"]: {box.label for box in annotations(sample["gt"], cfg["dataset"])}
+        for sample in training
+    }
+    frequency = {
+        label: sum(label in labels for labels in present.values()) / len(present)
+        for label in cfg["dataset"]["classes"]
+    }
+    factors = {
+        sample_id: max(
+            [1.0] + [math.sqrt(threshold / frequency[label]) for label in labels]
+        )
+        for sample_id, labels in present.items()
+    }
+    write_json(
+        path, {"key": key, "class_frame_frequency": frequency, "factors": factors}
+    )
+    return factors
+
+
+def repeated_order(training, factors, rng):
+    """Each frame ``floor(r)`` times plus once more with probability ``r % 1``."""
+    order = []
+    for sample in training:
+        factor = factors[sample["id"]]
+        whole = int(factor)
+        fraction = factor - whole
+        order.extend(
+            [sample] * (whole + int(bool(fraction) and rng.random() < fraction))
+        )
+    return order
+
+
+def slice_histories(samples):
+    """Frames of each recording slice in time order, for stale-message lookup."""
+    histories = defaultdict(list)
+    for sample in sorted(samples, key=lambda item: float(item["timestamp"])):
+        histories[(sample["session"], sample["slice"])].append(sample)
+    return histories
+
+
+def training_plan(order, cfg, rng, batch_size=None, histories=None):
+    """Batches of ``(sample, mode, nodes, augmentation, sources)`` plans.
+
+    Node 0 of each plan is the receiver. With ``training.stale.probability``,
+    every collaborator of an intermediate or adaptive sample is replaced, with
+    that probability, by one of its own earlier frames from ``histories``, as
+    a message delayed by the network would be; ``sources`` maps such nodes to
+    the earlier sample.
+    """
+    stale = cfg["training"]["stale"]
     buckets = defaultdict(list)
     for sample in order:
         available = sorted(sample["nodes"])
@@ -834,8 +953,18 @@ def training_plan(order, cfg, rng, batch_size=None):
             budget = rng.choice(cfg["adaptive_fusion"]["training_budgets"])
             model_mode = f"adaptive@{budget:g}"
         augmentation = sample_parameters(rng, cfg["training"]["augmentation"])
+        sources = {}
+        if model_mode != "early" and len(nodes) > 1 and stale["probability"]:
+            history = histories[(sample["session"], sample["slice"])]
+            for node in nodes[1:]:
+                if rng.random() >= stale["probability"]:
+                    continue
+                age = rng.randint(1, stale["max_age_frames"])
+                earlier = past_frame(history, sample, age)
+                if earlier is not None and node in earlier["nodes"]:
+                    sources[node] = earlier
         buckets[(model_mode, len(nodes))].append(
-            (sample, model_mode, nodes, augmentation)
+            (sample, model_mode, nodes, augmentation, sources)
         )
     batches = []
     size = batch_size or cfg["training"]["batch_size"]
@@ -869,8 +998,20 @@ def visibility_scope(boxes, counts, cfg):
 
 
 def prepare_training_example(plan, cfg):
-    sample, mode, nodes, augmentation = plan
-    clouds = inputs(sample, nodes, cfg)
+    """``(bev, target, ages)`` for one plan; ``ages`` are message ages in s."""
+    sample, mode, nodes, augmentation, sources = plan
+    bounds = cfg["dataset"]["bounds"]
+    clouds = [
+        load_cloud(sources.get(node, sample)["nodes"][node], bounds) for node in nodes
+    ]
+    ages = [
+        (
+            float(sample["timestamp"]) - float(sources[node]["timestamp"])
+            if node in sources
+            else 0.0
+        )
+        for node in nodes
+    ]
     boxes = annotations(sample["gt"], cfg["dataset"])
     minimum = cfg["training"]["min_target_points"]
     if minimum:
@@ -895,20 +1036,26 @@ def prepare_training_example(plan, cfg):
         target = targets(boxes, cfg["dataset"], shape, sample_id=sample["id"])
     bev = array_inputs(clouds, cfg, mode)
     if mode == "early":
-        bev = bev[0]
-    return bev, target
+        # The merged cloud is one fresh node.
+        bev, ages = bev[0], [0.0]
+    return bev, target, np.asarray(ages, dtype=np.float32)
+
+
+def stack_training_examples(examples):
+    return {
+        "bev": np.stack([example[0] for example in examples]),
+        "target": tuple(
+            np.stack([example[1][index] for example in examples]) for index in range(3)
+        ),
+        "ages": np.stack([example[2] for example in examples]),
+    }
 
 
 def submit_training_batch(executor, plans, cfg):
     def prepare_batch():
-        examples = [prepare_training_example(plan, cfg) for plan in plans]
-        return {
-            "bev": np.stack([example[0] for example in examples]),
-            "target": tuple(
-                np.stack([example[1][index] for example in examples])
-                for index in range(3)
-            ),
-        }
+        return stack_training_examples(
+            [prepare_training_example(plan, cfg) for plan in plans]
+        )
 
     # Stack the large dense targets on a preprocessing worker instead of
     # blocking the GPU-owning training thread.
@@ -919,6 +1066,7 @@ def slice_training_batch(batch, start, stop):
     return {
         "bev": batch["bev"][start:stop],
         "target": tuple(value[start:stop] for value in batch["target"]),
+        "ages": batch["ages"][start:stop],
     }
 
 
@@ -952,27 +1100,21 @@ def train_step(model, optimizer, scaler, examples, mode, cfg, device, context):
     """
     bev = device_tensor(examples["bev"], device)
     target = tuple(device_tensor(value, device) for value in examples["target"])
+    ages = device_tensor(examples["ages"], device)
     optimizer.zero_grad(set_to_none=True)
     amp_enabled = mixed_precision(cfg, device)
-    with torch.autocast(
-        device_type=device.type,
-        dtype=torch.float16,
-        enabled=amp_enabled,
-    ):
-        outputs = model(bev, mode)
+    with autocast(cfg, device):
+        outputs = model(bev, mode, ages)
         value = loss(outputs, target, cell_size(cfg))
     if not torch.isfinite(value) and amp_enabled:
-        # A clean checkpoint can still encounter an input/order-dependent
-        # fp16 activation overflow. Retry only that batch in fp32, without
-        # changing the checkpoint signature or disabling AMP globally.
-        # Drop the fp16 graph first; keeping it alive through the fp32 pass
-        # needs memory for both graphs at once.
+        # fp16 can still overflow on an unusual batch (bf16 cannot). Retry
+        # only that batch in fp32, without disabling AMP globally. Drop the
+        # AMP graph first; keeping it alive through the fp32 pass needs
+        # memory for both graphs at once.
         outputs = value = None
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(
-            device_type=device.type, dtype=torch.float16, enabled=False
-        ):
-            outputs = model(bev, mode)
+        with autocast(cfg, device, enabled=False):
+            outputs = model(bev, mode, ages)
             value = loss(outputs, target, cell_size(cfg))
         if torch.isfinite(value):
             print(
@@ -1016,13 +1158,7 @@ def train_examples(
 ):
     """Train the largest batch that fits, recursively splitting on CUDA OOM."""
     if isinstance(examples, list):
-        examples = {
-            "bev": np.stack([example[0] for example in examples]),
-            "target": tuple(
-                np.stack([example[1][index] for example in examples])
-                for index in range(3)
-            ),
-        }
+        examples = stack_training_examples(examples)
     try:
         return train_step(
             model, optimizer, scaler, examples, mode, cfg, device, context
@@ -1164,18 +1300,45 @@ def batch_outputs(outputs, index):
     return outputs[0][index : index + 1], outputs[1][index : index + 1]
 
 
-def make_model(cfg,device):
-    return BEVDetector(
+def make_model(cfg, device):
+    t = cfg["training"]
+    return DRIVEDetector(
         cfg["dataset"]["classes"],
-        cfg["training"]["hidden_channels"],
-        cfg["dataset"].get("objects_per_cell", 1),
-        cfg["training"]["output_stride"],
         bev_channels(cfg["dataset"]),
+        cfg["dataset"].get("objects_per_cell", 1),
+        node_channels=t["node_channels"],
+        backbone_channels=t["backbone_channels"],
+        fusion=t["fusion"],
+        node_blocks=t["node_blocks"],
+        backbone_blocks=tuple(t["backbone_blocks"]),
+        output_stride=t["output_stride"],
     ).to(device)
 
 
 def mixed_precision(cfg, device):
     return device.type == "cuda" and cfg["training"]["mixed_precision"]
+
+
+def amp_dtype(cfg, device):
+    """bf16 keeps fp32's exponent range, so activations cannot overflow as in fp16."""
+    choice = cfg["training"]["amp_dtype"]
+    if choice == "auto":
+        bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
+        return torch.bfloat16 if bf16 else torch.float16
+    return getattr(torch, choice)
+
+
+def autocast(cfg, device, enabled=True):
+    return torch.autocast(
+        device_type=device.type,
+        dtype=amp_dtype(cfg, device),
+        enabled=enabled and mixed_precision(cfg, device),
+    )
+
+
+def gradient_scaling(cfg, device):
+    """Only fp16 needs loss scaling; bf16 has fp32's range."""
+    return mixed_precision(cfg, device) and amp_dtype(cfg, device) == torch.float16
 
 
 def train(cfg, overwrite=False):
@@ -1188,6 +1351,8 @@ def train(cfg, overwrite=False):
         "training": cfg["training"]["batch_size"],
         "evaluation": cfg["evaluation"]["batch_size"],
     }
+    factors = repeat_factors(cfg, training)
+    histories = slice_histories(training)
     for seed in cfg['training']['seeds']:
         path = output/f'seed_{seed}'/'best.pt'
         latest = path.parent/'latest.pt'
@@ -1239,7 +1404,7 @@ def train(cfg, overwrite=False):
             lr=cfg["training"]["learning_rate"],
             weight_decay=cfg["training"]["weight_decay"],
         )
-        scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision(cfg, device))
+        scaler = torch.amp.GradScaler("cuda", enabled=gradient_scaling(cfg, device))
         scheduler_cfg = cfg["training"]["scheduler"]
         scheduler = (
             torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -1300,10 +1465,12 @@ def train(cfg, overwrite=False):
         for epoch in range(start_epoch, cfg['training']['epochs']):
             wait_for_resources(cfg, device, f'before seed={seed} epoch={epoch+1}')
             model.train()
-            order = training.copy()
+            order = repeated_order(training, factors, rng)
             rng.shuffle(order)
             train_losses = []
-            batches = training_plan(order, cfg, rng, runtime_batches["training"])
+            batches = training_plan(
+                order, cfg, rng, runtime_batches["training"], histories
+            )
             if not batches:
                 raise ValueError("Training split contains no samples")
             workers = cfg["training"]["preprocessing_workers"]
@@ -1413,7 +1580,7 @@ def train(cfg, overwrite=False):
                 recovery_state = state | {
                     "optimizer": optimizer.state_dict(),
                     "scaler": (
-                        scaler.state_dict() if mixed_precision(cfg, device) else None
+                        scaler.state_dict() if gradient_scaling(cfg, device) else None
                     ),
                     "best_score": best_score,
                     "history": history,
@@ -1487,17 +1654,23 @@ def feature_payload(array, cfg):
     return len(zlib.compress(np.asarray(array, dtype=dtype).tobytes(), level=1))
 
 
-def adaptive_payload(feature_nodes, selected, cfg):
-    """Serialize selected collaborator cells as int32 indices and fp16 values."""
+def adaptive_payload(messages, selected, cfg):
+    """Serialize each collaborator's selected cells: indices and the cell values.
+
+    ``messages`` [N, C, h, w] holds every node's transmitted channels (node 0
+    is the receiver and sends nothing); ``selected`` [N-1, h, w] marks the
+    cells each collaborator sends.
+    """
     total = 0
     index_dtype = "<u2" if cfg["adaptive_fusion"]["index_bytes"] == 2 else "<u4"
     value_dtype = "<f2" if cfg["adaptive_fusion"]["value_bytes"] == 2 else "<f4"
-    for node, mask in zip(feature_nodes[1:], selected):
+    for node, mask in zip(messages[1:], selected):
         device_indices = mask.flatten().nonzero(as_tuple=False).flatten()
         indices = device_indices.detach().cpu().numpy().astype(index_dtype, copy=False)
         values = (
             node.flatten(1)[:, device_indices]
             .T.detach()
+            .float()
             .cpu()
             .numpy()
             .astype(value_dtype, copy=False)
@@ -1566,13 +1739,9 @@ def run_inference(
         preprocessing_ms += float(np.mean(preprocessing_overheads_ms))
     start = time.perf_counter()
     serialization_ms = 0.0
-    with torch.no_grad(), torch.autocast(
-        device_type=device.type,
-        dtype=torch.float16,
-        enabled=mixed_precision(cfg, device),
-    ):
+    with torch.no_grad(), autocast(cfg, device):
         if base_strategy == "early":
-            outputs = model.heads(model.encoder(bev))
+            outputs = model(bev, "early")
             predictions = [
                 decode(batch_outputs(outputs, i), cfg)
                 for i in range(len(cloud_batches))
@@ -1583,21 +1752,22 @@ def run_inference(
                 else [sum(payload(p) for p in clouds[1:]) for clouds in cloud_batches]
             )
         else:
-            batch, nodes, channels, height, width = bev.shape
-            encoded = model.encoder(bev.reshape(batch * nodes, channels, height, width))
-            features = encoded.reshape(batch, nodes, *encoded.shape[1:])
+            batch, nodes = bev.shape[:2]
+            features, density = model.encode(bev)
+            # A collaborator's message carries its features and point density.
+            messages = torch.cat((features, density.to(features.dtype)), dim=2)
             if base_strategy == "intermediate":
-                outputs = model.heads(features.amax(dim=1))
+                outputs = model.detect(model.fuse(features, density))
                 predictions = [
                     decode(batch_outputs(outputs, i), cfg) for i in range(batch)
                 ]
                 serialization_start = time.perf_counter()
                 representations = [
                     sum(
-                        feature_payload(feature, cfg)
-                        for feature in item[1:].detach().cpu().numpy()
+                        feature_payload(message, cfg)
+                        for message in item[1:].detach().float().cpu().numpy()
                     )
-                    for item in features
+                    for item in messages
                 ]
                 serialization_ms = (
                     (time.perf_counter() - serialization_start)
@@ -1616,16 +1786,16 @@ def run_inference(
                         generator = torch.Generator(device=device)
                         generator.manual_seed(random_seed)
                         generators.append(generator)
-                fused, selected = model.adaptive_features(
-                    features, budget, selector, generators=generators
+                available, _ = model.select(
+                    features, density, budget, selector, generators=generators
                 )
-                outputs = model.heads(fused)
+                outputs = model.detect(model.fuse(features, density, available))
                 predictions = [
                     decode(batch_outputs(outputs, i), cfg) for i in range(batch)
                 ]
                 serialization_start = time.perf_counter()
                 representations = [
-                    adaptive_payload(features[item], selected[item], cfg)
+                    adaptive_payload(messages[item], available[item, 1:], cfg)
                     for item in range(batch)
                 ]
                 serialization_ms = (
@@ -1634,8 +1804,10 @@ def run_inference(
                     / len(cloud_batches)
                 )
             else:
-                outputs = model.heads(
-                    features.reshape(batch * nodes, *features.shape[2:])
+                outputs = model.detect(
+                    model.fuse(
+                        features.flatten(0, 1)[:, None], density.flatten(0, 1)[:, None]
+                    )
                 )
                 predictions, representations = [], []
                 serialization_seconds = 0.0
@@ -2220,7 +2392,8 @@ def evaluate_session(
                                 "representation_bytes": representation,
                             }
                         )
-    metrics, cost_rows = [], []
+    metrics, cost_rows, comparison_rows = [], [], []
+    comparison = cfg["evaluation"]["comparison"]
     for (nodes, strategy), values in buckets.items():
         base = {
             "seed": seed,
@@ -2252,6 +2425,25 @@ def evaluate_session(
             )
         if records:
             detection_writer.writerows(detection_rows(records, base, values))
+        if comparison is not None:
+            # The published benchmark's metric (merged classes, BEV IoU), so
+            # results can be set beside its table.
+            for scope in GT_SCOPES:
+                grouped = group_frames(
+                    scoped[scope],
+                    comparison["groups"],
+                    cfg["evaluation"]["nms_iou"],
+                    cfg["evaluation"]["late_max_detections"],
+                )
+                comparison_rows.extend(
+                    base | {"gt_scope": scope, "iou_type": comparison["iou_type"]} | row
+                    for row in evaluate(
+                        grouped,
+                        list(comparison["groups"]),
+                        [comparison["iou_threshold"]],
+                        iou_type=comparison["iou_type"],
+                    )
+                )
         measured = np.array(costs[(nodes, strategy)])
         cost_base = base | {
             "frames": len(values),
@@ -2274,7 +2466,7 @@ def evaluate_session(
         f"subsets={len(groups)}",
         flush=True,
     )
-    return metrics, cost_rows, latency_tail_rows(cfg, service)
+    return metrics, cost_rows, latency_tail_rows(cfg, service), comparison_rows
 
 
 def operating_thresholds(model, cfg, device, validation, seed_directory, signature):
@@ -2329,7 +2521,7 @@ def run_evaluation(cfg):
     for sample in samples:
         sessions[sample['session']].append(sample)
     output, device = Path(cfg['output']['root']),device_for(cfg)
-    all_metrics, all_costs, trace_parts, tail_parts = [], [], [], []
+    all_metrics, all_costs, all_comparison, trace_parts, tail_parts = [], [], [], [], []
     for seed in cfg['training']['seeds']:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -2371,6 +2563,7 @@ def run_evaluation(cfg):
                     if part.get("signature") == evaluation_signature:
                         all_metrics.extend(part["metrics"])
                         all_costs.extend(part["costs"])
+                        all_comparison.extend(part["comparison"])
                         trace_parts.append(trace_path)
                         tail_parts.append(tail_path)
                         print(
@@ -2397,7 +2590,7 @@ def run_evaluation(cfg):
                         detection_stream, fieldnames=DETECTION_FIELDS
                     )
                     detection_writer.writeheader()
-                metrics, costs, tails = evaluate_session(
+                metrics, costs, tails, comparison = evaluate_session(
                     model,
                     cfg,
                     device,
@@ -2424,17 +2617,399 @@ def run_evaluation(cfg):
                     "session": session,
                     "metrics": metrics,
                     "costs": costs,
+                    "comparison": comparison,
                 },
             )
             all_metrics.extend(metrics)
             all_costs.extend(costs)
+            all_comparison.extend(comparison)
             trace_parts.append(trace_path)
             tail_parts.append(tail_path)
     write_csv(output / "accuracy.csv", all_metrics)
+    if cfg["evaluation"]["comparison"] is not None:
+        write_csv(output / "coinfra_comparison.csv", all_comparison)
     write_csv(output / "latency_communication.csv", all_costs)
     concatenate_csv(trace_parts, output / "latency_trace.csv")
     concatenate_csv(tail_parts, output / "latency_tail_summary.csv")
     return all_metrics
+
+
+def deadline_sequences(cfg):
+    """Consecutive native-rate frames from the first slices of each test session."""
+    x = cfg["deadline_experiment"]
+    sequence_cfg = copy.deepcopy(cfg)
+    d = sequence_cfg["dataset"]
+    d["splits"] = {"train": [], "val": [], "test": list(d["splits"]["test"])}
+    d["split_mode"] = "sessions"
+    d["frame_stride"] = d["train_frame_stride"] = 1
+    d["max_frames_per_slice"] = x["frames_per_slice"]
+    slices = defaultdict(list)
+    for sample in discover(sequence_cfg):
+        slices[(sample["session"], sample["slice"])].append(sample)
+    chosen, per_session = {}, defaultdict(int)
+    for key in sorted(slices):
+        if per_session[key[0]] < x["slices_per_session"]:
+            per_session[key[0]] += 1
+            chosen[key] = sorted(slices[key], key=lambda item: float(item["timestamp"]))
+    return chosen
+
+
+class DeadlineState:
+    """Links, estimators, controllers, and delivered messages of one run."""
+
+    def __init__(self, cfg, key, collaborators, trace, controller):
+        x = cfg["deadline_experiment"]
+        period = cfg["latency_experiment"]["frame_period_ms"]
+        rtt = cfg["deployment_assumptions"]["edge_rtt_ms"]
+        self.links, self.estimators, self.logs, self.controllers = {}, {}, {}, {}
+        self.inbox = {node: [] for node in collaborators}
+        for node in collaborators:
+            seed = stable_random_seed("deadline-trace", trace["name"], *key, node)
+            self.links[node] = Link(make_trace(trace, seed, period), rtt)
+            self.estimators[node] = PastOnlyLinkEstimator(
+                DEADLINE_INITIAL_MBPS, x["estimator_alpha"]
+            )
+            self.logs[node] = OutcomeLog()
+            self.controllers[node] = controller() if controller else None
+        # Per collaborator: (frame, budget, age in s) of the message fused
+        # this frame, or None.
+        self.use = {}
+
+
+def deadline_frame_cache(model, cfg, device, sample, nodes, budgets):
+    """Everything any controller may send or fuse for one frame."""
+    d = cfg["dataset"]
+    bounds = d["bounds"]
+    clouds = [load_cloud(sample["nodes"][node], bounds) for node in nodes]
+    gt = annotations(sample["gt"], d)
+    support = sum(box_point_counts(cloud, gt, bounds) for cloud in clouds)
+    bev = device_tensor(
+        np.stack([rasterize(cloud, d) for cloud in clouds])[None], device
+    )
+    with torch.no_grad(), autocast(cfg, device):
+        features, density = model.encode(bev)
+        utility = model.utility(features[0, 1:]).float().sigmoid().flatten(1)
+        ranking = utility.argsort(dim=1, descending=True)
+        cumulative = utility.gather(1, ranking).cumsum(dim=1)
+        own = model.detect(model.fuse(features[0][:, None], density[0][:, None]))
+    cells = ranking.shape[1]
+    share = [
+        {
+            budget: float(row[math.ceil(budget * cells) - 1] / row[-1])
+            for budget in budgets
+        }
+        for row in cumulative
+    ]
+    boxes = [decode(batch_outputs(own, index), cfg) for index in range(len(nodes))]
+    threshold = cfg["evaluation"]["score_threshold"]
+    return {
+        "timestamp": float(sample["timestamp"]),
+        "features": features[0],
+        "density": density[0],
+        "ranking": ranking,
+        "share": share,
+        "clouds": clouds,
+        "boxes": boxes,
+        # Raw points as float32 x, y, z, intensity; boxes as nine float32.
+        "early_bytes": [len(cloud) * 16 for cloud in clouds[1:]],
+        "late_bytes": [
+            max(16, 36 * sum(box.score >= threshold for box in local))
+            for local in boxes[1:]
+        ],
+        "scope": visibility_scope(gt, support, cfg),
+        "cells": cells,
+    }
+
+
+def run_deadline_sequence(model, cfg, device, seed, key, frames, predictions, totals):
+    """Replay one recording slice under every trace, deadline, and controller.
+
+    Appends each frame's ``(detections, visible, ignored)`` to
+    ``predictions[(seed, trace, deadline, controller)]`` and adds message
+    statistics to ``totals`` under the same key.
+    """
+    x = cfg["deadline_experiment"]
+    n = cfg["deployment_assumptions"]
+    period = cfg["latency_experiment"]["frame_period_ms"]
+    budgets = cfg["adaptive_fusion"]["evaluation_budgets"]
+    adaptive = cfg["adaptive_fusion"]
+    common = sorted(set.intersection(*(set(frame["nodes"]) for frame in frames)))
+    if len(common) < 2:
+        return
+    receiver = common[stable_random_seed("deadline-receiver", *key) % len(common)]
+    nodes = [receiver] + [node for node in common if node != receiver]
+    collaborators = nodes[1:]
+    factories = feature_controllers(
+        x["controllers"],
+        budgets,
+        x["tradeoffs"],
+        x["target_miss_rate"],
+        x["max_miss_probability"],
+    )
+    labels = list(factories) + [
+        name for name in ("dense", "early", "late") if name in x["controllers"]
+    ]
+    kinds = {
+        label: (
+            label
+            if label in ("early", "late")
+            else "intermediate" if label == "dense" else "adaptive"
+        )
+        for label in labels
+    }
+    states = {
+        (trace["name"], deadline, label): DeadlineState(
+            cfg, key, collaborators, trace, factories.get(label)
+        )
+        for trace in x["traces"]
+        for deadline in x["deadlines_ms"]
+        for label in labels
+    }
+    cache = {}
+    for t, sample in enumerate(frames):
+        cache[t] = deadline_frame_cache(model, cfg, device, sample, nodes, budgets)
+        for stale in [f for f in cache if t - f > x["max_age_frames"]]:
+            del cache[stale]
+        current = cache[t]
+        # Every sent cell carries its features and its point density.
+        channels = current["features"].shape[1] + 1
+        feature_jobs = []
+        for (trace_name, deadline, label), state in states.items():
+            kind = kinds[label]
+            frame_key = (seed, trace_name, deadline, label)
+            stats = totals[frame_key]
+            fusion_ms = t * period + deadline - n["processing_ms"]["edge"][kind]
+            ready_ms = t * period + n["sensing_ms"]
+            for index, node in enumerate(collaborators):
+                link, estimator = state.links[node], state.estimators[node]
+                controller = state.controllers[node]
+                if t:
+                    # One-frame-old capacity report from the node's 5G modem.
+                    estimator.observe_rate(t - 1, link.trace.bandwidth(t - 1))
+                for *_, missed in state.logs[node].release(ready_ms):
+                    if controller is not None:
+                        controller.outcome(True, missed)
+                if controller is not None:
+                    controller.frame()
+                queue = link.queue_ms(ready_ms)
+                horizon = fusion_ms - ready_ms
+                window = horizon - link.rtt_ms / 2 - queue
+                if kind == "adaptive":
+                    options = [Option(0.0, 0, 0.0)] + [
+                        Option(
+                            budget,
+                            sparse_bytes(
+                                current["cells"],
+                                budget,
+                                channels,
+                                adaptive["index_bytes"],
+                                adaptive["value_bytes"],
+                            ),
+                            current["share"][index][budget],
+                        )
+                        for budget in budgets
+                    ]
+                    choice = controller.choose(
+                        options,
+                        {
+                            "estimator": estimator,
+                            "window_ms": window,
+                            "horizon_ms": horizon,
+                            "fixed_ms": link.rtt_ms / 2,
+                            "queue_ms": queue,
+                            "frame": t,
+                            "cells": current["cells"],
+                            "channels": channels,
+                            "index_bytes": adaptive["index_bytes"],
+                            "value_bytes": adaptive["value_bytes"],
+                            "true_mbps": link.trace.bandwidth(t),
+                        },
+                    )
+                    budget, size = choice.budget, choice.message_bytes
+                elif kind == "intermediate":
+                    budget = 1.0
+                    size = dense_bytes(
+                        current["cells"], channels, adaptive["value_bytes"]
+                    )
+                else:
+                    budget = 1.0
+                    size = current[f"{kind}_bytes"][index]
+                stats["collaborator_frames"] += 1
+                stats["budget"] += budget
+                if budget > 0:
+                    arrival, duration = link.send(t, ready_ms, size)
+                    missed = arrival > fusion_ms
+                    state.logs[node].record(
+                        link.busy_until_ms, t, size, duration, missed
+                    )
+                    state.inbox[node].append((t, arrival, budget))
+                    stats["sent"] += 1
+                    stats["missed"] += missed
+                    stats["bytes"] += size
+                usable = [
+                    message
+                    for message in state.inbox[node]
+                    if message[1] <= fusion_ms and t - message[0] <= x["max_age_frames"]
+                ]
+                state.inbox[node] = [
+                    message
+                    for message in state.inbox[node]
+                    if t - message[0] <= x["max_age_frames"]
+                ]
+                latest = max(usable, default=None)
+                if latest is None:
+                    stats["none"] += 1
+                    state.use[node] = None
+                    continue
+                age = current["timestamp"] - cache[latest[0]]["timestamp"]
+                stats["fresh" if latest[0] == t else "stale"] += 1
+                stats["age"] += age
+                state.use[node] = (latest[0], latest[2], age)
+            if kind in ("adaptive", "intermediate"):
+                feature_jobs.append((frame_key, state))
+            elif kind == "early":
+                merged = [current["clouds"][0]]
+                for index, node in enumerate(collaborators):
+                    use = state.use[node]
+                    if use is not None:
+                        merged.append(cache[use[0]]["clouds"][index + 1])
+                bev = device_tensor(
+                    rasterize(np.concatenate(merged), cfg["dataset"])[None], device
+                )
+                with torch.no_grad(), autocast(cfg, device):
+                    outputs = model(bev, "early")
+                predictions[frame_key].append((decode(outputs, cfg), *current["scope"]))
+            else:
+                boxes = list(current["boxes"][0])
+                for index, node in enumerate(collaborators):
+                    use = state.use[node]
+                    if use is not None:
+                        boxes.extend(cache[use[0]]["boxes"][index + 1])
+                merged_boxes = nms(
+                    boxes,
+                    cfg["evaluation"]["nms_iou"],
+                    cfg["evaluation"]["late_max_detections"],
+                )
+                predictions[frame_key].append((merged_boxes, *current["scope"]))
+        for start in range(0, len(feature_jobs), cfg["evaluation"]["batch_size"]):
+            chunk = feature_jobs[start : start + cfg["evaluation"]["batch_size"]]
+            stacked = [
+                deadline_fusion_inputs(current, cache, collaborators, state)
+                for _, state in chunk
+            ]
+            with torch.no_grad(), autocast(cfg, device):
+                outputs = model.detect(
+                    model.fuse(*(torch.stack(part) for part in zip(*stacked)))
+                )
+            for index, (frame_key, _) in enumerate(chunk):
+                predictions[frame_key].append(
+                    (decode(batch_outputs(outputs, index), cfg), *current["scope"])
+                )
+
+
+def deadline_fusion_inputs(current, cache, collaborators, state):
+    """Receiver-side features, density, availability, and ages for one run."""
+    features = [current["features"][0]]
+    density = [current["density"][0]]
+    receiver = torch.ones_like(current["density"][0][0], dtype=torch.bool)
+    available, ages = [receiver], [0.0]
+    for index, node in enumerate(collaborators):
+        use = state.use[node]
+        if use is None:
+            features.append(torch.zeros_like(current["features"][0]))
+            density.append(torch.zeros_like(current["density"][0]))
+            available.append(torch.zeros_like(receiver))
+            ages.append(0.0)
+            continue
+        frame, budget, age = use
+        source = cache[frame]
+        features.append(source["features"][index + 1])
+        density.append(source["density"][index + 1])
+        mask = torch.zeros(receiver.numel(), dtype=torch.bool, device=receiver.device)
+        mask[source["ranking"][index][: math.ceil(budget * source["cells"])]] = True
+        available.append(mask.reshape(receiver.shape))
+        ages.append(age)
+    return (
+        torch.stack(features),
+        torch.stack(density),
+        torch.stack(available),
+        torch.tensor(ages, device=receiver.device),
+    )
+
+
+def run_deadline_evaluation(cfg):
+    """Deadline-constrained cooperation on consecutive frames of test sessions."""
+    x = cfg["deadline_experiment"]
+    output = Path(cfg["output"]["root"])
+    if not x["enabled"]:
+        return []
+    sequences = deadline_sequences(cfg)
+    device = device_for(cfg)
+    predictions = defaultdict(list)
+    totals = defaultdict(lambda: defaultdict(float))
+    for seed in cfg["training"]["seeds"]:
+        checkpoint = output / f"seed_{seed}" / "best.pt"
+        if not checkpoint.exists():
+            raise FileNotFoundError(f"Train first; missing {checkpoint}")
+        state = torch.load(checkpoint, map_location=device, weights_only=True)
+        if not checkpoint_compatible(state, cfg):
+            raise ValueError("Checkpoint data/model configuration mismatch")
+        torch.manual_seed(seed)
+        model = make_model(cfg, device)
+        model.load_state_dict(state["model"])
+        model.eval()
+        for key, frames in sequences.items():
+            run_deadline_sequence(
+                model, cfg, device, seed, key, frames, predictions, totals
+            )
+            print(
+                f"Deadline experiment seed={seed} session={key[0]} slice={key[1]} "
+                f"frames={len(frames)}",
+                flush=True,
+            )
+    classes = cfg["dataset"]["classes"]
+    rows = []
+    for key, frames in predictions.items():
+        seed, trace_name, deadline, label = key
+        stats = totals[key]
+        metrics = [
+            row
+            for row in evaluate(
+                frames,
+                classes,
+                cfg["evaluation"]["iou_thresholds"],
+                class_thresholds=cfg["evaluation"]["class_iou_thresholds"],
+            )
+            if row["iou_level"] == 0
+        ]
+        scored = [row for row in metrics if row["ap_3d"] is not None]
+        used = stats["fresh"] + stats["stale"]
+        collaborator_frames = max(stats["collaborator_frames"], 1)
+        rows.append(
+            {
+                "seed": seed,
+                "trace": trace_name,
+                "deadline_ms": deadline,
+                "controller": label,
+                "frames": len(frames),
+                "map": _mean([row["ap_3d"] for row in scored]),
+                **{f"ap_{row['class']}": row["ap_3d"] for row in metrics},
+                "mean_kb_per_collaborator_frame": stats["bytes"]
+                / collaborator_frames
+                / 1000,
+                "mean_budget": stats["budget"] / collaborator_frames,
+                "miss_rate_sent": (
+                    stats["missed"] / stats["sent"] if stats["sent"] else 0.0
+                ),
+                "miss_rate_frames": stats["missed"] / collaborator_frames,
+                "fresh_fraction": stats["fresh"] / collaborator_frames,
+                "stale_fraction": stats["stale"] / collaborator_frames,
+                "none_fraction": stats["none"] / collaborator_frames,
+                "mean_age_s": stats["age"] / used if used else 0.0,
+            }
+        )
+    write_csv(output / "deadline_results.csv", rows)
+    return rows
 
 
 def range_bin(distance):
@@ -2683,6 +3258,110 @@ def range_section(ranges):
         recall = f"{matched / gt:.3f}" if gt else "n/a"
         lines.append(
             f"| {count} | {strategy} | {distance} | {precision} | {recall} | {fp} | {gt} |"
+        )
+    return lines
+
+
+def comparison_section(cfg, output):
+    """Grouped BEV AP at the largest node count beside the published table."""
+    path = output / "coinfra_comparison.csv"
+    if cfg["evaluation"]["comparison"] is None or not path.is_file():
+        return []
+    with path.open() as stream:
+        rows = [row for row in csv.DictReader(stream) if row["ap_3d"] not in ("", None)]
+    if not rows:
+        return []
+    groups = list(cfg["evaluation"]["comparison"]["groups"])
+    largest = max(int(row["node_count"]) for row in rows)
+    pooled = defaultdict(list)
+    for row in rows:
+        count, strategy = int(row["node_count"]), row["strategy"]
+        # One node is the same detector under every label; selector ablations
+        # appear in the rate-accuracy tables.
+        if count == 1 and strategy == "early":
+            strategy = "single node"
+        elif count != largest or count == 1 or "_" in strategy.split("@")[0]:
+            continue
+        pooled[(row["gt_scope"], count, strategy, row["class"])].append(
+            float(row["ap_3d"])
+        )
+    protocol = (
+        "the same random frame split as the published table"
+        if cfg["dataset"]["split_mode"] == "random_frames"
+        else "session-held-out splits, which the published random frame split "
+        "does not test; compare with configs/coinfra_random_split.yaml"
+    )
+    iou = cfg["evaluation"]["comparison"]
+    lines = [
+        "",
+        "## Comparison with the CoInfra benchmark metric",
+        "",
+        f"AP@{iou['iou_threshold']:g} with {iou['iou_type'].upper()} IoU over merged "
+        f"classes ({', '.join(f'{k} = {'+'.join(v)}' for k, v in iou['groups'].items())}), "
+        f"mean over sessions and seeds. These results use {protocol}. Published "
+        "LiDAR rows are from arXiv 2507.02245v3, Table 5.",
+        "",
+        "| Scope | Nodes | Fusion | " + " | ".join(groups) + " |",
+        "|---|---:|---|" + "---:|" * len(groups),
+    ]
+    keys = sorted({key[:3] for key in pooled})
+    for scope, count, strategy in keys:
+        values = [
+            (
+                f"{np.mean(pooled[(scope, count, strategy, group)]):.3f}"
+                if pooled.get((scope, count, strategy, group))
+                else "n/a"
+            )
+            for group in groups
+        ]
+        lines.append(f"| {scope} | {count} | {strategy} | " + " | ".join(values) + " |")
+    for name, values in COINFRA_PUBLISHED_AP.items():
+        cells = [
+            f"{values[group]:.3f}" if group in values else "n/a" for group in groups
+        ]
+        lines.append(f"| published | 8 | CoInfra {name} | " + " | ".join(cells) + " |")
+    return lines
+
+
+def deadline_section(cfg, output):
+    """Mean over seeds of each controller under each trace and deadline."""
+    path = output / "deadline_results.csv"
+    if not cfg["deadline_experiment"]["enabled"] or not path.is_file():
+        return []
+    with path.open() as stream:
+        rows = list(csv.DictReader(stream))
+    pooled = defaultdict(list)
+    for row in rows:
+        pooled[(row["trace"], float(row["deadline_ms"]), row["controller"])].append(row)
+    x = cfg["deadline_experiment"]
+    lines = [
+        "",
+        "## Deadline-constrained cooperation",
+        "",
+        f"Consecutive 10 Hz test frames ({x['frames_per_slice']} per slice). Each "
+        "collaborator decides every frame what to send over its own uplink trace; "
+        "a message that misses the receiver's fusion deadline is fused later as "
+        f"a stale message for up to {x['max_age_frames']} frames. DRIVE targets a "
+        f"late-message rate of {x['target_miss_rate']:g} per frame; each tradeoff V "
+        "is one point of its utility-versus-miss-rate curve. The oracle knows the "
+        "true throughput. mAP uses the visible scope at the primary IoU level.",
+        "",
+        "| Trace | Deadline (ms) | Controller | mAP | kB per collaborator-frame | "
+        "Late per frame | Fresh | Stale | None | Mean age (s) |",
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for (trace, deadline, controller), group in sorted(pooled.items()):
+
+        def mean(name):
+            values = [float(row[name]) for row in group if row[name] not in ("", None)]
+            return float(np.mean(values)) if values else float("nan")
+
+        lines.append(
+            f"| {trace} | {deadline:g} | {controller} | {mean('map'):.4f} | "
+            f"{mean('mean_kb_per_collaborator_frame'):.1f} | "
+            f"{mean('miss_rate_frames'):.3f} | {mean('fresh_fraction'):.2f} | "
+            f"{mean('stale_fraction'):.2f} | {mean('none_fraction'):.2f} | "
+            f"{mean('mean_age_s'):.2f} |"
         )
     return lines
 
@@ -3290,6 +3969,8 @@ def report(cfg):
     lines.extend(latency_feasibility_section(cfg, costs))
     if ranges:
         lines.extend(range_section(ranges))
+    lines.extend(comparison_section(cfg, output))
+    lines.extend(deadline_section(cfg, output))
     lines.extend(
         [
             "",
@@ -3353,6 +4034,16 @@ def verify_results(cfg):
         checks[f'artifact:{name}'] = path.is_file()
         if not checks[f'artifact:{name}']:
             errors.append(f'missing artifact: {name}')
+    optional = []
+    if cfg["deadline_experiment"]["enabled"]:
+        optional.append("deadline_results.csv")
+    if cfg["evaluation"]["comparison"] is not None:
+        optional.append("coinfra_comparison.csv")
+    for name in optional:
+        path = output / name
+        checks[f"artifact:{name}"] = path.is_file() and path.stat().st_size > 0
+        if not checks[f"artifact:{name}"]:
+            errors.append(f"missing or empty artifact: {name}")
     if cfg["evaluation"]["save_detections"]:
         path = output / "range_breakdown.csv"
         checks["artifact:range_breakdown.csv"] = path.is_file()

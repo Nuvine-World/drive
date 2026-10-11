@@ -1,6 +1,7 @@
 """CoInfra I2I reader. Fail on missing calibration/labels instead of guessing."""
 from pathlib import Path
 from functools import lru_cache
+import hashlib
 import math
 import warnings
 import numpy as np
@@ -92,9 +93,10 @@ def discover(cfg):
     if not root.is_dir():
         raise FileNotFoundError(f'Extract CoInfra into {root} or set COINFRA_ROOT')
     excluded = []
-    for split, sessions in d['splits'].items():
-        if smoke.get('enabled'):
-            sessions = sessions[:smoke['sessions_per_split']]
+    random_frames = d.get("split_mode") == "random_frames"
+    for split, sessions in d["splits"].items():
+        if smoke.get("enabled"):
+            sessions = sessions[: smoke["sessions_per_split"]]
         for session in sessions:
             scenario = root / session
             if not scenario.is_dir():
@@ -117,7 +119,14 @@ def discover(cfg):
                     if candidate.is_dir():
                         frames.append((timestamp, candidate))
                 frames = [candidate for _, candidate in sorted(frames)]
-                frames = frames[::d['frame_stride']]
+                # Denser training frames add data; evaluation keeps frame_stride.
+                training = split == "train" and not random_frames
+                stride = (
+                    d.get("train_frame_stride", d["frame_stride"])
+                    if training
+                    else d["frame_stride"]
+                )
+                frames = frames[::stride]
                 if d.get('max_frames_per_slice') is not None:
                     frames = frames[:d['max_frames_per_slice']]
                 if smoke.get('enabled'):
@@ -153,7 +162,27 @@ def discover(cfg):
         )
     if not samples:
         raise ValueError('No samples matched the configuration')
+    if random_frames:
+        assign_random_splits(samples, d["random_split"])
     return samples
+
+
+def assign_random_splits(samples, settings):
+    """CoInfra's published protocol: frames split at random, sessions shared.
+
+    Each frame's split depends only on its id and the seed, so it is stable
+    under reordering and under adding or removing other frames.
+    """
+    train, val, _ = settings["fractions"]
+    for sample in samples:
+        digest = hashlib.sha256(f"{settings['seed']}\0{sample['id']}".encode()).digest()
+        draw = int.from_bytes(digest[:8], "little") / 2**64
+        sample["split"] = (
+            "train" if draw < train else "val" if draw < train + val else "test"
+        )
+    for split in ("train", "val", "test"):
+        if not any(sample["split"] == split for sample in samples):
+            raise ValueError(f"random_frames assigned no frames to {split}")
 
 
 def load_cloud(node, bounds):
@@ -169,8 +198,11 @@ def load_cloud(node, bounds):
 
 
 def bev_channels(cfg):
-    """Density, maximum, minimum, and mean height, plus intensity when used."""
-    return 5 if cfg.get("use_intensity", True) else 4
+    """Density; maximum, minimum, and mean height; height slices above the
+    cell's lowest return; and intensity when used."""
+    return (
+        4 + cfg.get("height_slices", 0) + (1 if cfg.get("use_intensity", True) else 0)
+    )
 
 
 def rasterize(points, cfg):
@@ -194,6 +226,19 @@ def rasterize(points, cfg):
     np.minimum.at(minimum, (y, x), height)
     bev[2] = np.where(occupied, minimum, 0)
     bev[3] = np.bincount(cells, weights=height, minlength=h * w).reshape(h, w) / divisor
+    slices = cfg.get("height_slices", 0)
+    if slices:
+        # Point counts by height above the lowest return in the same cell.
+        # Measured from the cell's own floor, the slices describe vertical
+        # structure (a pedestrian versus low snow clutter) independent of the
+        # terrain level in the global frame.
+        above = (height - minimum[y, x]) * (b[5] - b[2])
+        level = np.minimum((above / cfg["height_slice_m"]).astype(int), slices - 1)
+        bev[4 : 4 + slices] = np.log1p(
+            np.bincount(level * (h * w) + cells, minlength=slices * h * w).reshape(
+                slices, h, w
+            )
+        )
     if cfg.get("use_intensity", True):
         intensity = points[:, 3]
         if cfg.get("intensity_max"):
@@ -201,7 +246,7 @@ def rasterize(points, cfg):
             intensity = (
                 np.clip(intensity, 0, cfg["intensity_max"]) / cfg["intensity_max"]
             )
-        bev[4] = (
+        bev[4 + slices] = (
             np.bincount(cells, weights=intensity, minlength=h * w).reshape(h, w)
             / divisor
         )

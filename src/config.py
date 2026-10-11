@@ -8,7 +8,16 @@ import yaml
 PROJECT = Path(__file__).resolve().parents[1]
 
 
-def validate_splits(splits):
+def validate_splits(splits, mode="sessions"):
+    if mode == "random_frames":
+        # CoInfra's published protocol: every listed session is pooled and its
+        # frames are assigned to splits at random, so sessions are shared.
+        if not splits["train"] or splits["val"] or splits["test"]:
+            raise ValueError(
+                "split_mode random_frames lists every pooled session under "
+                "splits.train and leaves splits.val and splits.test empty"
+            )
+        return
     seen = set()
     for split in ("train", "val", "test"):
         sessions = splits[split]
@@ -30,6 +39,7 @@ def enable_smoke(cfg):
     smoke["enabled"] = True
     cfg["dataset"]["splits"] = smoke["splits"]
     validate_splits(cfg["dataset"]["splits"])
+    cfg["dataset"]["split_mode"] = "sessions"
     cfg["training"]["epochs"] = smoke["epochs"]
     cfg["training"]["minimum_epochs"] = smoke["epochs"]
     cfg["training"]["early_stopping_patience"] = 0
@@ -160,10 +170,55 @@ def load_config(path):
     d.setdefault("use_intensity", True)
     if not isinstance(d["use_intensity"], bool):
         raise ValueError("dataset.use_intensity must be boolean")
+    d.setdefault("height_slices", 5)
+    d.setdefault("height_slice_m", 0.5)
+    if (
+        not isinstance(d["height_slices"], int)
+        or isinstance(d["height_slices"], bool)
+        or d["height_slices"] < 0
+        or not isinstance(d["height_slice_m"], (int, float))
+        or not d["height_slice_m"] > 0
+    ):
+        raise ValueError(
+            "dataset.height_slices must be a nonnegative integer and "
+            "dataset.height_slice_m positive"
+        )
     if d["yaw_unit"] not in ("degrees", "radians"):
         raise ValueError("yaw_unit must be degrees or radians")
     if d["frame_stride"] < 1 or d.get("max_timestamp_delta_s", 0) < 0:
         raise ValueError("Invalid stride or synchronization tolerance")
+    d.setdefault("train_frame_stride", d["frame_stride"])
+    if (
+        not isinstance(d["train_frame_stride"], int)
+        or isinstance(d["train_frame_stride"], bool)
+        or d["train_frame_stride"] < 1
+    ):
+        raise ValueError("dataset.train_frame_stride must be a positive integer")
+    d.setdefault("split_mode", "sessions")
+    if d["split_mode"] not in ("sessions", "random_frames"):
+        raise ValueError("dataset.split_mode must be sessions or random_frames")
+    if (
+        d["split_mode"] == "random_frames"
+        and d["train_frame_stride"] != d["frame_stride"]
+    ):
+        raise ValueError(
+            "split_mode random_frames splits one frame list, so "
+            "dataset.train_frame_stride must equal dataset.frame_stride"
+        )
+    random_split = d.setdefault("random_split", {})
+    random_split.setdefault("fractions", [0.8, 0.1, 0.1])
+    random_split.setdefault("seed", 0)
+    fractions = random_split["fractions"]
+    if (
+        not isinstance(fractions, list)
+        or len(fractions) != 3
+        or any(not isinstance(v, (int, float)) or not v > 0 for v in fractions)
+        or not math.isclose(sum(fractions), 1.0)
+    ):
+        raise ValueError(
+            "dataset.random_split.fractions must be three positive train/val/test "
+            "fractions summing to 1"
+        )
     if any(
         smoke[k] < 1
         for k in (
@@ -177,7 +232,7 @@ def load_config(path):
         raise ValueError("Smoke-mode limits must be positive")
     if not d["classes"] or len(d["classes"]) != len(set(d["classes"])):
         raise ValueError("Classes must be nonempty and unique")
-    validate_splits(d["splits"])
+    validate_splits(d["splits"], d["split_mode"])
     if not e["strategies"] or not set(e["strategies"]) <= {
         "early",
         "intermediate",
@@ -194,6 +249,60 @@ def load_config(path):
         raise ValueError("Unknown training mode")
     if t["epochs"] < 1 or not t["seeds"] or t["learning_rate"] <= 0:
         raise ValueError("Invalid training configuration")
+    if "hidden_channels" in t:
+        raise ValueError(
+            "training.hidden_channels was replaced by training.node_channels and "
+            "training.backbone_channels"
+        )
+    t.setdefault("node_channels", 64)
+    t.setdefault("backbone_channels", 128)
+    t.setdefault("node_blocks", 1)
+    t.setdefault("backbone_blocks", [2, 2, 2])
+    t.setdefault("fusion", "attention")
+    if (
+        any(
+            not isinstance(t[key], int) or isinstance(t[key], bool) or t[key] < 1
+            for key in ("node_channels", "backbone_channels")
+        )
+        or not isinstance(t["node_blocks"], int)
+        or isinstance(t["node_blocks"], bool)
+        or t["node_blocks"] < 0
+        or not isinstance(t["backbone_blocks"], list)
+        or len(t["backbone_blocks"]) != 3
+        or any(
+            not isinstance(v, int) or isinstance(v, bool) or v < 1
+            for v in t["backbone_blocks"]
+        )
+    ):
+        raise ValueError(
+            "training node/backbone channels must be positive, node_blocks "
+            "nonnegative, and backbone_blocks three positive integers"
+        )
+    if t["fusion"] not in ("attention", "mean", "max"):
+        raise ValueError("training.fusion must be attention, mean, or max")
+    t.setdefault("amp_dtype", "auto")
+    if t["amp_dtype"] not in ("auto", "bfloat16", "float16"):
+        raise ValueError("training.amp_dtype must be auto, bfloat16, or float16")
+    t.setdefault("repeat_factor_threshold", 0.0)
+    if (
+        not isinstance(t["repeat_factor_threshold"], (int, float))
+        or isinstance(t["repeat_factor_threshold"], bool)
+        or not 0 <= t["repeat_factor_threshold"] <= 1
+    ):
+        raise ValueError("training.repeat_factor_threshold must be in [0, 1]")
+    stale = t.setdefault("stale", {})
+    stale.setdefault("probability", 0.0)
+    stale.setdefault("max_age_frames", 3)
+    if (
+        not isinstance(stale["probability"], (int, float))
+        or not 0 <= stale["probability"] <= 1
+        or not isinstance(stale["max_age_frames"], int)
+        or isinstance(stale["max_age_frames"], bool)
+        or stale["max_age_frames"] < 1
+    ):
+        raise ValueError(
+            "training.stale needs probability in [0, 1] and a positive max_age_frames"
+        )
     t.setdefault("output_stride", 2)
     if t["output_stride"] != 2:
         raise ValueError("training.output_stride must currently be 2")
@@ -289,8 +398,9 @@ def load_config(path):
     if not isinstance(checkpointing, dict):
         raise ValueError("training.checkpointing must be a mapping")
     checkpointing.setdefault("keep_best", 3)
+    # 1 / (1 + validation loss) barely moves, so AP drives selection.
     checkpointing.setdefault(
-        "weights", {"val_loss_quality": 0.34, "val_map": 0.33, "val_recall": 0.33}
+        "weights", {"val_loss_quality": 0.0, "val_map": 0.8, "val_recall": 0.2}
     )
     if (
         not isinstance(checkpointing["keep_best"], int)
@@ -436,8 +546,10 @@ def load_config(path):
         )
     if not isinstance(adaptive["ablations"], list) or not set(
         adaptive["ablations"]
-    ) <= {"random", "energy"}:
-        raise ValueError("adaptive_fusion.ablations supports random and energy")
+    ) <= {"random", "energy", "confidence"}:
+        raise ValueError(
+            "adaptive_fusion.ablations supports random, energy, and confidence"
+        )
     latency = cfg.setdefault("latency_experiment", {})
     latency.setdefault("frame_period_ms", 100.0)
     latency.setdefault("profile_batch_size", 1)
@@ -478,4 +590,114 @@ def load_config(path):
             n["processing_ms"][p][s] < 0 for s in e["strategies"]
         ):
             raise ValueError("Latency cannot be negative")
+    validate_comparison(e, d["classes"])
+    validate_deadline_experiment(cfg)
     return cfg
+
+
+def validate_comparison(e, classes):
+    """Optional metric matching a published protocol (merged classes, BEV IoU)."""
+    comparison = e.setdefault("comparison", None)
+    if comparison is None:
+        return
+    comparison.setdefault("iou_type", "bev")
+    comparison.setdefault("iou_threshold", 0.5)
+    groups = comparison.get("groups")
+    members = [label for values in (groups or {}).values() for label in values]
+    if (
+        comparison["iou_type"] not in ("bev", "3d")
+        or not 0 < comparison["iou_threshold"] <= 1
+        or not isinstance(groups, dict)
+        or not groups
+        or any(not isinstance(values, list) or not values for values in groups.values())
+        or len(members) != len(set(members))
+        or not set(members) <= set(classes)
+    ):
+        raise ValueError(
+            "evaluation.comparison needs iou_type bev or 3d, an IoU in (0, 1], and "
+            "groups mapping names to disjoint lists of configured classes"
+        )
+
+
+def validate_deadline_experiment(cfg):
+    """Settings for deadline-constrained cooperative detection on 10 Hz sequences."""
+    x = cfg.setdefault("deadline_experiment", {"enabled": False})
+    x.setdefault("enabled", False)
+    if not x["enabled"]:
+        return
+    defaults = {
+        "frames_per_slice": 200,
+        "slices_per_session": 1,
+        "deadlines_ms": [200.0, 250.0],
+        "target_miss_rate": 0.05,
+        "tradeoffs": [0.5, 2.0, 10.0],
+        "max_miss_probability": 0.5,
+        "max_age_frames": 3,
+        "estimator_alpha": 0.2,
+        "controllers": ["fixed", "dense", "greedy", "drive", "oracle", "early", "late"],
+        "traces": [
+            {
+                "name": "gilbert_elliott",
+                "type": "gilbert_elliott",
+                "good_mbps": 40.0,
+                "bad_mbps": 5.0,
+                "p_good_to_bad": 0.05,
+                "p_bad_to_good": 0.25,
+                "jitter": 0.2,
+            }
+        ],
+    }
+    for key, value in defaults.items():
+        x.setdefault(key, value)
+    known = {"fixed", "dense", "greedy", "drive", "oracle", "early", "late"}
+    n = cfg["deployment_assumptions"]
+    window = (
+        n["sensing_ms"]
+        + n["edge_rtt_ms"] / 2
+        + n["processing_ms"]["edge"].get("adaptive", 0.0)
+    )
+    if (
+        any(
+            not isinstance(x[key], int) or isinstance(x[key], bool) or x[key] < 1
+            for key in ("frames_per_slice", "slices_per_session", "max_age_frames")
+        )
+        or not x["deadlines_ms"]
+        or any(value <= window for value in x["deadlines_ms"])
+        or not 0 < x["target_miss_rate"] < 1
+        or not 0 < x["max_miss_probability"] <= 1
+        or not x["tradeoffs"]
+        or any(not value > 0 for value in x["tradeoffs"])
+        or not 0 < x["estimator_alpha"] <= 1
+        or not x["controllers"]
+        or not set(x["controllers"]) <= known
+        or not x["traces"]
+    ):
+        raise ValueError(
+            "Invalid deadline_experiment: positive frame and age limits, deadlines "
+            f"above sensing + RTT/2 + receiver processing ({window:g} ms), "
+            f"target_miss_rate in (0, 1), and controllers from {sorted(known)}"
+        )
+    names = set()
+    for trace in x["traces"]:
+        kind = trace.get("type")
+        name = trace.get("name")
+        if not name or name in names:
+            raise ValueError("deadline_experiment traces need unique names")
+        names.add(name)
+        if kind == "constant":
+            valid = trace.get("mbps", 0) > 0
+        elif kind == "gilbert_elliott":
+            valid = (
+                trace.get("good_mbps", 0) > 0
+                and trace.get("bad_mbps", 0) > 0
+                and 0 < trace.get("p_good_to_bad", 0) < 1
+                and 0 < trace.get("p_bad_to_good", 0) < 1
+                and trace.setdefault("jitter", 0.0) >= 0
+            )
+        elif kind == "csv":
+            trace["path"] = str(resolve(trace.get("path", "")))
+            valid = Path(trace["path"]).suffix == ".csv"
+        else:
+            valid = False
+        if not valid:
+            raise ValueError(f"Invalid deadline_experiment trace: {trace}")

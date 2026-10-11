@@ -3,6 +3,7 @@ import csv
 import json
 import math
 import os
+import random
 import subprocess
 import sys
 import weakref
@@ -26,9 +27,11 @@ from src.data.coinfra import (
 )
 from src.data.loader import BoundingBox3D
 from src.data.visibility import box_point_counts
-from src.detection.bev import REGRESSION_CHANNELS, BEVDetector, decode, loss, targets
+from src.data.coinfra import bev_channels
+from src.detection.bev import REGRESSION_CHANNELS, DRIVEDetector, decode, loss, targets
 from src.metrics.evaluation import (
     evaluate,
+    group_frames,
     f1_optimal_thresholds,
     iou3d,
     paired_iou3d,
@@ -38,6 +41,18 @@ from src.network.control import (
     past_frame,
     select_deadline_budget,
 )
+from src.network.deadline import (
+    ConstantTrace,
+    DRIVEController,
+    FixedController,
+    GilbertElliottTrace,
+    Link,
+    OracleController,
+    Option,
+    OutcomeLog,
+    make_trace,
+    sparse_bytes,
+)
 from src.pipeline import (
     audit_split_isolation,
     choose_groups,
@@ -46,6 +61,7 @@ from src.pipeline import (
     network_rows,
     prune_checkpoints,
     report,
+    run_deadline_evaluation,
     run_evaluation,
     simulate_fifo_latency,
     train,
@@ -137,6 +153,7 @@ def fixture_config(tmp_path):
         bounds=[-8, -8, -2, 8, 8, 4],
         resolution=1,
         frame_stride=1,
+        train_frame_stride=1,
         classes=["car", "pedestrian"],
         # Fixture intensities are standard-normal draws.
         intensity_max=3.0,
@@ -146,6 +163,11 @@ def fixture_config(tmp_path):
             "test": ["2025_01_03_rainy"],
         },
     )
+    cfg["evaluation"]["comparison"] = {
+        "iou_type": "bev",
+        "iou_threshold": 0.5,
+        "groups": {"LV": ["car"], "VRU": ["pedestrian"]},
+    }
     cfg["output"]["root"] = str(tmp_path / "output")
     cfg["training"].update(
         seeds=[1],
@@ -160,7 +182,9 @@ def fixture_config(tmp_path):
         },
         device="cpu",
         require_cuda=False,
-        hidden_channels=4,
+        node_channels=4,
+        backbone_channels=8,
+        backbone_blocks=[1, 1, 1],
         node_counts=[1, 2],
     )
     cfg["evaluation"].update(
@@ -227,7 +251,11 @@ def test_calibration_composition_and_nan_filter(fixture_config):
     assert len(cloud) == int(mask.sum())
     assert np.isfinite(cloud).all()
     np.testing.assert_allclose(cloud[:, :3], xyz[mask], atol=1e-6)
-    assert rasterize(cloud, fixture_config["dataset"]).shape == (4, 16, 16)
+    assert rasterize(cloud, fixture_config["dataset"]).shape == (
+        bev_channels(fixture_config["dataset"]),
+        16,
+        16,
+    )
     assert calibration(node["calibration"])[0, 3] == 1
 
 
@@ -505,14 +533,24 @@ def test_center_collision_over_slot_capacity_is_explicit(fixture_config):
     assert "delta=(0.000000, 0.000000)" in message
 
 
-def test_batched_detector_and_class_balanced_loss_are_finite(fixture_config):
-    torch.manual_seed(7)
-    model = BEVDetector(
-        fixture_config["dataset"]["classes"],
-        4,
-        fixture_config["dataset"]["objects_per_cell"],
+def small_model(cfg, fusion="attention", channels=4):
+    d = cfg["dataset"]
+    return DRIVEDetector(
+        d["classes"],
+        bev_channels(d),
+        d["objects_per_cell"],
+        node_channels=channels,
+        backbone_channels=2 * channels,
+        fusion=fusion,
+        backbone_blocks=(1, 1, 1),
     )
-    bev = torch.randn(2, 4, 16, 16)
+
+
+def test_batched_detector_and_loss_are_finite(fixture_config):
+    torch.manual_seed(7)
+    model = small_model(fixture_config)
+    channels = bev_channels(fixture_config["dataset"])
+    bev = torch.randn(2, channels, 16, 16)
     boxes = [
         [BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")],
         [BoundingBox3D(-1, 1, 0, 1, 1, 2, 0, "pedestrian")],
@@ -538,11 +576,26 @@ def test_batched_detector_and_class_balanced_loss_are_finite(fixture_config):
         for gradient in detector_gradients
     )
 
-    per_node = torch.randn(2, 2, 4, 16, 16)
+    # Per-cell normalization: a sample's output does not depend on the rest
+    # of its batch, so OOM batch splitting cannot change predictions.
+    per_node = torch.randn(2, 2, channels, 16, 16)
     batched = model(per_node, "intermediate")
-    separate = [model(per_node[i], "intermediate") for i in range(2)]
+    separate = [model(per_node[i : i + 1], "intermediate") for i in range(2)]
     torch.testing.assert_close(batched[0], torch.cat([value[0] for value in separate]))
     torch.testing.assert_close(batched[1], torch.cat([value[1] for value in separate]))
+
+
+def test_loss_is_normalized_by_all_positives(fixture_config):
+    classes = len(fixture_config["dataset"]["classes"])
+    slots = fixture_config["dataset"]["objects_per_cell"]
+    target = targets(
+        [BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")], fixture_config["dataset"], (8, 8)
+    )
+    logits = torch.full((1, classes * slots, 8, 8), -2.19)
+    regression = torch.zeros((1, REGRESSION_CHANNELS * classes * slots, 8, 8))
+    # A class absent from the batch must not be divided by one positive and
+    # dominate: the initial loss stays of order one on a whole grid.
+    assert float(loss((logits, regression), target)) < 10
 
 
 def test_loss_returns_nonfinite_before_geometry_for_nan_box(
@@ -565,21 +618,26 @@ def test_loss_returns_nonfinite_before_geometry_for_nan_box(
     assert not torch.isfinite(value)
 
 
-def test_encoder_receptive_field_spans_typical_car(fixture_config):
-    model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
-    # Longer than a bus at the 0.4 m CoInfra resolution.
-    assert model.receptive_field_cells * 0.4 >= 15.0
-    assert (model.encoder(torch.randn(2, 4, 16, 16)) >= 0).all()
-    logits, regression = model(torch.zeros(1, 4, 16, 16))
+def test_detector_context_spans_a_bus(fixture_config):
+    torch.manual_seed(4)
+    model = small_model(fixture_config).eval()
+    channels = bev_channels(fixture_config["dataset"])
+    logits, regression = model(torch.zeros(1, channels, 16, 16))
     assert logits.shape[-2:] == (8, 8)
     assert regression.shape[-2:] == (8, 8)
+    bev = torch.zeros(1, channels, 128, 128, requires_grad=True)
+    model(bev)[0][0, :, 32, 32].sum().backward()
+    columns = bev.grad.abs().sum(dim=(0, 1, 2)).nonzero().flatten()
+    # More than 15 m of input context at the 0.4 m CoInfra resolution.
+    assert (columns.max() - columns.min() + 1) * 0.4 >= 15.0
 
 
 def test_detector_can_memorize_one_example(fixture_config):
     torch.manual_seed(3)
-    model = BEVDetector(fixture_config["dataset"]["classes"], 8, 2)
-    bev = torch.zeros(1, 4, 16, 16)
-    bev[0, :, 7:10, 8:11] = torch.tensor([1.0, 0.6, 0.2, 0.4])[:, None, None]
+    model = small_model(fixture_config, channels=8)
+    channels = bev_channels(fixture_config["dataset"])
+    bev = torch.zeros(1, channels, 16, 16)
+    bev[0, :4, 7:10, 8:11] = torch.tensor([1.0, 0.6, 0.2, 0.4])[:, None, None]
     box = BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")
     target = tuple(
         torch.from_numpy(value)[None]
@@ -598,64 +656,82 @@ def test_detector_can_memorize_one_example(fixture_config):
     assert final < initial * 0.1
 
 
-def test_adaptive_fusion_obeys_spatial_budget(fixture_config):
+def node_features(model, nodes=3, size=20, batch=2):
+    channels = bev_channels_of(model)
+    return model.encode(torch.rand(batch, nodes, channels, size, size))
+
+
+def bev_channels_of(model):
+    return model.encoder.stem[0].in_channels
+
+
+def test_adaptive_selection_obeys_spatial_budget(fixture_config):
     torch.manual_seed(11)
-    model = BEVDetector(
-        fixture_config["dataset"]["classes"],
-        4,
-        fixture_config["dataset"]["objects_per_cell"],
-    )
-    features = torch.rand(2, 3, 4, 10, 10)
-    fused_small, selected_small = model.adaptive_features(features, 0.05)
-    fused_large, selected_large = model.adaptive_features(features, 0.25)
-    assert fused_small.shape == (2, 4, 10, 10)
-    assert selected_small.shape == (2, 2, 10, 10)
-    assert selected_small.sum(dim=(-1, -2)).unique().tolist() == [5]
-    assert selected_large.sum(dim=(-1, -2)).unique().tolist() == [25]
-    assert torch.all(fused_small >= features[:, 0])
-    assert torch.all(fused_large >= features[:, 0])
+    model = small_model(fixture_config)
+    features, density = node_features(model)
+    for budget, cells in ((0.05, 5), (0.25, 25)):
+        available, _ = model.select(features, density, budget)
+        assert available.shape == (2, 3, 10, 10)
+        assert available[:, 0].all()
+        assert available[:, 1:].sum(dim=(-1, -2)).unique().tolist() == [cells]
 
 
-def test_ablation_selectors_change_only_selected_cells(fixture_config):
-    torch.manual_seed(21)
-    model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
-    # Signed features: unsent cells must not act like a zero message.
-    features = torch.randn(2, 3, 4, 10, 10)
-    energy_fused, energy_mask = model.adaptive_features(features, 0.1, "energy")
-    torch.manual_seed(22)
-    random_fused, random_mask = model.adaptive_features(features, 0.1, "random")
-    assert not torch.equal(random_mask[0, 0], random_mask[0, 1])
-    assert not torch.equal(random_mask[0], random_mask[1])
-    for fused, mask in ((energy_fused, energy_mask), (random_fused, random_mask)):
-        sent = features[:, 1:].masked_fill(~mask[:, :, None], -float("inf"))
-        expected = torch.maximum(features[:, 0], sent.amax(dim=1))
-        torch.testing.assert_close(fused, expected)
-
-
-def test_adaptive_fusion_leaves_unsent_receiver_cells_unchanged(fixture_config):
+@pytest.mark.parametrize("fusion", ["attention", "mean", "max"])
+def test_unsent_cells_cannot_change_the_fused_map(fixture_config, fusion):
     torch.manual_seed(5)
-    model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
-    features = torch.randn(1, 3, 4, 12, 12) - 1.0
-    for selector in ("learned", "energy", "random"):
-        fused, mask = model.adaptive_features(features, 0.05, selector)
-        unsent = ~mask[0].any(dim=0)
-        assert unsent.any()
-        torch.testing.assert_close(fused[0][:, unsent], features[0, 0][:, unsent])
+    model = small_model(fixture_config, fusion).eval()
+    features, density = node_features(model, batch=1)
+    for selector in ("learned", "energy", "random", "confidence"):
+        torch.manual_seed(6)
+        available, _ = model.select(features, density, 0.05, selector)
+        fused = model.fuse(features, density, available)
+        hidden = ~available[:, :, None]
+        altered = features.masked_fill(hidden, 1e3)
+        altered_density = density.masked_fill(hidden, 50.0)
+        torch.testing.assert_close(
+            model.fuse(altered, altered_density, available), fused
+        )
 
 
-def test_full_budget_adaptive_equals_dense_max_fusion(fixture_config):
-    model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
-    features = torch.randn(2, 3, 4, 6, 6)
-    fused, _ = model.adaptive_features(features, 1.0, "energy")
-    torch.testing.assert_close(fused, features.amax(dim=1))
+def test_full_budget_adaptive_equals_dense_intermediate(fixture_config):
+    model = small_model(fixture_config).eval()
+    features, density = node_features(model)
+    available, _ = model.select(features, density, 1.0, "energy")
+    assert available.all()
+    torch.testing.assert_close(
+        model.fuse(features, density, available), model.fuse(features, density)
+    )
+
+
+def test_one_node_fusion_is_the_node_itself(fixture_config):
+    for fusion in ("mean", "max"):
+        model = small_model(fixture_config, fusion).eval()
+        features, density = node_features(model, nodes=1)
+        torch.testing.assert_close(model.fuse(features, density), features[:, 0])
+
+
+def test_attention_fusion_weighs_message_age(fixture_config):
+    torch.manual_seed(8)
+    model = small_model(fixture_config).eval()
+    features, density = node_features(model)
+    fresh = model.fuse(features, density, ages=torch.zeros(2, 3))
+    stale = model.fuse(features, density, ages=torch.tensor([[0.0, 0.6, 0.0]] * 2))
+    assert not torch.allclose(fresh, stale)
+    for fusion in ("mean", "max"):
+        rule = small_model(fixture_config, fusion).eval()
+        features, density = node_features(rule)
+        torch.testing.assert_close(
+            rule.fuse(features, density, ages=torch.zeros(2, 3)),
+            rule.fuse(features, density, ages=torch.ones(2, 3)),
+        )
 
 
 def test_learned_selector_receives_gradient_through_sent_cells(fixture_config):
     torch.manual_seed(9)
-    model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
-    features = torch.randn(1, 2, 4, 8, 8)
-    fused, _ = model.adaptive_features(features, 0.25, "learned")
-    fused.sum().backward()
+    model = small_model(fixture_config)
+    channels = bev_channels(fixture_config["dataset"])
+    logits, regression = model(torch.rand(1, 2, channels, 16, 16), "adaptive@0.25")
+    (logits.sum() + regression.sum()).backward()
     gradients = [p.grad for p in model.utility.parameters()]
     assert all(g is not None and torch.isfinite(g).all() for g in gradients)
     assert any(g.abs().sum() > 0 for g in gradients)
@@ -663,38 +739,29 @@ def test_learned_selector_receives_gradient_through_sent_cells(fixture_config):
 
 def test_adaptive_payload_grows_with_budget(fixture_config):
     torch.manual_seed(12)
-    model = BEVDetector(
-        fixture_config["dataset"]["classes"],
-        4,
-        fixture_config["dataset"]["objects_per_cell"],
-    )
-    features = torch.rand(1, 3, 4, 16, 16)
-    _, small = model.adaptive_features(features, 0.01)
-    _, large = model.adaptive_features(features, 0.25)
-    small_bytes = pipeline_module.adaptive_payload(
-        features[0], small[0], fixture_config
-    )
-    large_bytes = pipeline_module.adaptive_payload(
-        features[0], large[0], fixture_config
-    )
-    assert 0 < small_bytes < large_bytes
+    model = small_model(fixture_config)
+    features, density = node_features(model, size=32, batch=1)
+    messages = torch.cat((features, density), dim=2)[0]
+    sizes = []
+    for budget in (0.01, 0.25):
+        available, _ = model.select(features, density, budget)
+        sizes.append(
+            pipeline_module.adaptive_payload(messages, available[0, 1:], fixture_config)
+        )
+    assert 0 < sizes[0] < sizes[1]
 
 
 def test_random_selector_is_independent_of_global_rng_history(fixture_config):
-    model = BEVDetector(
-        fixture_config["dataset"]["classes"],
-        4,
-        fixture_config["dataset"]["objects_per_cell"],
-    )
-    features = torch.rand(1, 3, 4, 8, 8)
+    model = small_model(fixture_config)
+    features, density = node_features(model, batch=1)
     first_generator = torch.Generator().manual_seed(123)
-    _, first = model.adaptive_features(
-        features, 0.1, "random", generators=[first_generator]
+    first, _ = model.select(
+        features, density, 0.1, "random", generators=[first_generator]
     )
     torch.rand(1000)
     second_generator = torch.Generator().manual_seed(123)
-    _, second = model.adaptive_features(
-        features, 0.1, "random", generators=[second_generator]
+    second, _ = model.select(
+        features, density, 0.1, "random", generators=[second_generator]
     )
     assert torch.equal(first, second)
 
@@ -801,26 +868,19 @@ def test_cooperation_gain_uses_only_participating_single_nodes(fixture_config):
 
 
 def test_validation_rejects_empty_split(fixture_config):
-    model = BEVDetector(
-        fixture_config["dataset"]["classes"],
-        4,
-        fixture_config["dataset"]["objects_per_cell"],
-    )
+    model = small_model(fixture_config)
     with pytest.raises(ValueError, match="Validation split contains no samples"):
         validation_metrics(model, [], fixture_config, torch.device("cpu"))
 
 
 def test_validation_oom_splits_only_current_batch(monkeypatch, fixture_config):
-    model = BEVDetector(
-        fixture_config["dataset"]["classes"],
-        4,
-        fixture_config["dataset"]["objects_per_cell"],
-    )
+    model = small_model(fixture_config)
     gt = [BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")]
     examples = []
     for _ in range(2):
-        early = np.zeros((4, 16, 16), np.float32)
-        per_node = np.zeros((2, 4, 16, 16), np.float32)
+        channels = bev_channels(fixture_config["dataset"])
+        early = np.zeros((channels, 16, 16), np.float32)
+        per_node = np.zeros((2, channels, 16, 16), np.float32)
         target = targets(gt, fixture_config["dataset"], (8, 8))
         examples.append((early, per_node, (gt, []), target, 1, (gt, []), target))
     original = pipeline_module.device_tensor
@@ -842,9 +902,12 @@ def test_validation_oom_splits_only_current_batch(monkeypatch, fixture_config):
 
 
 def test_optimizer_step_oom_resets_scaler_before_retry(monkeypatch, fixture_config):
-    model = BEVDetector(fixture_config["dataset"]["classes"], 4, 2)
+    model = small_model(fixture_config)
     target = targets([], fixture_config["dataset"], (8, 8))
-    examples = [(np.zeros((4, 16, 16), np.float32), target)]
+    channels = bev_channels(fixture_config["dataset"])
+    examples = [
+        (np.zeros((channels, 16, 16), np.float32), target, np.zeros(1, np.float32))
+    ]
 
     class Optimizer:
         def zero_grad(self, set_to_none=True):
@@ -917,7 +980,7 @@ def test_nonfinite_amp_loss_retries_batch_in_fp32(monkeypatch, fixture_config, c
             super().__init__()
             self.weight = torch.nn.Parameter(torch.tensor(1.0))
 
-        def forward(self, bev, mode):
+        def forward(self, bev, mode, ages=None):
             value = self.weight * (float("inf") if active.enabled else 1.0)
             return value[None], value[None]
 
@@ -939,6 +1002,7 @@ def test_nonfinite_amp_loss_retries_batch_in_fp32(monkeypatch, fixture_config, c
     examples = {
         "bev": np.zeros((1, 1), np.float32),
         "target": tuple(np.zeros((1, 1), np.float32) for _ in range(3)),
+        "ages": np.zeros((1, 1), np.float32),
     }
     fixture_config["training"]["mixed_precision"] = True
     monkeypatch.setattr(torch, "autocast", Autocast)
@@ -986,7 +1050,7 @@ def test_fp32_retry_releases_amp_graph_first(monkeypatch, fixture_config):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.tensor(1.0))
 
-        def forward(self, bev, mode):
+        def forward(self, bev, mode, ages=None):
             if not active.enabled:
                 # Holding the fp16 graph through the fp32 pass doubles peak memory.
                 assert all(reference() is None for reference in amp_tensors)
@@ -1029,6 +1093,7 @@ def test_fp32_retry_releases_amp_graph_first(monkeypatch, fixture_config):
         {
             "bev": np.zeros((1, 1), np.float32),
             "target": tuple(np.zeros((1, 1), np.float32) for _ in range(3)),
+            "ages": np.zeros((1, 1), np.float32),
         },
         "intermediate",
         fixture_config,
@@ -1055,7 +1120,7 @@ def test_training_oom_split_releases_failed_batch(monkeypatch, fixture_config):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.tensor(1.0))
 
-        def forward(self, bev, mode):
+        def forward(self, bev, mode, ages=None):
             if len(bev) > 1:
                 raise torch.OutOfMemoryError("out of memory")
             # Parent frames must not keep the failed batch alive on the GPU.
@@ -1091,6 +1156,7 @@ def test_training_oom_split_releases_failed_batch(monkeypatch, fixture_config):
         {
             "bev": np.ones((4, 1), np.float32),
             "target": tuple(np.zeros((4, 1), np.float32) for _ in range(3)),
+            "ages": np.zeros((4, 1), np.float32),
         },
         "early",
         fixture_config,
@@ -1104,15 +1170,12 @@ def test_training_oom_split_releases_failed_batch(monkeypatch, fixture_config):
 
 
 def test_validation_oom_split_releases_failed_batch(monkeypatch, fixture_config):
-    model = BEVDetector(
-        fixture_config["dataset"]["classes"],
-        4,
-        fixture_config["dataset"]["objects_per_cell"],
-    )
+    model = small_model(fixture_config)
     gt = [BoundingBox3D(1, 0, 0, 4, 2, 2, 0, "car")]
     target = targets(gt, fixture_config["dataset"], (8, 8))
-    early = np.zeros((4, 16, 16), np.float32)
-    per_node = np.zeros((2, 4, 16, 16), np.float32)
+    channels = bev_channels(fixture_config["dataset"])
+    early = np.zeros((channels, 16, 16), np.float32)
+    per_node = np.zeros((2, channels, 16, 16), np.float32)
     examples = [(early, per_node, (gt, []), target, 1, (gt, []), target)] * 2
     original = pipeline_module.device_tensor
     failed = []
@@ -1185,12 +1248,41 @@ def test_end_to_end_train_all_fusions_report(fixture_config):
     assert class_inventory["train"]["pedestrian"] == 0
     train(fixture_config)
     rows = run_evaluation(fixture_config)
+    deadline_rows = run_deadline_evaluation(fixture_config)
     report(fixture_config)
     verification = verify_results(fixture_config)
     assert verification["status"] == "passed"
+    deadline = fixture_config["deadline_experiment"]
+    assert {row["controller"] for row in deadline_rows} == {
+        *(
+            f"fixed@{b:g}"
+            for b in fixture_config["adaptive_fusion"]["evaluation_budgets"]
+        ),
+        *(f"drive@{v:g}" for v in deadline["tradeoffs"]),
+        "greedy",
+        "oracle",
+        "dense",
+        "early",
+        "late",
+    }
+    assert len(deadline_rows) == len(
+        {row["controller"] for row in deadline_rows}
+    ) * len(deadline["traces"]) * len(deadline["deadlines_ms"])
+    for row in deadline_rows:
+        fractions = row["fresh_fraction"] + row["stale_fraction"] + row["none_fraction"]
+        assert fractions == pytest.approx(1.0)
+        assert 0 <= row["miss_rate_frames"] <= 1
+    report_text = (Path(fixture_config["output"]["root"]) / "report.md").read_text()
+    assert "## Deadline-constrained cooperation" in report_text
+    assert "## Comparison with the CoInfra benchmark metric" in report_text
     expected_adaptive = {
         f"{name}@{budget}"
-        for name in ("adaptive", "adaptive_random", "adaptive_energy")
+        for name in (
+            "adaptive",
+            "adaptive_random",
+            "adaptive_energy",
+            "adaptive_confidence",
+        )
         for budget in ("0.01", "0.05", "0.1", "0.25")
     }
     assert {r["strategy"] for r in rows} == {
@@ -1509,8 +1601,9 @@ def test_augmented_collision_falls_back_to_original_labels(monkeypatch, fixture_
         "early",
         ["4"],
         {"flip_x": False, "flip_y": False, "rotation": 0.0, "scale": 1.0},
+        {},
     )
-    _, (_, _, mask) = pipeline_module.prepare_training_example(plan, fixture_config)
+    _, (_, _, mask), _ = pipeline_module.prepare_training_example(plan, fixture_config)
     assert mask.sum() == 1
 
 
@@ -1574,7 +1667,7 @@ def test_nms_matches_reference_greedy_algorithm():
 def test_intensity_channel_and_scale_guard(fixture_config):
     d = fixture_config["dataset"] | {"intensity_max": 255.0, "use_intensity": True}
     points = np.array([[0.5, 0.5, 0.0, 510.0], [0.5, 0.5, 0.0, 51.0]], np.float32)
-    assert rasterize(points, d)[4].max() == pytest.approx(0.6)
+    assert rasterize(points, d)[4 + d["height_slices"]].max() == pytest.approx(0.6)
     pipeline_module.validate_intensity_scale([np.linspace(0, 250, 100)], d)
     with pytest.raises(ValueError, match="intensity_max"):
         pipeline_module.validate_intensity_scale([np.linspace(0, 1, 100)], d)
@@ -1619,7 +1712,7 @@ def test_rasterize_height_channels_without_intensity(fixture_config):
         np.float32,
     )
     bev = rasterize(points, d)
-    assert bev.shape[0] == bev_channels(d) == 4
+    assert bev.shape[0] == bev_channels(d) == 4 + d["height_slices"]
     cell = (8, 8)
     assert bev[0][cell] == pytest.approx(math.log1p(3))
     assert bev[1][cell] == pytest.approx(1.0, abs=1e-3)
@@ -1692,11 +1785,11 @@ def test_training_targets_skip_boxes_without_points(fixture_config):
             }
         )
     )
-    plan = (sample, "early", ["4", "9"], None)
-    _, (_, _, mask) = pipeline_module.prepare_training_example(plan, fixture_config)
+    plan = (sample, "early", ["4", "9"], None, {})
+    _, (_, _, mask), _ = pipeline_module.prepare_training_example(plan, fixture_config)
     assert mask.sum() == 1
     fixture_config["training"]["min_target_points"] = 0
-    _, (_, _, mask) = pipeline_module.prepare_training_example(plan, fixture_config)
+    _, (_, _, mask), _ = pipeline_module.prepare_training_example(plan, fixture_config)
     assert mask.sum() == 2
 
 
@@ -1824,3 +1917,249 @@ def test_mixed_node_pilot_trains_longer_on_more_subsets_and_seeds():
     assert cfg["evaluation"]["subsets_per_count"] == 5
     assert cfg["dataset"]["use_intensity"] is False
     assert cfg["evaluation"]["save_detections"] is True
+
+
+def simulate_controller(controller, trace, frames, horizon_ms, rtt_ms=5.0):
+    """Late messages per frame and mean utility on a synthetic uplink."""
+    budgets = (0.01, 0.05, 0.1, 0.25)
+    cells, channels = 62_500, 65
+    link, estimator, log = (
+        Link(trace, rtt_ms),
+        PastOnlyLinkEstimator(10.0, 0.5),
+        OutcomeLog(),
+    )
+    late = utility = 0.0
+    for t in range(frames):
+        ready = 100.0 * t
+        if t:
+            estimator.observe_rate(t - 1, trace.bandwidth(t - 1))
+        for *_, missed in log.release(ready):
+            controller.outcome(True, missed)
+        controller.frame()
+        queue = link.queue_ms(ready)
+        options = [Option(0.0, 0, 0.0)] + [
+            Option(b, sparse_bytes(cells, b, channels, 4, 2), 1 - math.exp(-30 * b))
+            for b in budgets
+        ]
+        choice = controller.choose(
+            options,
+            {
+                "estimator": estimator,
+                "window_ms": horizon_ms - rtt_ms / 2 - queue,
+                "horizon_ms": horizon_ms,
+                "fixed_ms": rtt_ms / 2,
+                "queue_ms": queue,
+                "frame": t,
+                "cells": cells,
+                "channels": channels,
+                "index_bytes": 4,
+                "value_bytes": 2,
+                "true_mbps": trace.bandwidth(t),
+            },
+        )
+        if choice.budget > 0:
+            arrival, duration = link.send(t, ready, choice.message_bytes)
+            missed = arrival > ready + horizon_ms
+            log.record(link.busy_until_ms, t, choice.message_bytes, duration, missed)
+            late += missed
+            utility += choice.utility
+    return late / frames, utility / frames
+
+
+def test_drive_controller_holds_the_late_message_target():
+    trace = lambda: GilbertElliottTrace(40, 5, 0.05, 0.25, 0.2, seed=3)
+    late, utility = simulate_controller(DRIVEController(0.5, 0.05), trace(), 6000, 97.5)
+    fixed_late, _ = simulate_controller(FixedController(0.01), trace(), 6000, 97.5)
+    oracle_late, oracle_utility = simulate_controller(
+        OracleController(), trace(), 6000, 97.5
+    )
+    assert late <= 0.06 < fixed_late
+    assert oracle_late == 0
+    assert 0 < utility <= oracle_utility
+
+
+def test_drive_chance_constraint_prevents_cold_start_flooding():
+    controller = DRIVEController(10.0, 0.05, max_miss_probability=0.5)
+    estimator = PastOnlyLinkEstimator(5.0, 0.5)
+    huge = Option(0.25, 2_000_000, 1.0)
+    choice = controller.choose(
+        [Option(0.0, 0, 0.0), huge], {"estimator": estimator, "window_ms": 95.0}
+    )
+    # An empty virtual queue must not justify a message that is almost surely late.
+    assert choice.budget == 0.0
+
+
+def test_outcomes_reach_the_sender_only_after_transmission_completes():
+    log = OutcomeLog()
+    log.record(250.0, 0, 1000, 150.0, True)
+    assert log.release(200.0) == []
+    assert log.release(250.0) == [(0, 1000, 150.0, True)]
+
+
+def test_link_queues_messages_fifo():
+    link = Link(ConstantTrace(8.0), rtt_ms=10.0)
+    arrival, duration = link.send(0, 0.0, 100_000)
+    assert duration == pytest.approx(100.0)
+    assert arrival == pytest.approx(105.0)
+    assert link.queue_ms(50.0) == pytest.approx(50.0)
+    arrival, _ = link.send(1, 50.0, 100_000)
+    assert arrival == pytest.approx(205.0)
+
+
+def test_estimator_capacity_reports_are_past_only():
+    estimator = PastOnlyLinkEstimator(10.0, 0.5)
+    estimator.observe_rate(3, 40.0)
+    with pytest.raises(ValueError, match="strict time order"):
+        estimator.observe_rate(3, 40.0)
+    assert estimator.miss_probability(0, 50) == 0.0
+    assert estimator.miss_probability(10_000, 0) == 1.0
+    assert estimator.miss_probability(10_000, 100) < estimator.miss_probability(
+        1_000_000, 100
+    )
+
+
+def test_csv_trace_reads_measured_throughput(tmp_path):
+    path = tmp_path / "trace.csv"
+    path.write_text("time_s,mbps\n0.0,10\n0.15,30\n")
+    trace = make_trace({"type": "csv", "path": str(path)}, seed=0, period_ms=100)
+    assert [trace.bandwidth(frame) for frame in range(3)] == [10.0, 10.0, 30.0]
+
+
+def test_repeat_factors_favor_frames_with_rare_classes(fixture_config):
+    samples = [s for s in discover(fixture_config) if s["split"] == "train"]
+    for index, sample in enumerate(samples):
+        labels = ["car"] + (["pedestrian"] if index == 0 else [])
+        Path(sample["gt"]).write_text(
+            yaml.safe_dump(
+                {
+                    "objects": [
+                        {
+                            "class": label,
+                            "position": [0, 0, 0],
+                            "dimensions": [1, 1, 1],
+                            "heading": 0.0,
+                        }
+                        for label in labels
+                    ]
+                }
+            )
+        )
+    fixture_config["training"]["repeat_factor_threshold"] = 0.5
+    factors = pipeline_module.repeat_factors(fixture_config, samples)
+    rare = factors[samples[0]["id"]]
+    assert rare == pytest.approx(math.sqrt(0.5 / (1 / len(samples))))
+    assert all(factors[sample["id"]] == 1.0 for sample in samples[1:])
+    first = pipeline_module.repeated_order(samples, factors, random.Random(4))
+    second = pipeline_module.repeated_order(samples, factors, random.Random(4))
+    assert [s["id"] for s in first] == [s["id"] for s in second]
+    assert len(first) >= len(samples) + 1
+
+
+def test_repeat_factors_disabled_draw_no_random_numbers(fixture_config):
+    samples = [s for s in discover(fixture_config) if s["split"] == "train"]
+    factors = pipeline_module.repeat_factors(
+        fixture_config
+        | {"training": fixture_config["training"] | {"repeat_factor_threshold": 0.0}},
+        samples,
+    )
+    rng = random.Random(9)
+    state = rng.getstate()
+    assert pipeline_module.repeated_order(samples, factors, rng) == samples
+    assert rng.getstate() == state
+
+
+def test_stale_collaborators_come_from_earlier_frames_of_the_same_slice(
+    fixture_config,
+):
+    fixture_config["training"]["stale"] = {"probability": 1.0, "max_age_frames": 1}
+    fixture_config["training"]["modes"] = ["intermediate"]
+    fixture_config["training"]["node_counts"] = [2]
+    samples = [s for s in discover(fixture_config) if s["split"] == "train"]
+    histories = pipeline_module.slice_histories(samples)
+    plans = [
+        plan
+        for batch in pipeline_module.training_plan(
+            samples, fixture_config, random.Random(1), 8, histories
+        )
+        for plan in batch
+    ]
+    later = [plan for plan in plans if plan[0]["timestamp"] == "100.1"]
+    assert later and all(plan[4] for plan in later)
+    for sample, mode, nodes, _, sources in plans:
+        assert nodes[0] not in sources
+        for node, earlier in sources.items():
+            assert (earlier["session"], earlier["slice"]) == (
+                sample["session"],
+                sample["slice"],
+            )
+            assert float(earlier["timestamp"]) < float(sample["timestamp"])
+    bev, _, ages = pipeline_module.prepare_training_example(later[0], fixture_config)
+    assert ages[0] == 0.0
+    assert ages[1] == pytest.approx(0.1)
+    assert bev.shape[0] == 2
+
+
+def test_random_frame_split_is_deterministic_and_shares_sessions(fixture_config):
+    d = fixture_config["dataset"]
+    sessions = [session for values in d["splits"].values() for session in values]
+    d["split_mode"] = "random_frames"
+    d["splits"] = {"train": sessions, "val": [], "test": []}
+    d["random_split"] = {"fractions": [0.5, 0.25, 0.25], "seed": 7}
+    first = discover(fixture_config)
+    second = discover(fixture_config)
+    assert [s["split"] for s in first] == [s["split"] for s in second]
+    assert {s["split"] for s in first} == {"train", "val", "test"}
+    shared = defaultdict(set)
+    for sample in first:
+        shared[sample["session"]].add(sample["split"])
+    assert any(len(splits) > 1 for splits in shared.values())
+    audit = audit_split_isolation(first, "random_frames")
+    assert "frame-level random split" in audit["status"]
+    with pytest.raises(ValueError, match="Data leakage"):
+        audit_split_isolation(first)
+
+
+def test_random_frame_split_config_rules(fixture_config, tmp_path, monkeypatch):
+    monkeypatch.delenv("COINFRA_ROOT", raising=False)
+    d = fixture_config["dataset"]
+    d["split_mode"] = "random_frames"
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(fixture_config))
+    with pytest.raises(ValueError, match="random_frames lists every pooled session"):
+        load_config(path)
+    d["splits"] = {"train": ["2025_01_01_sunny"], "val": [], "test": []}
+    d["train_frame_stride"] = 2
+    path.write_text(yaml.safe_dump(fixture_config))
+    with pytest.raises(ValueError, match="train_frame_stride must equal"):
+        load_config(path)
+
+
+def test_legacy_hidden_channels_key_is_rejected(fixture_config, tmp_path, monkeypatch):
+    monkeypatch.delenv("COINFRA_ROOT", raising=False)
+    fixture_config["training"]["hidden_channels"] = 32
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(fixture_config))
+    with pytest.raises(ValueError, match="node_channels"):
+        load_config(path)
+
+
+def test_bev_iou_ignores_height_and_groups_merge_duplicate_classes():
+    car = BoundingBox3D(0, 0, 0, 4, 2, 2, 0, "car")
+    raised = BoundingBox3D(0, 0, 1.5, 4, 2, 2, 0, "car", 0.9)
+    frames = [([raised], [car])]
+    assert evaluate(frames, ["car"], [0.5])[0]["ap_3d"] == 0.0
+    assert evaluate(frames, ["car"], [0.5], iou_type="bev")[0]["ap_3d"] == 1.0
+    truck = BoundingBox3D(0, 0, 0, 4, 2, 2, 0, "truck")
+    duplicates = [
+        (
+            [
+                BoundingBox3D(0, 0, 0, 4, 2, 2, 0, "car", 0.9),
+                BoundingBox3D(0, 0, 0, 4, 2, 2, 0, "truck", 0.8),
+            ],
+            [truck],
+        )
+    ]
+    grouped = group_frames(duplicates, {"LV": ["car", "truck"]}, 0.2, 100)
+    assert [box.label for box in grouped[0][0]] == ["LV"]
+    row = evaluate(grouped, ["LV"], [0.5], iou_type="bev")[0]
+    assert row["ap_3d"] == 1.0 and row["false_positives"] == 0

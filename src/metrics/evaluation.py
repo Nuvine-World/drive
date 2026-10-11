@@ -1,4 +1,6 @@
-"""Rotated 3D IoU, class-wise NMS and dataset-level all-points AP."""
+"""Rotated 3D/BEV IoU, class-wise NMS and dataset-level all-points AP."""
+
+import dataclasses
 import math
 from collections import defaultdict
 import numpy as np
@@ -23,8 +25,9 @@ def _footprints(values):
     return shapely.polygons(np.stack((x, y), axis=-1))
 
 
-def _pair_iou(a, b, footprints_a, footprints_b, rows, columns):
-    """Rotated 3D IoU for the index pairs ``(rows[k], columns[k])``."""
+def _pair_iou(a, b, footprints_a, footprints_b, rows, columns, bev=False):
+    """Rotated 3D IoU (or BEV IoU of the footprints, ignoring height) for the
+    index pairs ``(rows[k], columns[k])``."""
     result = np.zeros(len(rows))
     if not len(rows):
         return result
@@ -37,30 +40,35 @@ def _pair_iou(a, b, footprints_a, footprints_b, rows, columns):
         np.minimum(a[rows, 2] + a[rows, 5] / 2, b[columns, 2] + b[columns, 5] / 2)
         - np.maximum(a[rows, 2] - a[rows, 5] / 2, b[columns, 2] - b[columns, 5] / 2),
     )
-    touching = (distance <= radius_a + radius_b) & (z > 0)
+    touching = (distance <= radius_a + radius_b) & ((z > 0) | bev)
     if not touching.any():
         return result
     rows, columns = rows[touching], columns[touching]
     area = shapely.area(shapely.intersection(footprints_a[rows], footprints_b[columns]))
-    intersection = area * z[touching]
-    union = (
-        a[rows, 3] * a[rows, 4] * a[rows, 5]
-        + b[columns, 3] * b[columns, 4] * b[columns, 5]
-        - intersection
-    )
+    if bev:
+        intersection = area
+        union = a[rows, 3] * a[rows, 4] + b[columns, 3] * b[columns, 4] - area
+    else:
+        intersection = area * z[touching]
+        union = (
+            a[rows, 3] * a[rows, 4] * a[rows, 5]
+            + b[columns, 3] * b[columns, 4] * b[columns, 5]
+            - intersection
+        )
     result[touching] = np.divide(
         intersection, union, out=np.zeros_like(union), where=union > 0
     )
     return result
 
 
-def iou3d_matrix(boxes_a, boxes_b):
-    """Pairwise rotated 3D IoU; only pairs whose footprints can touch use shapely."""
+def iou3d_matrix(boxes_a, boxes_b, bev=False):
+    """Pairwise rotated 3D (or BEV) IoU; only pairs whose footprints can touch
+    use shapely."""
     a, b = _box_array(boxes_a), _box_array(boxes_b)
     if not len(a) or not len(b):
         return np.zeros((len(a), len(b)))
     rows, columns = np.indices((len(a), len(b))).reshape(2, -1)
-    values = _pair_iou(a, b, _footprints(a), _footprints(b), rows, columns)
+    values = _pair_iou(a, b, _footprints(a), _footprints(b), rows, columns, bev)
     return values.reshape(len(a), len(b))
 
 
@@ -122,7 +130,7 @@ def _operating_threshold(operating_score_threshold, label):
     return operating_score_threshold
 
 
-def _class_candidates(frames, label):
+def _class_candidates(frames, label, bev=False):
     """Ranked predictions of one class and their overlaps with its truths.
 
     A frame is ``(predictions, truths)`` or ``(predictions, truths, ignored)``;
@@ -149,9 +157,9 @@ def _class_candidates(frames, label):
     overlaps, ignored_overlaps = {}, {}
     for frame_index, ranks in ranks_by_frame.items():
         boxes = [predictions[rank][2] for rank in ranks]
-        overlaps.update(zip(ranks, iou3d_matrix(boxes, truths[frame_index])))
+        overlaps.update(zip(ranks, iou3d_matrix(boxes, truths[frame_index], bev)))
         if ignored[frame_index]:
-            best = iou3d_matrix(boxes, ignored[frame_index]).max(axis=1)
+            best = iou3d_matrix(boxes, ignored[frame_index], bev).max(axis=1)
             ignored_overlaps.update(zip(ranks, best.tolist()))
     return truths, ignored, predictions, overlaps, ignored_overlaps
 
@@ -192,6 +200,7 @@ def evaluate(
     operating_score_threshold=None,
     class_thresholds=None,
     records=None,
+    iou_type="3d",
 ):
     """Dataset-level detection metrics; never average per-frame AP.
 
@@ -209,14 +218,17 @@ def evaluate(
     only an ignored truth are dropped from AP and from the operating counts.
     When ``records`` is a list, it receives the outcome of every
     operating-point prediction and every truth at the first IoU level.
+    ``iou_type`` is ``3d`` (rotated boxes) or ``bev`` (rotated footprints).
     """
+    if iou_type not in ("3d", "bev"):
+        raise ValueError("iou_type must be 3d or bev")
     class_thresholds = class_thresholds or {}
     results = []
     for label in classes:
         levels = class_thresholds.get(label, thresholds)
         operating_threshold = _operating_threshold(operating_score_threshold, label)
         truths, ignored, predictions, overlaps, ignored_overlaps = _class_candidates(
-            frames, label
+            frames, label, iou_type == "bev"
         )
         count = sum(map(len, truths))
         for level, threshold in enumerate(levels):
@@ -358,6 +370,28 @@ def evaluate(
                 }
             )
     return results
+
+
+def group_frames(frames, groups, nms_iou, limit):
+    """Relabel frames to merged categories, such as LV = car + truck.
+
+    A detector that separates car and truck can report one vehicle under
+    both, so each group's predictions pass a class-agnostic NMS first.
+    Boxes of classes outside every group are dropped.
+    """
+    mapping = {label: name for name, labels in groups.items() for label in labels}
+
+    def relabel(boxes):
+        return [
+            dataclasses.replace(box, label=mapping[box.label])
+            for box in boxes
+            if box.label in mapping
+        ]
+
+    return [
+        (nms(relabel(frame[0]), nms_iou, limit), *(relabel(part) for part in frame[1:]))
+        for frame in frames
+    ]
 
 
 def f1_optimal_thresholds(

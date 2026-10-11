@@ -1,4 +1,11 @@
-"""Compact two-scale BEV center detector used by all fusion strategies."""
+"""DRIVE cooperative BEV detector: one network for every fusion strategy.
+
+A shared encoder turns each node's BEV into the feature map that node would
+transmit. The receiver fuses whatever node features it holds (dense, sparse,
+or stale) cell by cell, then a shared multi-scale backbone and CenterPoint
+heads detect every class. Early fusion and single-node detection are the
+one-node case of the same network, and late fusion runs it once per node.
+"""
 
 import math
 import numpy as np
@@ -12,157 +19,275 @@ from src.metrics.evaluation import nms, paired_iou3d
 # Per slot: x/y offset, z, log length/width/height, sin/cos yaw, IoU logit.
 BOX_CHANNELS = 8
 REGRESSION_CHANNELS = BOX_CHANNELS + 1
+FUSIONS = ("attention", "mean", "max")
+SELECTORS = ("learned", "random", "energy", "confidence")
 
 
 class TargetCollisionError(ValueError):
     """More same-class centers share one output cell than there are slots."""
 
 
-class SeparableResidual(nn.Module):
-    """Large-context residual block with inexpensive depthwise convolution."""
+class LayerNorm2d(nn.Module):
+    """LayerNorm over the channels of each BEV cell.
 
-    def __init__(self, channels, dilation):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(
-                channels,
-                channels,
-                3,
-                padding=dilation,
-                dilation=dilation,
-                groups=channels,
-                bias=False,
-            ),
-            nn.GroupNorm(1, channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(channels, channels, 1, bias=False),
-            nn.GroupNorm(1, channels),
-        )
-        self.activation = nn.SiLU(inplace=True)
-
-    def forward(self, value):
-        return self.activation(value + self.block(value))
-
-
-class ResidualBlock(nn.Module):
-    """Dense residual block for the coarse, large-context stage."""
-
-    def __init__(self, channels, dilation):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(
-                channels, channels, 3, padding=dilation, dilation=dilation, bias=False
-            ),
-            nn.GroupNorm(1, channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(
-                channels, channels, 3, padding=dilation, dilation=dilation, bias=False
-            ),
-            nn.GroupNorm(1, channels),
-        )
-        self.activation = nn.SiLU(inplace=True)
-
-    def forward(self, value):
-        return self.activation(value + self.block(value))
-
-
-class BEVEncoder(nn.Module):
-    """Two-scale encoder whose output is the transmitted stride-2 feature map.
-
-    A cheap stride-2 path keeps small-object detail; a dense stride-4 path with
-    twice the channels adds capacity and a receptive field longer than a bus.
-    The ReLU output makes zero mean "no evidence", which is the natural
-    identity for max fusion and keeps empty space compressible.
+    It uses no spatial statistics, so a cell's features do not depend on how
+    much of the map is empty, on the batch size after an OOM split, or on how
+    many nodes were fused. GroupNorm over a mostly empty BEV map amplifies the
+    few occupied cells by an amount that changes with sparsity.
     """
 
-    def __init__(self, hidden, in_channels=4):
+    def __init__(self, channels, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(channels))
+        self.bias = nn.Parameter(torch.zeros(channels))
+        self.eps = eps
+
+    def forward(self, value):
+        normalized = F.layer_norm(
+            value.permute(0, 2, 3, 1),
+            (value.shape[1],),
+            self.weight,
+            self.bias,
+            self.eps,
+        )
+        # Autocast computes layer_norm in fp32; keep activations in the AMP dtype.
+        return normalized.permute(0, 3, 1, 2).to(value.dtype)
+
+
+class ConvNeXtBlock(nn.Module):
+    """Large-kernel depthwise residual block with per-cell normalization."""
+
+    def __init__(self, channels, expansion=4, kernel=7):
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            channels, channels, kernel, padding=kernel // 2, groups=channels
+        )
+        self.norm = LayerNorm2d(channels)
+        self.expand = nn.Conv2d(channels, expansion * channels, 1)
+        self.project = nn.Conv2d(expansion * channels, channels, 1)
+        # A small residual scale starts each block near identity (layer scale).
+        self.scale = nn.Parameter(torch.full((channels, 1, 1), 0.1))
+
+    def forward(self, value):
+        branch = self.project(F.gelu(self.expand(self.norm(self.depthwise(value)))))
+        return value + self.scale.to(branch.dtype) * branch
+
+
+def downsample(in_channels, out_channels):
+    return nn.Sequential(
+        LayerNorm2d(in_channels), nn.Conv2d(in_channels, out_channels, 2, stride=2)
+    )
+
+
+def detection_head(channels, outputs, bias=None):
+    layers = nn.Sequential(
+        nn.Conv2d(channels, channels, 3, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(channels, outputs, 1),
+    )
+    if bias is not None:
+        nn.init.constant_(layers[-1].bias, bias)
+    return layers
+
+
+class NodeEncoder(nn.Module):
+    """Shared per-node encoder; its stride-2 output is what a node transmits."""
+
+    def __init__(self, in_channels, channels, blocks):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, hidden, 3, stride=2, padding=1, bias=False),
-            nn.GroupNorm(1, hidden),
-            nn.SiLU(inplace=True),
+            nn.Conv2d(in_channels, channels, 3, stride=2, padding=1),
+            LayerNorm2d(channels),
+            nn.GELU(),
         )
-        self.fine = nn.Sequential(
-            SeparableResidual(hidden, dilation=1),
-            SeparableResidual(hidden, dilation=2),
-        )
-        self.down = nn.Sequential(
-            nn.Conv2d(hidden, 2 * hidden, 3, stride=2, padding=1, bias=False),
-            nn.GroupNorm(1, 2 * hidden),
-            nn.SiLU(inplace=True),
-        )
-        self.coarse = nn.Sequential(
-            ResidualBlock(2 * hidden, dilation=1),
-            ResidualBlock(2 * hidden, dilation=2),
-            ResidualBlock(2 * hidden, dilation=4),
-        )
-        self.lateral = nn.Conv2d(2 * hidden, hidden, 1, bias=False)
-        self.fuse = nn.Sequential(
-            nn.Conv2d(hidden, hidden, 3, padding=1, bias=False),
-            nn.GroupNorm(1, hidden),
-            nn.ReLU(inplace=True),
+        self.blocks = nn.Sequential(
+            *(ConvNeXtBlock(channels, expansion=2) for _ in range(blocks))
         )
 
     def forward(self, bev):
-        fine = self.fine(self.stem(bev))
-        coarse = self.lateral(self.coarse(self.down(fine)))
-        coarse = F.interpolate(
-            coarse, size=fine.shape[-2:], mode="bilinear", align_corners=False
+        return self.blocks(self.stem(bev))
+
+
+class NodeFusion(nn.Module):
+    """Per-cell fusion of the node features available to the receiver.
+
+    ``attention`` weighs every available node by a learned score of its
+    features, its own point density, and the age of its message, then merges
+    that weighted average with the per-cell maximum. ``mean`` (the CoInfra
+    baseline) and ``max`` (F-Cooper) are fixed-rule ablations.
+    """
+
+    def __init__(self, channels, mode="attention"):
+        super().__init__()
+        if mode not in FUSIONS:
+            raise ValueError(f"fusion must be one of {FUSIONS}")
+        self.mode = mode
+        if mode == "attention":
+            self.score = nn.Sequential(
+                nn.Conv2d(channels + 2, channels // 2, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(channels // 2, 1, 1),
+            )
+            self.merge = nn.Conv2d(2 * channels, channels, 1)
+
+    def forward(self, features, density, available, ages):
+        """Fuse ``features`` [B, N, C, h, w] into [B, C, h, w].
+
+        ``available`` [B, N, h, w] marks the cells the receiver holds for each
+        node; node 0 is the receiver and is always available. ``density`` is
+        each node's log point density [B, N, 1, h, w] and ``ages`` [B, N] the
+        age of each node's message in seconds.
+        """
+        batch, nodes, _, height, width = features.shape
+        mask = available[:, :, None]
+        # The receiver never holds unsent cells; zero them so no convolution
+        # below can read across the mask.
+        features = features.masked_fill(~mask, 0)
+        lowest = torch.finfo(features.dtype).min
+        maximum = features.masked_fill(~mask, lowest).amax(dim=1)
+        if self.mode == "max":
+            return maximum
+        if self.mode == "mean":
+            count = mask.sum(dim=1).clamp(min=1).to(features.dtype)
+            return (features * mask).sum(dim=1) / count
+        age = ages.to(features.dtype)[:, :, None, None, None]
+        cues = torch.cat(
+            (
+                features,
+                density.to(features.dtype).masked_fill(~mask, 0),
+                age.expand(batch, nodes, 1, height, width),
+            ),
+            dim=2,
         )
-        return self.fuse(fine + coarse)
+        logits = self.score(cues.flatten(0, 1)).reshape(batch, nodes, 1, height, width)
+        logits = logits.float().masked_fill(~mask, float("-inf"))
+        weights = torch.softmax(logits, dim=1).to(features.dtype)
+        average = (weights * features).sum(dim=1)
+        return self.merge(torch.cat((average, maximum), dim=1))
 
 
-class BEVDetector(nn.Module):
+class Backbone(nn.Module):
+    """Three-scale backbone over the fused map with top-down (FPN) merging."""
+
+    def __init__(self, in_channels, channels, blocks=(2, 2, 2)):
+        super().__init__()
+        widths = (channels, 2 * channels, 2 * channels)
+        self.entry = nn.Conv2d(in_channels, widths[0], 1)
+        self.stages = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+        for index, (width, count) in enumerate(zip(widths, blocks)):
+            if index:
+                self.downsamples.append(downsample(widths[index - 1], width))
+            self.stages.append(
+                nn.Sequential(*(ConvNeXtBlock(width) for _ in range(count)))
+            )
+        self.laterals = nn.ModuleList(nn.Conv2d(width, channels, 1) for width in widths)
+        self.output = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            LayerNorm2d(channels),
+            nn.GELU(),
+        )
+
+    def forward(self, fused):
+        scales = []
+        value = self.entry(fused)
+        for index, stage in enumerate(self.stages):
+            if index:
+                value = self.downsamples[index - 1](value)
+            value = stage(value)
+            scales.append(value)
+        merged = self.laterals[-1](scales[-1])
+        for scale, lateral in zip(scales[-2::-1], list(self.laterals)[-2::-1]):
+            merged = lateral(scale) + F.interpolate(
+                merged, size=scale.shape[-2:], mode="bilinear", align_corners=False
+            )
+        return self.output(merged)
+
+
+class DRIVEDetector(nn.Module):
     def __init__(
-        self, classes, hidden, objects_per_cell=1, output_stride=2, in_channels=4
+        self,
+        classes,
+        in_channels,
+        objects_per_cell=1,
+        node_channels=64,
+        backbone_channels=128,
+        fusion="attention",
+        node_blocks=1,
+        backbone_blocks=(2, 2, 2),
+        output_stride=2,
     ):
         super().__init__()
+        if output_stride != 2:
+            raise ValueError("DRIVEDetector currently supports output_stride=2")
         self.classes = classes
         self.objects_per_cell = objects_per_cell
-        if output_stride != 2:
-            raise ValueError("BEVDetector currently supports output_stride=2")
         self.output_stride = output_stride
-        self.encoder = BEVEncoder(hidden, in_channels)
-        # Through the stride-4 path: 135 input cells (54 m at 0.4 m/cell).
-        self.receptive_field_cells = 135
         slots = len(classes) * objects_per_cell
-        self.heatmap = nn.Conv2d(hidden, slots, 1)
+        self.encoder = NodeEncoder(in_channels, node_channels, node_blocks)
+        # Learned, content-dependent value of each collaborator cell for
+        # budget-limited sparse transmission.
+        self.utility = nn.Sequential(
+            nn.Conv2d(node_channels, node_channels, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(node_channels, 1, 1),
+        )
+        self.fusion = NodeFusion(node_channels, fusion)
+        self.backbone = Backbone(node_channels, backbone_channels, backbone_blocks)
+        self.heatmap = detection_head(backbone_channels, slots, bias=-2.19)
         # The last channel of each slot predicts the 3D IoU of its own box and
         # rescales the detection score, so well-localized boxes rank first.
-        self.regression = nn.Conv2d(hidden, REGRESSION_CHANNELS * slots, 1)
-        # A learned, content-dependent utility map used by budget-conditioned
-        # sparse fusion. One score is produced for every node and BEV cell.
-        self.utility = nn.Sequential(
-            nn.Conv2d(hidden, hidden, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(hidden, 1, 1),
+        self.regression = detection_head(backbone_channels, REGRESSION_CHANNELS * slots)
+
+    def encode(self, bev):
+        """Node features [B, N, C, h, w] and log point density [B, N, 1, h, w]
+        for a [B, N, C_in, H, W] stack of per-node BEVs."""
+        batch, nodes = bev.shape[:2]
+        flat = bev.flatten(0, 1)
+        features = self.encoder(flat)
+        # BEV channel 0 is log(1 + point count); pool it onto the feature grid.
+        density = F.avg_pool2d(flat[:, :1], 2, ceil_mode=True)
+        return (
+            features.reshape(batch, nodes, *features.shape[1:]),
+            density.reshape(batch, nodes, *density.shape[1:]),
         )
-        nn.init.constant_(self.heatmap.bias, -2.19)
 
-    def heads(self, features):
-        return self.heatmap(features), self.regression(features)
+    def fuse(self, features, density, available=None, ages=None):
+        batch, nodes, _, height, width = features.shape
+        if available is None:
+            available = torch.ones(
+                batch, nodes, height, width, dtype=torch.bool, device=features.device
+            )
+        if ages is None:
+            ages = torch.zeros(batch, nodes, device=features.device)
+        return self.fusion(features, density, available, ages)
 
-    def adaptive_features(self, features, budget, selector="learned", generators=None):
-        """Fuse a dense reference with top-utility collaborator cells.
+    def detect(self, fused):
+        value = self.backbone(fused)
+        return self.heatmap(value), self.regression(value)
 
-        The first node is the reference observation. Each additional node may
-        transmit only ``budget`` of its spatial cells. Feature values remain
-        differentiable; the discrete top-k decision is intentionally explicit
-        so evaluation has a deterministic byte budget.
+    def select(self, features, density, budget, selector="learned", generators=None):
+        """Cells each collaborator transmits under ``budget``.
+
+        Node 0 is the receiver and keeps its dense map; every other node sends
+        exactly ``ceil(budget * cells)`` cells. Returns the availability mask
+        [B, N, h, w] and, for the learned selector, a straight-through gate
+        [B, N-1, h, w] whose forward value is 1 on sent cells while every
+        utility score still receives a gradient.
         """
         if not 0 < budget <= 1:
             raise ValueError("adaptive budget must be in (0, 1]")
-        if features.ndim != 5:
-            raise ValueError("adaptive fusion expects [batch, nodes, channels, H, W]")
+        if selector not in SELECTORS:
+            raise ValueError(f"unknown adaptive selector: {selector}")
         batch, nodes, channels, height, width = features.shape
+        receiver = torch.ones(
+            batch, 1, height, width, dtype=torch.bool, device=features.device
+        )
         if nodes == 1:
-            empty = torch.zeros(
-                batch, 0, height, width, dtype=torch.bool, device=features.device
-            )
-            return features[:, 0], empty
+            return receiver, None
         collaborators = features[:, 1:]
         if selector == "learned":
-            flat = collaborators.reshape(batch * (nodes - 1), channels, height, width)
+            flat = collaborators.flatten(0, 1)
             scores = self.utility(flat).reshape(batch, nodes - 1, height * width)
         elif selector == "energy":
             scores = (
@@ -171,71 +296,67 @@ class BEVDetector(nn.Module):
                 .mean(dim=2)
                 .reshape(batch, nodes - 1, height * width)
             )
-        elif selector == "random":
-            if generators is None:
-                scores = torch.rand(
-                    batch, nodes - 1, height * width, device=features.device
+        elif selector == "confidence":
+            # Where2comm-style: each collaborator ranks its cells by the
+            # confidence of its own single-node detections.
+            own = self.detect(
+                self.fuse(
+                    collaborators.flatten(0, 1)[:, None],
+                    density[:, 1:].flatten(0, 1)[:, None],
                 )
-            else:
-                if len(generators) != batch:
-                    raise ValueError("one random generator is required per batch item")
-                scores = torch.stack(
-                    [
-                        torch.rand(
-                            nodes - 1,
-                            height * width,
-                            device=features.device,
-                            generator=generator,
-                        )
-                        for generator in generators
-                    ]
-                )
+            )[0]
+            scores = own.float().amax(dim=1).reshape(batch, nodes - 1, height * width)
+        elif generators is None:
+            scores = torch.rand(
+                batch, nodes - 1, height * width, device=features.device
+            )
         else:
-            raise ValueError(f"unknown adaptive selector: {selector}")
+            if len(generators) != batch:
+                raise ValueError("one random generator is required per batch item")
+            scores = torch.stack(
+                [
+                    torch.rand(
+                        nodes - 1,
+                        height * width,
+                        device=features.device,
+                        generator=generator,
+                    )
+                    for generator in generators
+                ]
+            )
         count = max(1, min(height * width, math.ceil(budget * height * width)))
         selected = scores.topk(count, dim=-1).indices
-        hard_mask = torch.zeros_like(scores)
-        hard_mask.scatter_(-1, selected, 1.0)
-        # Straight-through relaxation: forward communication is exactly top-k,
-        # while every utility score receives a useful training gradient.
-        # Only the proposed learned selector needs the surrogate gradient.
+        hard = torch.zeros_like(scores)
+        hard.scatter_(-1, selected, 1.0)
+        mask = hard.bool().reshape(batch, nodes - 1, height, width)
+        gate = None
         if selector == "learned":
-            soft_mask = scores.sigmoid()
-            gate = hard_mask + soft_mask - soft_mask.detach()
-        else:
-            gate = hard_mask
-        mask = hard_mask.bool().reshape(batch, nodes - 1, height, width)
-        # Selection methods differ only in which cells they choose. All three
-        # transmit and fuse the same unscaled encoder features.
-        sparse = collaborators * gate.reshape(batch, nodes - 1, 1, height, width)
-        # Unsent cells must not take part in max fusion. Filling them with the
-        # lowest finite value (not zero) leaves the receiver's features exactly
-        # unchanged there, whatever the encoder's output range.
-        sparse = sparse.masked_fill(~mask[:, :, None], torch.finfo(sparse.dtype).min)
-        fused = torch.maximum(features[:, 0], sparse.amax(dim=1))
-        return fused, mask
+            soft = scores.sigmoid()
+            gate = (hard + soft - soft.detach()).reshape(
+                batch, nodes - 1, height, width
+            )
+        return torch.cat((receiver, mask), dim=1), gate
 
-    def forward(self, bev, mode="early"):
-        base_mode, _, budget_text = mode.partition("@")
-        if base_mode in {"intermediate", "adaptive"} and bev.ndim == 5:
-            batch, nodes, channels, height, width = bev.shape
-            features = self.encoder(bev.reshape(batch * nodes, channels, height, width))
-            features = features.reshape(batch, nodes, *features.shape[1:])
-            if base_mode == "adaptive":
-                budget = float(budget_text) if budget_text else 0.1
-                features, _ = self.adaptive_features(features, budget)
-            else:
-                features = features.amax(dim=1)
-        else:
-            features = self.encoder(bev)
-            if base_mode == "intermediate":
-                features = features.amax(dim=0, keepdim=True)
-            elif base_mode == "adaptive":
-                if features.ndim != 4:
-                    raise ValueError("unexpected adaptive feature shape")
-                budget = float(budget_text) if budget_text else 0.1
-                features, _ = self.adaptive_features(features[None], budget)
-        return self.heads(features)
+    def forward(self, bev, mode="early", ages=None):
+        """Detect from a [B, N, C_in, H, W] (or one-node [B, C_in, H, W]) BEV.
+
+        ``mode`` is ``early``, ``intermediate``, or ``adaptive@budget``.
+        Early and single-node inputs are one node, so all modes share every
+        weight; only what reaches the fusion differs.
+        """
+        if bev.ndim == 4:
+            bev = bev[:, None]
+        base, _, budget_text = mode.partition("@")
+        features, density = self.encode(bev)
+        available = None
+        if base == "adaptive" and features.shape[1] > 1:
+            available, gate = self.select(
+                features, density, float(budget_text) if budget_text else 0.1
+            )
+            features = torch.cat(
+                (features[:, :1], features[:, 1:] * gate[:, :, None]), dim=1
+            )
+        return self.detect(self.fuse(features, density, available, ages))
 
 
 def _grid_resolution(cfg, shape):
@@ -370,10 +491,13 @@ def regression_boxes(values, cell_size):
 
 
 def loss(outputs, target, cell_size=(1.0, 1.0)):
-    """Class-balanced focal heatmap loss, L1 box regression, and IoU quality.
+    """Focal heatmap loss, L1 box regression, and IoU quality.
 
-    ``cell_size`` is the prediction-grid cell in metres along x and y; it
-    converts offset errors to metres for the IoU-quality target.
+    The focal loss is normalized by the number of positives in the batch, as
+    in CenterNet and CenterPoint; class imbalance is handled by repeat-factor
+    sampling of training frames instead. ``cell_size`` is the prediction-grid
+    cell in metres along x and y; it converts offset errors to metres for the
+    IoU-quality target.
     """
     logits, regression = outputs
     heat, reg, mask = [torch.as_tensor(v, device=logits.device) for v in target]
@@ -388,21 +512,11 @@ def loss(outputs, target, cell_size=(1.0, 1.0)):
     positive = heat.eq(1)
     negative = heat.lt(1)
     negative_weight = (1 - heat).pow(4)
-    # Normalize across the batch per class so abundant cars cannot drown out
-    # the rarer truck, bus, bicycle, and pedestrian positives.
-    axes = (0, 2, 3, 4)
-    positive_loss = ((1 - p).pow(2) * F.logsigmoid(x) * positive).sum(dim=axes)
-    negative_loss = (p.pow(2) * F.logsigmoid(-x) * negative_weight * negative).sum(
-        dim=axes
-    )
-    positive_count = positive.sum(dim=axes)
-    focal_by_class = -(positive_loss + negative_loss) / positive_count.clamp(min=1)
-    focal_weights = torch.where(
-        positive_count > 0,
-        torch.ones_like(focal_by_class),
-        torch.full_like(focal_by_class, 0.05),
-    )
-    focal = (focal_by_class * focal_weights).sum() / focal_weights.sum()
+    # A per-class normalization divides a class absent from the batch by one,
+    # so its negatives over the whole grid would dominate the loss.
+    positive_loss = ((1 - p).pow(2) * F.logsigmoid(x) * positive).sum()
+    negative_loss = (p.pow(2) * F.logsigmoid(-x) * negative_weight * negative).sum()
+    focal = -(positive_loss + negative_loss) / positive.sum().clamp(min=1)
     prediction = regression.float().reshape(
         batch, classes, slots, REGRESSION_CHANNELS, height, width
     )

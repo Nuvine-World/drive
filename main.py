@@ -9,8 +9,18 @@ import traceback
 
 from src.config import PROJECT, enable_overfit, enable_smoke, load_config
 
-
-STAGES = ('check', 'prepare', 'inspect', 'preprocess', 'train', 'evaluate', 'report', 'verify', 'all')
+STAGES = (
+    "check",
+    "prepare",
+    "inspect",
+    "preprocess",
+    "train",
+    "evaluate",
+    "deadline",
+    "report",
+    "verify",
+    "all",
+)
 
 
 def check_runtime(cfg):
@@ -82,7 +92,15 @@ def run_pipeline(args, cfg):
         if args.stage == 'prepare':
             return
 
-    from src.pipeline import inspect, preprocess, report, run_evaluation, train, verify_results
+    from src.pipeline import (
+        inspect,
+        preprocess,
+        report,
+        run_deadline_evaluation,
+        run_evaluation,
+        train,
+        verify_results,
+    )
 
     if args.stage in ('inspect', 'all'):
         inspect(cfg)
@@ -92,6 +110,8 @@ def run_pipeline(args, cfg):
         train(cfg, args.overwrite)
     if args.stage in ('evaluate', 'all'):
         run_evaluation(cfg)
+    if args.stage in ("deadline", "all"):
+        run_deadline_evaluation(cfg)
     if args.stage in ('report', 'all'):
         report(cfg)
     if args.stage in ('verify', 'all'):
