@@ -1,6 +1,6 @@
-# ECCO on Adver-City and CoInfra
+# DRIVE
 
-ECCO evaluates cooperative LiDAR perception with Adver-City or CoInfra-I2I.
+DRIVE evaluates cooperative LiDAR perception with Adver-City or CoInfra-I2I.
 With no explicit configuration, `run.sh` executes CoInfra followed by Adver-City.
 Passing either dataset configuration runs only that dataset.
 
@@ -214,139 +214,99 @@ COINFRA_ROOT/
       GroundTruth/1742850299.2/global_roi.yaml
 ```
 
-Each cloud is transformed from its node frame to the shared global frame,
-cropped to one fixed region, and rasterized as log point density and the
-maximum, minimum, and mean height per cell, plus mean intensity when
-`dataset.use_intensity` is true. Ground-truth boxes use the same region. Missing calibration,
-labels, frames, or excessive timestamp mismatch stops the run.
+Both `slice0` and `slice_0` names are accepted. Calibration requires 4×4 matrices
+`lidar_to_ground` and `ground_to_global`; their product maps each cloud to global
+coordinates. Calibration is loaded per slice, never borrowed from another one.
+Point arrays must be numeric Nx3 or Nx4+; column 4 is treated as intensity.
+Nonfinite XYZ returns are discarded, nonfinite intensity is set to zero.
 
-## Model and fusion
+Annotations accept an object list or `objects`/`annotations`/`data` containing one.
+Each object must provide class, position, dimensions (full L/W/H), and yaw.
+Known field aliases follow the publisher baseline. Yaw units are explicit; zero
+yaw is valid. Unknown labels, missing GT/calibration, duplicate nodes, excessive
+timestamp offsets, and malformed arrays fail loudly. Global ROI labels are never
+silently substituted with a different annotation set. GT and predictions are
+scored in the same configured global region for every node subset.
 
-The included model is a compact trainable BEV center detector, not a reproduction
-of the publisher's detector. It predicts car, truck, bus, bicycle, and pedestrian.
-Its encoder combines a stride-2 path with a dense stride-4 path (receptive field
-about 54 m at 0.4 m cells) and ends in a ReLU, so the transmitted stride-2
-feature map uses zero for "no evidence". Training applies the same random
-flips, rotation (±22.5°), and scaling (0.95–1.05) to every node's points and to
-the labels; `training.augmentation` configures it, and `--overfit` disables it.
-A labeled box is a training target only when the sampled nodes return at least
-`training.min_target_points` points inside it, so the detector is not taught to
-predict objects it cannot see. Box regression uses an L1 loss, and each slot
-also predicts the 3D IoU of its own box; detection scores are
-`heat^(1-a) * IoU^a` with `a = evaluation.iou_score_weight`.
+The bounds come from the publisher baseline; `inspect` reports in-bounds point
+and box counts on the first selected frame of each slice. Review `inspection.json`
+before committing to training. Actual release schema and heading units still need
+verification on your downloaded files. No real archive has been inspected here.
 
-- **Early fusion:** combine globally aligned points before rasterization.
-- **Intermediate fusion:** encode each RSU BEV and max-fuse its feature map.
-- **Late fusion:** detect per RSU and merge boxes with class-wise rotated 3D NMS.
-- **Adaptive fusion:** retain one dense reference node and transmit only the
-  highest-utility spatial cells from collaborator feature maps. A learned
-  utility head is trained end-to-end with a straight-through top-k mask. One
-  model is trained across several budgets and evaluated at 1%, 5%, 10%, and
-  25% collaborator-cell budgets. Cells that are not sent do not take part in
-  max fusion, so the reference features are unchanged wherever nothing
-  arrives.
+## Model and experiments
 
-The same byte-budget sweep includes deterministic random-cell and feature-energy
-selectors. These are ablations of the learned utility head, not separately
-trained models, and appear as `adaptive_random@...` and `adaptive_energy@...`
-in result files.
+The included model is a small **trainable BEV center detector**, not PointPillars
+or a reproduction of the CoInfra paper. It predicts class confidence, center,
+dimensions and yaw from LiDAR density, maximum height and mean intensity rasters.
+Batch size is one frame; node dropout samples real subsets during training.
+Training mixes early, intermediate and single-node passes. Validation uses fixed
+all-node early fusion loss, so checkpoint selection favors the early-fusion task.
 
-For adaptive fusion, the first node in the deterministic subset is the fusion
-reference and therefore does not contribute to the transmitted collaborator
-payload. Sparse messages contain flattened cell indices and feature vectors
-serialized as configured integer and floating-point widths, then compressed
-with zlib level 1. This reference-node assumption must be stated in papers and
-should be tested with a reference-rotation ablation before a final submission.
+- Early: merge global point clouds, then rasterize and detect.
+- Intermediate: encode each global BEV with shared weights, max-fuse features,
+  then decode detections.
+- Late: detect independently at each node, then apply class-wise rotated 3D NMS.
 
-All strategies use the same weights and evaluation frames. Every single common
-RSU is evaluated; larger node combinations are sampled deterministically
-(`evaluation.subsets_per_count` per count). Every subset is scored on two
-ground-truth scopes (`gt_scope`): `full` keeps the fixed global ground truth for
-every subset (system coverage), and `visible` scores only boxes with at least
-`evaluation.min_visible_points` points from the subset's own nodes and ignores
-the rest (predictions on ignored boxes are neither true nor false positives).
-The difference separates fusion quality from added coverage. With one node,
-every strategy reduces to the same detector, so it runs once and its result is
-reported under each strategy label.
+No detector reads ground truth during inference. Global labels supervise training
+and score evaluation only. Single-node models are scored against the same global
+ROI, including objects they cannot see, making the task a coverage-sensitive test.
+Dense centers colliding in a class/grid cell cause an explicit error; reduce the
+grid resolution if this occurs. The model is intentionally a modest baseline;
+its performance must be established experimentally before scientific claims.
 
-## Outputs
+The default splits are recording-session-disjoint: sunny March for training,
+sunny November 18 for validation, sunny November 20 and adverse sessions for test.
+This is **clear-to-adverse generalization**, not training on all weather. Rain and
+freezing rain have one listed date each, so the config does not split adjacent
+slices from those dates across training and test. Multiple weather sessions can
+be assigned to training if you define a different valid experiment.
 
-The configured output directory contains:
+Evaluation uses all single nodes and deterministic sampled 2/4/8-node combinations
+from nodes common to all selected frames within each session. It fails if requested
+counts exceed availability. No extra RSUs are generated. Comparisons within each
+session share timestamps and GT. Across sessions, node IDs and traffic can differ.
 
-- `index.json`, `inventory.json`, `inspection.json`, `class_inventory.json`, and
-  `resolved_config.json`;
-- `environment.json` with software and platform versions;
-- `seed_N/best.pt`, `latest.pt`, retained epoch checkpoints, and completion state;
-- `seed_N/training_metrics_seed_N.csv` and training curves;
-- `accuracy.csv` with per-session, subset, seed, class, and IoU metrics;
-- `accuracy_summary.csv` with per-class accuracy and localization summaries;
-- `metrics_overview.csv` with macro/micro AP, precision, recall, F1, counts, and localization quality;
-- `cooperation_gains.csv` with paired multi-RSU gains over mean/best single RSUs;
-- `weather_cooperation_summary.csv` with weather-stratified paired gains,
-  including the worst paired session against the best member node;
-- `seed_N/operating_thresholds.json` with per-class operating thresholds tuned
-  on validation (`evaluation.tune_score_thresholds`);
-- with `evaluation.save_detections`, per-detection dumps in
-  `eval_parts/seed_N/*.detections.csv.gz`, `range_breakdown.csv` (precision and
-  recall by distance to the nearest participating node), and
-  `false_positive_map.png`;
-- `node_scaling.csv` with changes between successive configured node counts;
-- `latency_communication.csv` with measured local timing, the link rate each
-  configuration needs at the frame rate, and end-to-end latency from measured
-  compute (`end_to_end_ms_measured`) and from assumed constants;
-- `latency_trace.csv` with per-frame loading, preprocessing, inference/decoding,
-  serialization, and payload measurements, streamed per session from
-  `eval_parts/` so large sweeps do not accumulate in memory;
-- `latency_tail_summary.csv` with p50/p95/p99 and maximum latency, queue waiting,
-  and deadline-miss rates under periodic and burst arrivals; `queue_stable` is
-  false when mean service time reaches the frame period, where the queue grows
-  without bound and tail values only reflect the trace length;
-- `accuracy_latency_tradeoffs.csv` joining accuracy and deployment costs;
-- `coinfra_comparison.csv` with AP@0.5 BEV over CoInfra's merged classes
-  (Bus, LV, VRU), the metric of the published benchmark;
-- `deadline_results.csv` with mAP, bytes, late-message rate, and the fraction
-  of fresh, stale, and missing collaborator messages for each controller, link
-  trace, and deadline;
-- `accuracy_by_nodes.png`, `cooperation_gain_by_weather.png`,
-  `latency_by_bandwidth.png`, and `report.md`;
-- `verification.json`, written only after required artifacts and metric invariants are checked.
+## Outputs and interpretation
 
-AP is confidence-ranked across a complete session/subset using candidates retained
-at `evaluation.ap_score_threshold`. `evaluation.iou_thresholds` defines IoU
-levels; `evaluation.class_iou_thresholds` replaces them per class (pedestrians
-and bicycles use 0.25/0.5, KITTI style). Rows record the applied `iou` and its
-`iou_level`, and summaries across classes group by `iou_level`. Precision, recall, F1, and localization
-diagnostics use per-class operating thresholds that maximize F1 on validation
-(classes absent from validation keep `evaluation.score_threshold`), applied
-after class-wise NMS. This prevents the operating
-threshold from truncating the precision-recall curve. Localization errors are
-computed only for matched true positives. Undefined classes and match metrics are
-left blank rather than treated as zero. Summary statistics are descriptive, not
-confidence intervals. `run.sh` executes verification after report generation and
-returns a nonzero exit code if required results are missing or inconsistent.
+Under `outputs/coinfra/`:
 
-## Latency experiment
+- `index.json`, `inventory.json`, `inspection.json`, `resolved_config.json`.
+- `environment.json`: Python, platform, PyTorch and NumPy versions.
+- `seed_N/best.pt` and `training.csv`.
+- `seed_N/training_metrics_seed_N.csv` and `training_curves_seed_N.png`: timestamped
+  epoch history with training/validation loss, validation mAP, recall, composite
+  selection score, learning rate and elapsed time. The consolidated CSV is never
+  pruned. Only the configured number of strongest `epoch_*.pt` checkpoints and
+  their metric sidecars are retained; `best.pt` is the best composite checkpoint.
+- `accuracy.csv`: per-session/subset/seed class AP and recall at rotated 3D IoU.
+- `latency_communication.csv`: compressed payloads, measured inference/decode
+  time, and modeled edge/cloud latency across configured bandwidths.
+- `summary.csv`, `report.md`: descriptive aggregated results.
+- `accuracy_by_nodes.png`: test AP trends across node counts and fusion strategies.
+- `rsu_gains.csv`: multi-node AP minus mean/best single-node AP within each
+  session, seed, strategy, class and IoU threshold. Best single is a retrospective
+  comparison, not a deployment policy chosen without test labels.
 
-The latency trace separates measured local stages from network modeling. Edge
-placement processes at the receiving node, so only collaborators transmit.
-Cloud placement uploads raw points from every participating node, the receiver
-included (`cloud_raw_bytes`). Late fusion transmits only local boxes at the
-operating score threshold; lower-scoring candidates stay local for AP ranking. GPU
-timing is synchronized around inference. The queue experiment replays the
-measured per-frame service trace through a FIFO server at the configured frame
-period and at 2x/4x burst arrival rates. For every placement, bandwidth, and
-deadline it reports mean, p50, p95, p99, maximum, queue waiting, and deadline
-miss rate. Transmission and RTT remain modeled unless an external network
-testbed is used. Run the final latency experiment with evaluation batch size 1
-so batch-amortized throughput is not reported as per-request response time.
+AP ranks predictions across a complete session/subset, not an average of frame
+AP. A class with no GT is undefined (blank), not zero. Summary averages over
+sessions/subsets/seeds are descriptive and are not statistical confidence intervals.
 
-## Scientific scope
+Communication serializes actual raw point, encoded feature or detected-box arrays
+as float32 and zlib level 1. It excludes protocol headers. Edge transmission sends
+the strategy-specific representation; cloud transmission sends raw cropped points.
+The analytical shared-link latency uses configured RTT and processing assumptions.
+Measured inference/decode is serial on one machine and excludes rasterization,
+I/O and serialization. It is not a measured distributed end-to-end deployment.
+Cloud placement changes the transport model, not the accuracy predictions.
 
-The experiment supports claims about multi-RSU cooperation on CoInfra-I2I. It
-does not provide real edge/cloud deployment measurements, causal weather effects,
-vehicle-to-infrastructure fusion, or guarantees about production deployment.
-Smoke runs and synthetic tests validate software plumbing, not model quality.
+For the hypothesis, compare each multi-node result with the single-node results
+under the same session and weather. Separate node-count gains from extra bandwidth;
+these experiments report bytes but do not implement equal-byte feature selection.
+Weather is confounded with recording date and traffic, so weather-stratified gains
+are evidence of performance in those conditions, not a controlled causal weather
+effect. Do not infer general deployment success from smoke-test results.
 
-Dataset resources: [project](https://github.com/NingMingHao/CoInfra),
-[schema](https://github.com/NingMingHao/CoInfra/blob/main/docs/DATASET.md), and
-[archives](https://huggingface.co/datasets/MinghaoNing/CoInfra).
+Sources: [CoInfra project](https://github.com/NingMingHao/CoInfra),
+[dataset schema](https://github.com/NingMingHao/CoInfra/blob/main/docs/DATASET.md),
+[publisher baseline](https://github.com/NingMingHao/CoInfra/blob/main/baselines/coop_lidar/dataset.py),
+[downloads](https://huggingface.co/datasets/MinghaoNing/CoInfra).
