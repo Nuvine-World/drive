@@ -1,0 +1,201 @@
+dataset:
+  type: coinfra
+  root: data/coinfra
+  smoke:
+    enabled: false
+    splits:
+      train: [2025_03_27_sunny]
+      val: [2025_11_18_sunny]
+      test: [2025_03_24_rainy]
+    sessions_per_split: 1
+    slices_per_session: 1
+    frames_per_slice: 1
+    epochs: 2
+    seeds: 1
+  weather: [sunny, rainy, heavysnow, freezingrain]
+  nodes: []
+  # Every fifth frame (0.5 s apart) of every session, before the random split.
+  frame_stride: 5
+  max_frames_per_slice: null
+  max_timestamp_delta_s: 0.15
+  annotation_file: global_roi.yaml
+  yaw_unit: radians
+  classes: [car, truck, bus, bicycle, pedestrian]
+  class_aliases: {person: pedestrian, cyclist: bicycle, vehicle: car}
+  # CoInfra's global metric frame is centered near the roundabout origin.
+  bounds: [-100.0, -100.0, -5.0, 100.0, 100.0, 20.0]
+  resolution: 0.4
+  # Separate prediction slots preserve closely spaced same-class objects whose
+  # centers fall in the same 0.8 m prediction cell (0.4 m BEV, output stride 2).
+  objects_per_cell: 2
+  # CoInfra point intensity is constant (p1 = p99 = 1.0 in every inspected
+  # slice), so the BEV uses density and maximum/minimum/mean height only.
+  # Inspection fails if intensity is enabled but carries no information.
+  use_intensity: false
+  # Point counts by height above each cell's lowest return (0.5 m slices; the
+  # last slice holds everything above 2 m).
+  height_slices: 5
+  height_slice_m: 0.5
+  # CoInfra's published benchmark protocol (arXiv 2507.02245, Sec. 6.3.1):
+  # frames of every session are assigned 80/10/10 at random, so test frames
+  # neighbour training frames in time. Reported only to compare with the
+  # published table; configs/coinfra.yaml is the session-held-out protocol.
+  split_mode: random_frames
+  random_split:
+    fractions: [0.8, 0.1, 0.1]
+    seed: 2025
+  splits:
+    train: [2025_03_27_sunny, 2025_02_12_heavysnow, 2025_11_18_sunny,
+            2025_04_07_heavysnow, 2025_11_20_sunny, 2025_11_27_heavysnow,
+            2025_03_24_rainy, 2025_04_02_freezingrain]
+    val: []
+    test: []
+training:
+  seeds: [42, 43, 44]
+  # Reduce LR on validation-score plateaus; train up to 200 epochs and never
+  # stop before 100 (validation was still rising at epoch 100 of the pilot).
+  epochs: 200
+  minimum_epochs: 100
+  early_stopping_patience: 12
+  early_stopping_min_delta: 0.0005
+  learning_rate: 0.001
+  scheduler:
+    enabled: true
+    factor: 0.5
+    patience: 5
+    minimum_learning_rate: 0.00001
+  weight_decay: 0.0001
+  device: auto
+  require_cuda: true
+  # DRIVE detector: a shared node encoder (what each node transmits), fusion
+  # before a three-scale backbone, and CenterPoint heads at output stride 2.
+  node_channels: 64
+  backbone_channels: 128
+  node_blocks: 1
+  backbone_blocks: [2, 2, 2]
+  # attention (DRIVE), mean (the CoInfra baseline), or max (F-Cooper).
+  fusion: attention
+  output_stride: 2
+  # 24 GB GPU profile (RTX 4090/3090). An 8-node sample holds about 1.9 GB
+  # of bf16 activations on the 500x500 grid, so batch 8 does not fit; CUDA OOM
+  # recovery still splits a batch if an unusual sample does not fit.
+  batch_size: 4
+  preprocessing_workers: 8
+  mixed_precision: true
+  # bf16 where the GPU supports it (fp32 exponent range, no overflow).
+  amp_dtype: auto
+  # Repeat frames with rare classes (bus, bicycle, truck): LVIS repeat factors.
+  repeat_factor_threshold: 0.3
+  # A collaborator in an intermediate or adaptive sample is replaced by one of
+  # its own frames up to 3 training frames (0.6 s) old with this probability,
+  # so the fusion learns to weigh delayed messages by their age.
+  stale:
+    probability: 0.25
+    max_age_frames: 3
+  # Scene-wide flips, rotation, and scaling applied identically to every node.
+  augmentation:
+    enabled: true
+    flip_x: true
+    flip_y: true
+    rotation_degrees: 22.5
+    scale_range: [0.95, 1.05]
+  modes: [early, intermediate, adaptive, single]
+  # A box is a training target only when the chosen nodes return at least
+  # this many points inside it; the global ROI also labels unseen objects.
+  min_target_points: 1
+  node_counts: [1, 2, 4, 8]
+  checkpointing:
+    keep_best: 3
+    # AP drives selection; recall breaks near ties.
+    weights: {val_loss_quality: 0.0, val_map: 0.8, val_recall: 0.2}
+  recovery:
+    resume: true
+    save_every_epochs: 1
+    wait_for_resources: true
+    poll_seconds: 60
+    timeout_minutes: 60
+    minimum_free_disk_gb: 5
+    minimum_free_gpu_gb: 2
+    cuda_oom_retries: 3
+    # Preserve stale per-seed artifacts and retrain only that seed during unattended runs.
+    on_incompatible: quarantine
+evaluation:
+  receiver_policy: all
+  # Validation materializes both early- and per-node BEVs, so keep this below
+  # the training batch even on a 24 GB card.
+  batch_size: 8
+  strategies: [early, intermediate, late, adaptive]
+  node_counts: [1, 2, 4, 8]
+  subsets_per_count: 5
+  subset_seed: 17
+  # Retain low-confidence candidates for a complete AP curve; precision/recall
+  # use the separate deployed operating threshold below.
+  ap_score_threshold: 0.01
+  # Fallback operating threshold for classes absent from validation; every
+  # other class uses the F1-optimal threshold tuned on validation.
+  score_threshold: 0.15
+  tune_score_thresholds: true
+  # Detection score = heat^(1-w) * predicted IoU^w.
+  iou_score_weight: 0.5
+  # The visible ground-truth scope scores boxes with at least this many points
+  # from the evaluated subset's own nodes and ignores the rest.
+  min_visible_points: 5
+  # Per-detection dumps for range and false-positive diagnostics.
+  save_detections: false
+  nms_iou: 0.2
+  iou_thresholds: [0.5, 0.7]
+  # KITTI-style levels: small road users use 0.25/0.5 instead of 0.5/0.7.
+  class_iou_thresholds:
+    bicycle: [0.25, 0.5]
+    pedestrian: [0.25, 0.5]
+  max_detections: 150
+  # The CoInfra benchmark's metric: AP@0.5 BEV IoU over merged classes.
+  comparison:
+    iou_type: bev
+    iou_threshold: 0.5
+    groups: {Bus: [bus], LV: [car, truck], VRU: [pedestrian, bicycle]}
+adaptive_fusion:
+  training_budgets: [0.01, 0.05, 0.10, 0.25]
+  evaluation_budgets: [0.01, 0.05, 0.10, 0.25]
+  # confidence ranks cells by each collaborator's own detection confidence
+  # (Where2comm-style).
+  ablations: [random, energy, confidence]
+  index_bytes: 4
+  value_bytes: 2
+latency_experiment:
+  frame_period_ms: 100.0
+  profile_batch_size: 1
+  # Must exceed sensing plus the largest configured RTT (140 ms).
+  deadlines_ms: [150.0, 250.0]
+  burst_multipliers: [1, 2, 4]
+# Deadline-constrained cooperation on consecutive 10 Hz test frames: per-frame
+# budget control over a time-varying uplink, with late messages used stale.
+deadline_experiment:
+  # Needs held-out recording sequences; run it with configs/coinfra.yaml.
+  enabled: false
+  frames_per_slice: 100
+  slices_per_session: 2
+  # End-to-end from capture; the transmission window is the deadline minus
+  # sensing, half the edge RTT, and receiver processing.
+  deadlines_ms: [200.0, 250.0]
+  target_miss_rate: 0.05
+  tradeoff: 10.0
+  max_age_frames: 3
+  estimator_alpha: 0.2
+  controllers: [fixed, dense, greedy, drive, oracle, early, late]
+  traces:
+    - {name: uplink_5g, type: gilbert_elliott, good_mbps: 40.0, bad_mbps: 5.0,
+       p_good_to_bad: 0.05, p_bad_to_good: 0.25, jitter: 0.2}
+    - {name: constant_20mbps, type: constant, mbps: 20.0}
+deployment_assumptions:
+  source: "literature assumption; citation required"
+  bandwidths_mbps: [10, 100, 1000]
+  sensing_ms: 100.0
+  edge_rtt_ms: 5.0
+  cloud_rtt_ms: 40.0
+  processing_ms:
+    edge: {early: 80.0, intermediate: 45.0, late: 25.0, adaptive: 50.0}
+    cloud: {early: 40.0, intermediate: 30.0, late: 20.0, adaptive: 35.0}
+output:
+  root: outputs/coinfra_random_split
+  plots: true

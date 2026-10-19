@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Git pre-commit hook: format Python lines changed since HEAD with darker
+# (diff-scoped black), then run the test suite. Aborts the commit unless
+# both succeed.
+#
+# darker is used instead of plain black because this codebase was never
+# black-formatted; running black on a whole file reformats every line in it,
+# not just the ones being committed. darker only touches lines that differ
+# from the last commit.
+#
+# Note: this formats/stages everything changed since HEAD in each touched
+# file, not only what's staged — if you use partial staging (git add -p),
+# unstaged edits in the same file get pulled in too.
+set -uo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root" || exit 1
+
+python_bin="$repo_root/.venv/bin/python"
+[ -x "$python_bin" ] || python_bin="python3"
+
+changed_py=()
+while IFS= read -r file; do
+  [ -n "$file" ] && changed_py+=("$file")
+done < <(git diff --name-only --diff-filter=ACMR HEAD -- '*.py')
+
+if [ "${#changed_py[@]}" -gt 0 ]; then
+  echo "pre-commit: formatting changed lines with darker..."
+  if ! "$python_bin" -m darker "${changed_py[@]}"; then
+    echo "pre-commit: darker (black) formatting failed. Commit aborted." >&2
+    exit 1
+  fi
+  git add -- "${changed_py[@]}"
+fi
+
+echo "pre-commit: running test suite..."
+if ! "$python_bin" -m pytest -q; then
+  echo "pre-commit: tests failed. Commit aborted." >&2
+  exit 1
+fi
+
+exit 0

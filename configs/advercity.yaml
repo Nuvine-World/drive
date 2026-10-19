@@ -1,0 +1,143 @@
+dataset:
+  type: advercity
+  root: data/advercity
+  acquisition:
+    work_dir: advercity_work
+    minimum_free_gb: 35
+    cleanup_archives: true
+    retain_frame_stride: 2
+    # Format-1 scenarios carry ego-only labels; keep false to require format 2.
+    allow_legacy_labels: false
+  smoke:
+    enabled: false
+    splits:
+      train: [ui_cd_d]
+      val: [rsnj_cd_d]
+      test: [rcnj_fhrd_d]
+    sessions_per_split: 1
+    slices_per_session: 1
+    frames_per_slice: 1
+    epochs: 2
+    seeds: 1
+  weather: [clear, soft_rain, heavy_rain, fog, fog_heavy_rain]
+  nodes: []
+  frame_stride: 1
+  max_frames_per_slice: null
+  max_timestamp_delta_s: 0
+  annotation_file: gt.yaml
+  yaw_unit: radians
+  classes: [car, van, truck, motorcycle, bicycle, pedestrian]
+  class_aliases: {vehicle: car, walker: pedestrian}
+  bounds: [-100.0, -100.0, -5.0, 100.0, 100.0, 5.0]
+  resolution: 1.0
+  objects_per_cell: 2
+  # CARLA LiDAR intensity is already in [0, 1].
+  intensity_max: 1.0
+  splits:
+    train: [ui_cd_d, ui_srd_d, ui_hrd_d, ui_fd_d, ui_fhrd_d,
+            unj_cd_d, unj_srd_d, unj_hrd_d, unj_fd_d, unj_fhrd_d,
+            ri_cd_d, ri_srd_d, ri_hrd_d, ri_fd_d, ri_fhrd_d]
+    val: [rsnj_cd_d, rsnj_srd_d, rsnj_hrd_d, rsnj_fd_d, rsnj_fhrd_d]
+    test: [rcnj_cd_d, rcnj_srd_d, rcnj_hrd_d, rcnj_fd_d, rcnj_fhrd_d]
+training:
+  seeds: [42, 43, 44]
+  # Continue existing 30-epoch checkpoints, reduce LR on validation-score
+  # plateaus, and stop only after the minimum training horizon.
+  epochs: 100
+  minimum_epochs: 30
+  early_stopping_patience: 12
+  early_stopping_min_delta: 0.0005
+  learning_rate: 0.001
+  scheduler:
+    enabled: true
+    factor: 0.5
+    patience: 5
+    minimum_learning_rate: 0.00001
+  weight_decay: 0.0001
+  device: auto
+  require_cuda: true
+  # DRIVE detector: a shared node encoder (what each node transmits), fusion
+  # before a three-scale backbone, and CenterPoint heads at output stride 2.
+  node_channels: 64
+  backbone_channels: 128
+  node_blocks: 1
+  backbone_blocks: [2, 2, 2]
+  fusion: attention
+  output_stride: 2
+  batch_size: 8
+  preprocessing_workers: 8
+  mixed_precision: true
+  amp_dtype: auto
+  repeat_factor_threshold: 0.3
+  # Adver-City clouds are stored in the moving ego frame, so an earlier frame
+  # is not a valid delayed message without re-registration: no stale training.
+  stale:
+    probability: 0.0
+    max_age_frames: 3
+  # Scene-wide flips, rotation, and scaling applied identically to every node.
+  augmentation:
+    enabled: true
+    flip_x: true
+    flip_y: true
+    rotation_degrees: 22.5
+    scale_range: [0.95, 1.05]
+  modes: [early, intermediate, adaptive, single]
+  node_counts: [1, 2, 3, 5]
+  checkpointing:
+    keep_best: 3
+    weights: {val_loss_quality: 0.0, val_map: 0.8, val_recall: 0.2}
+  recovery:
+    resume: true
+    save_every_epochs: 1
+    wait_for_resources: true
+    poll_seconds: 60
+    timeout_minutes: 60
+    minimum_free_disk_gb: 20
+    minimum_free_gpu_gb: 2
+    cuda_oom_retries: 3
+    # Preserve stale per-seed artifacts and retrain only that seed during unattended runs.
+    on_incompatible: quarantine
+evaluation:
+  receiver_policy: all
+  batch_size: 8
+  strategies: [early, intermediate, late, adaptive]
+  node_counts: [1, 2, 3, 5]
+  subsets_per_count: 5
+  subset_seed: 17
+  ap_score_threshold: 0.01
+  score_threshold: 0.15
+  nms_iou: 0.2
+  iou_thresholds: [0.5, 0.7]
+  # KITTI-style levels: small road users use 0.25/0.5 instead of 0.5/0.7.
+  class_iou_thresholds:
+    motorcycle: [0.25, 0.5]
+    bicycle: [0.25, 0.5]
+    pedestrian: [0.25, 0.5]
+  max_detections: 150
+adaptive_fusion:
+  training_budgets: [0.01, 0.05, 0.10, 0.25]
+  evaluation_budgets: [0.01, 0.05, 0.10, 0.25]
+  ablations: [random, energy, confidence]
+  index_bytes: 4
+  value_bytes: 2
+latency_experiment:
+  frame_period_ms: 100.0
+  profile_batch_size: 1
+  # Must exceed sensing plus the largest configured RTT (140 ms).
+  deadlines_ms: [150.0, 250.0]
+  burst_multipliers: [1, 2, 4]
+# The deadline experiment replays static-infrastructure links (CoInfra).
+deadline_experiment:
+  enabled: false
+deployment_assumptions:
+  source: "controlled analytical assumptions; replace with cited or measured server values"
+  bandwidths_mbps: [10, 100, 1000]
+  sensing_ms: 100.0
+  edge_rtt_ms: 5.0
+  cloud_rtt_ms: 40.0
+  processing_ms:
+    edge: {early: 80.0, intermediate: 45.0, late: 25.0, adaptive: 50.0}
+    cloud: {early: 40.0, intermediate: 30.0, late: 20.0, adaptive: 35.0}
+output:
+  root: outputs/advercity
+  plots: true

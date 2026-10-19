@@ -1,93 +1,217 @@
-# ECCO
+# DRIVE
 
-Config-driven experiments for distributed roadside LiDAR perception in real
-sunny, rainy, heavy-snow and freezing-rain recordings. This project works with
-the extracted **CoInfra-I2I** layout, without an ego vehicle or synthetic RSUs.
+DRIVE evaluates cooperative LiDAR perception with Adver-City or CoInfra-I2I.
+With no explicit configuration, `run.sh` executes CoInfra followed by Adver-City.
+Passing either dataset configuration runs only that dataset.
 
-See [Architecture and Mermaid diagrams](docs/architecture.md) for the data flow,
-detector, fusion strategies, training, evaluation and edge/cloud timing model.
+The project compares early, intermediate, late, and budget-conditioned adaptive
+sparse fusion for 1, 2, 4, and 8 RSUs. It measures rotated 3D AP, precision,
+recall, F1, TP/FP/FN counts,
+matched-box 3D IoU, center/yaw/size errors, representation size, local inference
+time, and analytical edge/cloud latency. Edge/cloud deployment is not executed;
+latency uses explicit configuration assumptions that must be cited in a paper.
 
-## Run
+CoInfra is infrastructure-to-infrastructure perception. Adver-City contributes
+vehicle and roadside sensor viewpoints in simulation.
 
-Python 3.10+ is recommended. On a GPU machine, install the appropriate PyTorch
-build for your CUDA version before installing the remaining requirements.
+## Research questions
+
+1. Does multi-RSU cooperation improve AP and recall over individual RSUs?
+2. How does the benefit change with node count and fusion strategy?
+3. What accuracy, communication, and assumed-latency trade-offs result?
+4. Does the paired cooperation gain persist across recorded weather conditions?
+5. Which object classes benefit most?
+6. Can learned utility-per-byte selection preserve cooperative accuracy while
+   transmitting only 1--25% of collaborator BEV cells?
+
+Weather comparisons are observational. Recording date, traffic, lighting, and
+weather are confounded, so results do not identify a causal weather effect.
+
+## Setup
+
+Python 3.10+ is recommended. Install a CUDA-compatible PyTorch build on the GPU
+machine before installing the remaining dependencies.
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-bash run_coinfra.sh --stage check
 .venv/bin/python -m pytest -q
 ```
 
-Edit `configs/coinfra.yaml`, especially `dataset.root`, `dataset.splits`, global
-`bounds`, and `yaw_unit`. Alternatively, set `COINFRA_ROOT` to the extracted
-dataset directory. Relative config paths resolve from this project directory.
-
-Once the data is downloaded and extracted:
+Optional local commit hook:
 
 ```bash
-export COINFRA_ROOT=/path/to/extracted/CoInfra
-bash run_coinfra.sh --stage inspect
-bash run_coinfra.sh
+git config core.hooksPath githooks
 ```
 
-For the smallest end-to-end check, use the new single entry point. Smoke mode
-keeps train/validation/test recording sessions distinct, but uses only the first
-session, slice and frame per split, two epochs, one seed and one node:
+## Adver-City server run
+
+The default configuration selects 25 daytime scenarios covering clear weather,
+soft rain, heavy rain, fog, and fog with heavy rain. The official archives total
+310.85 GB over the complete sequential transfer, but only one archive is staged
+at a time. Camera images are not extracted. LiDAR, annotations, poses, and
+scenario metadata are converted to a compact ego-centered representation, then
+the verified source archive and extraction directory are removed.
+
+Set the persistent and temporary locations on the server and run:
 
 ```bash
-chmod +x run.sh
-./run.sh --smoke
+export ADVERCITY_ROOT=/path/to/persistent/advercity
+export ADVERCITY_WORK_DIR=/path/to/temporary/advercity_work
+export ECCO_PYTHON=/path/to/venv/bin/python
+./run.sh --config configs/advercity.yaml
 ```
 
-Smoke mode needs three distinct recording sessions to prevent train/validation/test
-leakage. Download only their three archives with:
+The process resumes partial HTTP downloads and skips scenarios that already have
+a validated converted result. Each frame's labels merge the vehicle and walker
+lists of every agent (keyed by actor id), because an agent's own file need not
+list itself or objects outside its range. Scenarios converted before this
+change (`format: 1` in `scenario.yaml`) hold ego-only labels and stop the run;
+delete them to re-prepare (this re-downloads their archives), or set
+`dataset.acquisition.allow_legacy_labels: true` to use them as they are. A system `7z` or `7zz` executable is used when
+available; otherwise `py7zr` from `requirements.txt` is used. To inspect the
+official selection and transfer sizes without downloading archives:
+
+```bash
+.venv/bin/python prepare_advercity.py --config configs/advercity.yaml --preview
+```
+
+For an end-to-end one-frame test profile:
+
+```bash
+./run.sh --small --config configs/advercity.yaml
+```
+
+`--small` is the recommended whole-flow preflight when prepared data already
+exists. It checks that every smoke-profile session is present, skips all download
+and conversion work, replaces any earlier smoke checkpoints, then runs inspection,
+indexing, two training epochs, evaluation, plots, reporting, and final verification.
+Its split-disjoint metrics validate plumbing only and are not research results.
+
+Do not interrupt the process during the final scenario rename. Failed downloads
+remain as `.part` files and resume on the next invocation. An archive is deleted
+only after checksum verification, conversion, and converted-data validation.
+
+## CoInfra server run
+
+Point `COINFRA_ROOT` at the extracted directory whose immediate children are
+the `2025_*` recording sessions:
+
+```bash
+export COINFRA_ROOT="/path/to/CoInfra"
+./run.sh --config configs/coinfra.yaml --stage check
+./run.sh --config configs/coinfra.yaml --stage inspect
+```
+
+Edit [configs/coinfra.yaml](configs/coinfra.yaml) before a full experiment.
+Verify the dataset bounds, heading units, split sessions, `use_intensity`/
+`intensity_max`, and the source and values under `deployment_assumptions`.
+Inspection records point intensity percentiles in `inspection.json`. When
+`dataset.use_intensity` is true it stops if intensity is constant (CoInfra's is,
+so its configs set `use_intensity: false`) or if the p99 intensity does not fit
+`dataset.intensity_max` (above it, or below 1% of it). It also warns about
+classes that have test but no validation ground truth; such classes are unseen
+by checkpoint selection and threshold tuning (CoInfra validation has no
+bicycles).
+
+Training uses two sessions (2025_03_27_sunny and 2025_02_12_heavysnow);
+validation uses 2025_11_18_sunny; every weather condition keeps at least one
+held-out test session. Rainy and freezing-rain conditions are unseen in
+training, which matters when comparing results across weather.
+
+## Small end-to-end check
+
+Smoke mode keeps train, validation, and test sessions separate but uses one
+session, one slice, one frame, one seed, two epochs, and one RSU per split. It
+validates the pipeline; its metrics are not research results.
 
 ```bash
 .venv/bin/python download_coinfra.py --smoke --download --output coinfra_downloads
+./run.sh --small --config configs/coinfra.yaml
 ```
 
-Run the full configured experiment with `./run.sh`. Both commands write a complete
-timestamped console log under `logs/` and a second pipeline log plus JSON completion
-or failure status under the configured output directory. A traceback is preserved
-when a run fails or is interrupted.
+The three smoke archives are approximately 32 GB compressed. Extract them into
+`COINFRA_ROOT` before running the pipeline.
 
-The last command runs inspect/index → train each seed → evaluate every configured
-fusion/node subset → generate CSV summaries and a Markdown report. The script
-does not download or extract data automatically. Run individual stages with
-`--stage preprocess|train|evaluate|report`. Use `--config /path/to/config.yaml`
-for another experiment, and `COINFRA_PYTHON` for another Python interpreter.
-Existing compatible checkpoints are skipped; `--overwrite` explicitly retrains.
-Interrupted training resumes from `latest.pt` at the next epoch when
-`training.recovery.resume` is enabled. The recovery checkpoint includes model,
-optimizer and random-number-generator state. Use `--overwrite` to restart training
-(all configured seeds). Use a new output directory for a new
-configuration. Completed seeds can be evaluated without training again.
+## Full experiment
 
-## Download separately
+```bash
+./preflight.sh
+nohup ./run.sh >> output.txt 2>&1 < /dev/null &
+```
+
+With no `--config`, `run.sh` runs CoInfra first and starts Adver-City only after
+CoInfra exits successfully. If CoInfra fails, the sequence exits with the same
+nonzero status and Adver-City is not started. `preflight.sh` runs the unit tests,
+checks both configurations and runtime dependencies, verifies CUDA availability,
+and requires the externally downloaded CoInfra data. Adver-City data is not
+required by the preflight because its full run prepares and validates that data.
+
+To run only one dataset, continue to pass its configuration explicitly:
+
+```bash
+./run.sh --config configs/coinfra.yaml
+./run.sh --config configs/advercity.yaml
+```
+
+The runner performs inspection, indexing, training, held-out evaluation, and
+report generation. Timestamped console logs and completion/failure status files
+are written under `logs/`, including Python tracebacks from failed runs.
+Runtime dependencies are imported before acquisition or training begins. Dataset
+inspection parses annotations in every selected frame and verifies that each test
+session has enough common nodes for the largest requested evaluation count.
+
+Training resumes from `seed_N/latest.pt` after the last completed epoch. Recovery
+checkpoints include model, optimizer, metric history, and random states. The best
+checkpoint is selected using validation loss quality, mAP, and recall at the
+primary IoU level. Validation scores every frame twice: with all of its nodes
+under each configured fusion strategy, and with one deterministic single node.
+The two views carry equal weight, so checkpoints are not chosen for multi-node
+quality alone. Validation loss is averaged per sample over both views. Use
+`--overwrite` to restart configured seeds. `run.sh` retries exit code 75
+(transient failures) without `--overwrite`, so a retry resumes rather than
+discarding checkpoints; `ECCO_RETRY_DELAY_SECONDS` sets the base retry delay.
+
+Individual stages are available:
+
+```bash
+./run.sh --config configs/coinfra.yaml --stage preprocess
+./run.sh --config configs/coinfra.yaml --stage train
+./run.sh --config configs/coinfra.yaml --stage evaluate
+./run.sh --config configs/coinfra.yaml --stage deadline
+./run.sh --config configs/coinfra.yaml --stage report
+```
+
+`configs/coinfra.yaml` holds out whole recording sessions.
+`configs/coinfra_random_split.yaml` reproduces the CoInfra paper's protocol,
+which splits frames at random, so its numbers can be compared with the
+published table. The `deadline` stage replays consecutive 10 Hz test frames
+through per-frame communication controllers over modeled uplinks (see
+`docs/decisions/2026-10-11-drive-detector.md`).
+
+## Dataset download
 
 ```bash
 .venv/bin/python download_coinfra.py --list
 .venv/bin/python download_coinfra.py --download --output /path/to/archives
+.venv/bin/python download_coinfra.py --subset --download --output /path/to/archives
+.venv/bin/python download_coinfra.py \
+  --file "2025_11_20_sunny_slice10-slice10.tar.zst" \
+  --download --output /path/to/archives
 ```
 
-The downloader defaults to all archives, with a 400 GB compressed selection cap,
-20 GB disk reserve, Hub resume, pinned revision and SHA-256 validation. The cap
-does not include extraction, unrelated files or retries. Full archives are about
-361 GB compressed; allow additional extraction and training space. `--subset`
-selects the old eight-archive starter subset, which does NOT cover every session
-in the full default experiment config. Change the split lists if using a subset.
-
-Extract each `.tar.zst` with a zstd-capable tar into your data root. Avoid duplicate
-scenario wrappers; the expected root immediately contains `2025_*` session folders.
+The downloader pins the Hub revision, enforces size and free-space limits, and
+verifies publisher SHA-256 hashes. It does not extract archives.
 
 ## Data contract
 
 ```text
-ROOT/2025_03_24_rainy/slice0/
-  PcImage/1742850299.2/lidar/4_1742850299.199.npy
-  Calibration/lidar/4.yaml
-  GroundTruth/1742850299.2/global_roi.yaml
+COINFRA_ROOT/
+  2025_03_24_rainy/
+    slice0/
+      PcImage/1742850299.2/lidar/4_1742850299.199.npy
+      Calibration/lidar/4.yaml
+      GroundTruth/1742850299.2/global_roi.yaml
 ```
 
 Both `slice0` and `slice_0` names are accepted. Calibration requires 4×4 matrices
